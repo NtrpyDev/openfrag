@@ -1,6 +1,6 @@
 # Post-match import pipeline decision
 
-v1 accepts local `.dem` files only. The pipeline is durable, idempotent, and local. Every transition writes an append-only attempt record before doing external or expensive work; a crash resumes from the last committed state.
+v1 accepts local `.dem` files only. GSI may create provisional candidate records, but a local Demo import is the only trigger for canonical Match, Rating, and Receipt production. The pipeline is durable, idempotent, and local. Every transition writes an append-only attempt record before expensive work; a crash resumes from the last committed state.
 
 ## State machine
 
@@ -19,7 +19,24 @@ v1 accepts local `.dem` files only. The pipeline is durable, idempotent, and loc
 
 Error codes are `error_io`, `error_corrupt`, `error_unsupported`, `error_conflict`, `error_parse`, and `error_analysis`. Never represent an error as an empty Match.
 
+## Triggers, keys, and reconciliation
+
+An import trigger is a user-selected local path or an explicit Inbox retry. GSI does not bypass `awaiting_import`. Before a Demo exists, create only a `CaptureSession` with a generated session ID, observed map and round, candidate Receipts, and provisional Clips. After a Demo is copied and parsed, associate the CaptureSession to a Match using explicit map, round, local SteamID, and bounded capture metadata. Then attach the Demo hash and Match ID to candidates. Never associate by nearest wall-clock time alone. If association is ambiguous, retain **“Awaiting Demo association”** and require user selection.
+
+Idempotency keys are:
+
+- import job: `source_sha256`;
+- stored Demo artifact: `source_sha256`;
+- calculation run: `source_sha256 + parser_build + generated_proto_build + formula_version`;
+- Match: canonical Demo identity plus map and match metadata;
+- candidate Clip: `capture_session_id + observed_map + observed_round + rule_version + candidate_interval + raw_media_hash`;
+- reconciliation: `capture_session_id + demo_sha256 + match_id`.
+
+Every key is unique in storage. Replays of a request return the existing state and attempt ID. Recovery is observable through `attempt_id`, state-entered time, retry count, next retry time, source hash, parser identity, and last error code. A startup sweep marks abandoned `validating`, `copying`, or `parsing` attempts as resumable, verifies checkpoints, and removes only uncommitted temporary files.
+
 ## Decision fights and winners
+
+Five-round summary: local import beats automatic acquisition because it is supported and auditable; snapshots beat inferred GSI events because the stream is buffered; content hashes beat filenames because retries and duplicates are safe; append-only calculation runs beat overwrite because trends remain reproducible; explicit user deletion beats automatic retention because Receipts and Clips are evidence. These choices are product decisions informed by the acquisition, GSI, and highlight contracts.
 
 ### Retries
 
