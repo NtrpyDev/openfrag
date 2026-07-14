@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
+const CONTRACT_MIGRATION: &str = include_str!("../migrations/0002_contract.sql");
 
 #[derive(Debug)]
 pub enum Error {
@@ -166,7 +167,6 @@ impl Storage {
                 "INSERT INTO schema_migrations(version, applied_at_ms, checksum) VALUES(1, ?, ?)",
                 params![now_ms(), checksum],
             )?;
-            return Ok(());
         }
         let exists: Option<String> = self
             .connection
@@ -180,9 +180,32 @@ impl Storage {
             if found != checksum {
                 return Err(Error::Invalid("migration checksum mismatch"));
             }
+        } else {
+            return Err(Error::Invalid("migration history is incomplete"));
+        }
+        let checksum = hex_sha256(CONTRACT_MIGRATION.as_bytes());
+        let exists: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version=2",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(found) = exists {
+            if found != checksum {
+                return Err(Error::Invalid("migration checksum mismatch"));
+            }
             return Ok(());
         }
-        Err(Error::Invalid("migration history is incomplete"))
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute_batch(CONTRACT_MIGRATION)?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version, applied_at_ms, checksum) VALUES(2, ?, ?)",
+            params![now_ms(), checksum],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn stage_artifact(&self, bytes: &[u8]) -> Result<StagedArtifact> {
         let sha256 = hex_sha256(bytes);
