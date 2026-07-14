@@ -114,6 +114,168 @@ pub trait ImportStore {
     fn load_attempt(&self, id: u64) -> Option<Attempt>;
 }
 
+pub trait Persist {
+    fn put(&mut self, job: &Job) -> Result<(), ErrorCode>;
+    fn get(&self, id: u64) -> Option<Job>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Job {
+    pub id: u64,
+    pub state: State,
+    pub attempt: Attempt,
+    pub identity: Option<CalculationIdentity>,
+    pub canonical: bool,
+    pub quarantined: bool,
+    pub cancelled: bool,
+}
+
+pub fn legal_transition(from: &State, to: &State) -> bool {
+    matches!(
+        (from, to),
+        (State::AwaitingImport, State::Validating)
+            | (State::Validating, State::Hashing | State::Error(_))
+            | (State::Hashing, State::Deduplicating | State::Error(_))
+            | (
+                State::Deduplicating,
+                State::Copying | State::Parsing | State::Rating | State::Ready | State::Error(_)
+            )
+            | (State::Copying, State::Parsing | State::Error(_))
+            | (State::Parsing, State::Rating | State::Error(_))
+            | (State::Rating, State::LinkingClips | State::Error(_))
+            | (State::LinkingClips, State::Ready | State::Error(_))
+            | (
+                State::Error(_),
+                State::AwaitingImport
+                    | State::Validating
+                    | State::Hashing
+                    | State::Copying
+                    | State::Parsing
+                    | State::Rating
+            )
+            | (State::Ready, State::Parsing | State::Rating)
+    )
+}
+
+pub struct Orchestrator<P: Persist> {
+    pub store: P,
+    next_id: u64,
+}
+impl<P: Persist> Orchestrator<P> {
+    pub fn new(store: P) -> Self {
+        Self { store, next_id: 1 }
+    }
+    pub fn create(&mut self) -> Result<Job, ErrorCode> {
+        let job = self.job(State::AwaitingImport);
+        self.store.put(&job)?;
+        Ok(job)
+    }
+    pub fn resume(&mut self, id: u64) -> Result<Job, ErrorCode> {
+        self.store.get(id).ok_or(ErrorCode::Io)
+    }
+    pub fn transition(&mut self, mut job: Job, to: State) -> Result<Job, ErrorCode> {
+        if job.cancelled || !legal_transition(&job.state, &to) {
+            return Err(ErrorCode::Analysis);
+        }
+        job.state = to.clone();
+        job.attempt.state = to;
+        job.attempt.progress.heartbeat += 1;
+        self.store.put(&job)?;
+        Ok(job)
+    }
+    pub fn acquire_lease(
+        &mut self,
+        mut job: Job,
+        owner: &str,
+        now: SystemTime,
+        ttl: Duration,
+    ) -> Result<Job, ErrorCode> {
+        if !lease_available(&job.attempt, now, owner) {
+            return Err(ErrorCode::Io);
+        }
+        job.attempt.lease_owner = Some(owner.into());
+        job.attempt.lease_expires_at = Some(now + ttl);
+        self.store.put(&job)?;
+        Ok(job)
+    }
+    pub fn renew_lease(
+        &mut self,
+        mut job: Job,
+        owner: &str,
+        now: SystemTime,
+        ttl: Duration,
+    ) -> Result<Job, ErrorCode> {
+        if job.attempt.lease_owner.as_deref() != Some(owner) {
+            return Err(ErrorCode::Io);
+        }
+        job.attempt.lease_expires_at = Some(now + ttl);
+        self.store.put(&job)?;
+        Ok(job)
+    }
+    pub fn release_lease(&mut self, mut job: Job, owner: &str) -> Result<Job, ErrorCode> {
+        if job.attempt.lease_owner.as_deref() != Some(owner) {
+            return Err(ErrorCode::Io);
+        }
+        job.attempt.lease_owner = None;
+        job.attempt.lease_expires_at = None;
+        self.store.put(&job)?;
+        Ok(job)
+    }
+    pub fn retry(&mut self, mut job: Job, manual: bool) -> Result<Job, ErrorCode> {
+        if manual {
+            job.attempt.retries = 0;
+            job.attempt.next_retry_after = None;
+        } else {
+            let delay = retry_delay(job.attempt.retries).ok_or(ErrorCode::Io)?;
+            job.attempt.next_retry_after = Some(delay);
+            job.attempt.retries += 1;
+        }
+        self.store.put(&job)?;
+        Ok(job)
+    }
+    pub fn cancel(&mut self, mut job: Job) -> Result<Job, ErrorCode> {
+        job.cancelled = true;
+        job.state = State::AwaitingImport;
+        job.attempt.state = job.state.clone();
+        self.store.put(&job)?;
+        Ok(job)
+    }
+    pub fn quarantine_empty(&mut self, mut job: Job) -> Result<Job, ErrorCode> {
+        job.quarantined = true;
+        job.state = State::Error(ErrorCode::Parse);
+        job.attempt.state = job.state.clone();
+        self.store.put(&job)?;
+        Ok(job)
+    }
+    fn job(&mut self, state: State) -> Job {
+        let id = self.next_id;
+        self.next_id += 1;
+        Job {
+            id,
+            state: state.clone(),
+            attempt: Attempt {
+                id,
+                state,
+                retries: 0,
+                next_retry_after: None,
+                progress: Progress {
+                    processed_bytes: 0,
+                    total_bytes: None,
+                    indeterminate: true,
+                    work_done: 0,
+                    heartbeat: 0,
+                },
+                lease_owner: None,
+                lease_expires_at: None,
+            },
+            identity: None,
+            canonical: false,
+            quarantined: false,
+            cancelled: false,
+        }
+    }
+}
+
 pub trait ParserAdapter {
     type Parsed;
     type Error: std::fmt::Display;
@@ -341,8 +503,20 @@ pub fn choose_dedup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use tempfile::tempdir;
     struct Fake;
+    #[derive(Default)]
+    struct Mem(BTreeMap<u64, Job>);
+    impl Persist for Mem {
+        fn put(&mut self, job: &Job) -> Result<(), ErrorCode> {
+            self.0.insert(job.id, job.clone());
+            Ok(())
+        }
+        fn get(&self, id: u64) -> Option<Job> {
+            self.0.get(&id).cloned()
+        }
+    }
     impl ParserAdapter for Fake {
         type Parsed = u8;
         type Error = &'static str;
@@ -414,5 +588,39 @@ mod tests {
         let parsed = f.parse(&p, &mut |x| n = x).unwrap();
         f.rate(&parsed).unwrap();
         assert_eq!(n, 1);
+    }
+    #[test]
+    fn orchestrator_transitions_and_lease_race() {
+        let mut o = Orchestrator::new(Mem::default());
+        let j = o.create().unwrap();
+        let j = o.transition(j, State::Validating).unwrap();
+        let now = SystemTime::now();
+        let j = o
+            .acquire_lease(j, "a", now, Duration::from_secs(60))
+            .unwrap();
+        assert!(o
+            .acquire_lease(j.clone(), "b", now, Duration::from_secs(60))
+            .is_err());
+        let j = o.renew_lease(j, "a", now, Duration::from_secs(60)).unwrap();
+        o.release_lease(j, "a").unwrap();
+    }
+    #[test]
+    fn retries_cancel_quarantine_and_resume() {
+        let mut o = Orchestrator::new(Mem::default());
+        let j = o.create().unwrap();
+        let j = o.retry(j, false).unwrap();
+        assert_eq!(j.attempt.retries, 1);
+        let j = o.retry(j, true).unwrap();
+        assert_eq!(j.attempt.retries, 0);
+        let j = o.quarantine_empty(j).unwrap();
+        assert!(!j.canonical && j.quarantined);
+        let j = o.cancel(j).unwrap();
+        assert!(j.cancelled);
+        assert_eq!(o.resume(j.id).unwrap().id, j.id);
+    }
+    #[test]
+    fn legal_transition_table_rejects_skips() {
+        assert!(legal_transition(&State::AwaitingImport, &State::Validating));
+        assert!(!legal_transition(&State::AwaitingImport, &State::Ready));
     }
 }
