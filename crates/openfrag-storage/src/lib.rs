@@ -1,7 +1,7 @@
 //! Local, transactional persistence for openfrag artifacts and analysis runs.
 #![allow(clippy::missing_errors_doc)]
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -1507,15 +1507,17 @@ mod tests {
                 "matched",
             )
             .unwrap();
-        assert!(storage
-            .reconcile(
-                &candidate,
-                &run,
-                None,
-                ReconciliationStatus::Unconfirmed,
-                "again"
-            )
-            .is_err());
+        assert!(
+            storage
+                .reconcile(
+                    &candidate,
+                    &run,
+                    None,
+                    ReconciliationStatus::Unconfirmed,
+                    "again"
+                )
+                .is_err()
+        );
     }
     #[test]
     fn import_lifecycle_persists_public_state() {
