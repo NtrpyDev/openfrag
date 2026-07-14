@@ -1,0 +1,72 @@
+# Post-match import pipeline decision
+
+v1 accepts local `.dem` files only. The pipeline is durable, idempotent, and local. Every transition writes an append-only attempt record before doing external or expensive work; a crash resumes from the last committed state.
+
+## State machine
+
+| State | Meaning and UI copy | Next states |
+|---|---|---|
+| `awaiting_import` | **“Choose a demo file.”** No file has been accepted. | `validating` |
+| `validating` | **“Checking demo file…”** Verify regular file, readable bytes, size limit, and recognized demo header. | `hashing`, `error_corrupt`, `error_unsupported` |
+| `hashing` | **“Fingerprinting demo…”** Compute SHA-256 over immutable source bytes. | `deduplicating`, `error_io` |
+| `deduplicating` | **“Checking for an existing match…”** Look up the hash and parser/build identity. | `copying`, `ready` for an exact existing artifact, `error_conflict` for same hash with incompatible metadata |
+| `copying` | **“Copying demo into openfrag storage…”** Copy to a temporary file, fsync, atomically rename, and verify size and hash. | `parsing`, `error_io` |
+| `parsing` | **“Reading rounds and events…”** Run the pinned parser with bounded memory and record parser errors. | `rating`, `error_parse` |
+| `rating` | **“Calculating Rating and Receipts…”** Run the versioned formula only over validated evidence. | `linking_clips`, `error_analysis` |
+| `linking_clips` | **“Linking available clips…”** Link existing local Clips by match, round, and time range; missing clips are not an import failure. | `ready`, `error_analysis` only for corrupt metadata |
+| `ready` | **“Ready.”** Match, stats, Receipts, and any linked Clips are browsable. | `parsing` for an explicit parser/formula rerun |
+| `error_*` | **“Import needs attention.”** Show stable code, human explanation, and retry or remove action. | retry to the documented predecessor, `awaiting_import`, or terminal removal |
+
+Error codes are `error_io`, `error_corrupt`, `error_unsupported`, `error_conflict`, `error_parse`, and `error_analysis`. Never represent an error as an empty Match.
+
+## Decision fights and winners
+
+### Retries
+
+The optimistic policy is infinite automatic retry. The safer policy is bounded automatic retry for transient I/O only, then visible manual retry. Winner: three attempts with exponential backoff for `error_io`; no automatic retry for corrupt, unsupported, conflict, parser, or analysis errors. A retry creates an attempt record and reuses the same source hash when available.
+
+### Idempotency and crash recovery
+
+The simplest policy is to rerun every stage. The safer policy is content-addressed artifacts and committed checkpoints. Winner: key the source by SHA-256, use atomic temporary-file rename, and make each stage a transaction. On restart, verify checkpoint inputs and continue; delete abandoned temp files. A completed hash plus parser/formula identity is never parsed twice unless explicitly requested.
+
+### Duplicate handling
+
+The simple policy is to create a second Match for every import. The safer policy is exact deduplication by demo hash and calculation identity. Winner: an exact duplicate opens the existing Match and reports **“Already imported.”** The same demo under a new parser or formula identity creates a new append-only calculation run under the same Match, never a second Match.
+
+### Corrupt and unsupported input
+
+The permissive policy is to salvage whatever bytes parse. The safer policy rejects before storage or marks a parse attempt failed. Winner: reject unreadable, truncated, non-demo, and unsupported-version files with a specific error and remediation. Preserve the original only when the user explicitly asks to retain a failed import for diagnosis.
+
+### Parser-version reruns
+
+Overwriting old stats is simple but destroys trend reproducibility. Winner: retain immutable parser and formula identities in every calculation run. A rerun writes new components, Receipts, and Rating beside the old run; the UI labels one run canonical and allows comparison. Never mix versions in one trend line.
+
+### Inbox visibility
+
+The minimalist UI shows only successful Matches. Winner: Inbox lists every active import and terminal error with state, progress, filename, timestamp, retry action, and stable error code. `ready` items remain discoverable through Matches; errors remain until dismissed or removed so failures cannot disappear.
+
+### Deletion and retention
+
+Automatic deletion saves disk but can destroy evidence. Winner: never delete a source demo or Receipt automatically while its Match is retained. User deletion is explicit, confirms the affected Match, stats, Receipts, and Clips, and leaves an audit tombstone containing hash and deletion time. Temporary files and failed copies may be garbage-collected after a grace period; raw failed inputs are not retained by default.
+
+## Invariants
+
+- A Match becomes visible as canonical only after validated storage, successful parsing, Rating, and Receipts are committed.
+- Every state transition is append-only and includes attempt ID, timestamp, input hash when known, parser/build identity, and error details when applicable.
+- A source hash identifies bytes, not a user-supplied filename.
+- A failed attempt cannot create a zero-stat, empty, or partially canonical Match.
+- Atomic copy and verified hash prevent a crash from exposing a partial demo.
+- Clip linking is additive and cannot change parsed stats or Rating.
+- A rerun never mutates a prior calculation or Receipt.
+- User deletion cannot remove a demo still referenced by another Match or calculation run without an explicit dependency confirmation.
+
+## Verification cases
+
+1. Import a valid demo, kill the process during copy and parsing, restart, and verify resume without duplicate Match rows.
+2. Import the same bytes under two filenames and verify **“Already imported.”**
+3. Import a truncated file, non-demo file, unreadable file, and unsupported-version demo; verify stable error state and no canonical Match.
+4. Force a transient storage error and verify three bounded retries, then a visible manual retry.
+5. Rerun a Match with a new parser or formula identity and verify two immutable calculation runs and separate trend series.
+6. Link a matching Clip, a missing Clip, and a malformed Clip reference; verify only the malformed metadata can fail the linking stage.
+7. Delete a Match with dependent calculations or Clips and verify confirmation, dependency warning, and audit tombstone.
+8. Confirm Inbox retains dismissed errors until explicit removal and that no error is rendered as an empty Match.
