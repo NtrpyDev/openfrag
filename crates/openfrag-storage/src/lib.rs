@@ -12,6 +12,7 @@ use uuid::Uuid;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
 const CONTRACT_MIGRATION: &str = include_str!("../migrations/0002_contract.sql");
 const ENFORCEMENT_MIGRATION: &str = include_str!("../migrations/0003_enforcement.sql");
+const IMPORT_LIFECYCLE_MIGRATION: &str = include_str!("../migrations/0004_import_lifecycle.sql");
 
 #[derive(Debug)]
 pub enum Error {
@@ -99,6 +100,45 @@ pub enum ClipDisposition {
     InReview,
     Kept,
     Deleted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImportPhase {
+    Queued,
+    Leased,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+impl ImportPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Leased => "leased",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "leased" => Ok(Self::Leased),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => Err(Error::Invalid("import phase")),
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportJob {
+    pub id: ImportJobId,
+    pub phase: ImportPhase,
+    pub progress_bp: i64,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at_ms: Option<i64>,
+    pub error_code: Option<String>,
 }
 impl ClipDisposition {
     fn as_str(self) -> &'static str {
@@ -240,6 +280,22 @@ impl Storage {
             }
         } else {
             apply_migration(&self.connection, 3, ENFORCEMENT_MIGRATION, &checksum)?;
+        }
+        let checksum = hex_sha256(IMPORT_LIFECYCLE_MIGRATION.as_bytes());
+        let exists: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version=4",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(found) = exists {
+            if found != checksum {
+                return Err(Error::Invalid("migration checksum mismatch"));
+            }
+        } else {
+            apply_migration(&self.connection, 4, IMPORT_LIFECYCLE_MIGRATION, &checksum)?;
         }
         Ok(())
     }
@@ -582,6 +638,69 @@ impl Storage {
         }
         Ok(())
     }
+    #[allow(clippy::type_complexity)]
+    pub fn import_job(&self, id: &ImportJobId) -> Result<ImportJob> {
+        let row: Option<(String, i64, Option<String>, Option<i64>, Option<String>)> = self.connection.query_row("SELECT status,progress_bp,lease_owner,lease_expires_at_ms,error_code FROM import_jobs WHERE id=?",[id.as_str()],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let (phase, progress_bp, lease_owner, lease_expires_at_ms, error_code) =
+            row.ok_or(Error::NotFound("import job"))?;
+        Ok(ImportJob {
+            id: id.clone(),
+            phase: ImportPhase::parse(&phase)?,
+            progress_bp,
+            lease_owner,
+            lease_expires_at_ms,
+            error_code,
+        })
+    }
+    pub fn update_import_progress(
+        &self,
+        id: &ImportJobId,
+        owner: &str,
+        done: Option<i64>,
+        total: Option<i64>,
+        progress: i64,
+        heartbeat: i64,
+    ) -> Result<()> {
+        if !(0..=10_000).contains(&progress) {
+            return Err(Error::Invalid("progress"));
+        }
+        let n=self.connection.execute("UPDATE import_jobs SET bytes_done=?,bytes_total=?,progress_bp=?,heartbeat_at_ms=?,updated_at_ms=? WHERE id=? AND status='leased' AND lease_owner=?",params![done,total,progress,heartbeat,now_ms(),id.as_str(),owner])?;
+        if n == 0 {
+            return Err(Error::IllegalTransition("import progress lease"));
+        }
+        Ok(())
+    }
+    pub fn finish_import(
+        &self,
+        id: &ImportJobId,
+        owner: &str,
+        phase: ImportPhase,
+        error: Option<&str>,
+        remediation: Option<&str>,
+        retry_at: Option<i64>,
+    ) -> Result<()> {
+        if !matches!(
+            phase,
+            ImportPhase::Succeeded | ImportPhase::Failed | ImportPhase::Cancelled
+        ) {
+            return Err(Error::Invalid("terminal phase"));
+        }
+        let n=self.connection.execute("UPDATE import_jobs SET status=?,error_code=?,remediation_code=?,next_retry_at_ms=?,lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE id=? AND status='leased' AND lease_owner=?",params![phase.as_str(),error,remediation,retry_at,now_ms(),id.as_str(),owner])?;
+        if n == 0 {
+            return Err(Error::IllegalTransition("finish import"));
+        }
+        Ok(())
+    }
+    pub fn reset_import_retry(&self, id: &ImportJobId) -> Result<()> {
+        let n=self.connection.execute("UPDATE import_jobs SET status='queued',retry_budget=3,error_code=NULL,remediation_code=NULL,next_retry_at_ms=NULL,lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE id=? AND status IN ('failed','cancelled')",params![now_ms(),id.as_str()])?;
+        if n == 0 {
+            return Err(Error::IllegalTransition("manual retry"));
+        }
+        Ok(())
+    }
+    pub fn recover_expired_imports(&self, now: i64) -> Result<usize> {
+        Ok(self.connection.execute("UPDATE import_jobs SET status='queued',lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE status='leased' AND lease_expires_at_ms < ?",params![now,now])?)
+    }
     pub fn reconcile(
         &self,
         candidate: &LiveCandidateId,
@@ -752,6 +871,49 @@ mod tests {
                     "again"
                 )
                 .is_err()
+        );
+    }
+    #[test]
+    fn import_lifecycle_persists_public_state() {
+        let (_dir, storage) = store();
+        let demo = storage
+            .commit_artifact(storage.stage_artifact(b"import").unwrap(), "dem", None)
+            .unwrap();
+        let job = storage.enqueue_import(&demo).unwrap();
+        assert_eq!(storage.import_job(&job).unwrap().phase, ImportPhase::Queued);
+        storage.lease_import(&job, "worker-a", i64::MAX).unwrap();
+        storage
+            .update_import_progress(&job, "worker-a", Some(5), Some(10), 5000, 77)
+            .unwrap();
+        storage
+            .finish_import(
+                &job,
+                "worker-a",
+                ImportPhase::Failed,
+                Some("network"),
+                Some("retry"),
+                Some(99),
+            )
+            .unwrap();
+        assert_eq!(storage.import_job(&job).unwrap().phase, ImportPhase::Failed);
+        storage.reset_import_retry(&job).unwrap();
+        assert_eq!(storage.import_job(&job).unwrap().phase, ImportPhase::Queued);
+    }
+    #[test]
+    fn import_lease_has_one_public_owner() {
+        let (_dir, storage) = store();
+        let demo = storage
+            .commit_artifact(storage.stage_artifact(b"lease").unwrap(), "dem", None)
+            .unwrap();
+        let job = storage.enqueue_import(&demo).unwrap();
+        storage.lease_import(&job, "first", i64::MAX).unwrap();
+        assert!(matches!(
+            storage.lease_import(&job, "second", i64::MAX),
+            Err(Error::IllegalTransition(_))
+        ));
+        assert_eq!(
+            storage.import_job(&job).unwrap().lease_owner.as_deref(),
+            Some("first")
         );
     }
 }
