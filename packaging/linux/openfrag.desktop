@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=OpenFrag
+Comment=Open the local OpenFrag dashboard
+Exec=/usr/libexec/openfrag/openfrag-open-dashboard
+Terminal=false
+Categories=Game;Utility;
+StartupNotify=true
