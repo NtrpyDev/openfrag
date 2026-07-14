@@ -37,13 +37,16 @@ pub enum PipelineError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImportOutcome {
     Deduplicated {
+        job_id: ImportJobId,
         demo_sha256: String,
     },
     Ready {
+        job_id: ImportJobId,
         demo_sha256: String,
         rating_bp: u16,
     },
     RatingUnavailable {
+        job_id: ImportJobId,
         demo_sha256: String,
         reason: AnalysisUnavailable,
     },
@@ -177,6 +180,7 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
                     )
                     .map_err(storage_error)?;
                 return Ok(ImportOutcome::Deduplicated {
+                    job_id: job.clone(),
                     demo_sha256: demo_sha256.into(),
                 });
             }
@@ -211,11 +215,12 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
             .map_err(storage_error)?;
         let outcome = match analyze(&parsed, request.local_steam_id) {
             Ok(analysis) => {
-                self.persist_available(&run, demo_sha256, request.local_steam_id, &analysis)?
+                self.persist_available(job, &run, demo_sha256, request.local_steam_id, &analysis)?
             }
             Err(reason) => {
                 self.persist_unavailable(&run, &parsed, request.local_steam_id, &reason)?;
                 ImportOutcome::RatingUnavailable {
+                    job_id: job.clone(),
                     demo_sha256: demo_sha256.into(),
                     reason,
                 }
@@ -287,6 +292,7 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
 
     fn persist_available(
         &self,
+        job: &ImportJobId,
         run: &openfrag_storage::AnalysisRunId,
         demo_sha256: &str,
         local: u64,
@@ -382,6 +388,7 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
             }
         }
         Ok(ImportOutcome::Ready {
+            job_id: job.clone(),
             demo_sha256: demo_sha256.into(),
             rating_bp,
         })

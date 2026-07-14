@@ -429,13 +429,15 @@ fn pinned_real_fixture_commits_unavailable_rating_without_empty_match() {
             lease_expires_at_ms: i64::MAX,
         })
         .unwrap();
-    assert_eq!(
+    assert!(matches!(
         outcome,
         ImportOutcome::RatingUnavailable {
-            demo_sha256: "84a1a4191302bdd2a3bbb5a727842093744b1fb1a228aeec630369e44b622cb2".into(),
-            reason: openfrag_analysis::AnalysisUnavailable::MissingTickRate
+            demo_sha256,
+            reason: openfrag_analysis::AnalysisUnavailable::MissingTickRate,
+            ..
         }
-    );
+        if demo_sha256 == "84a1a4191302bdd2a3bbb5a727842093744b1fb1a228aeec630369e44b622cb2"
+    ));
     drop(storage);
     let db = rusqlite::Connection::open(dir.path().join("store/openfrag.sqlite3")).unwrap();
     for (sql, expected) in [
