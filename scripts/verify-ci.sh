@@ -30,6 +30,7 @@ cargo test -p openfrag-import --features demoparser
 cargo test -p openfrag-pipeline --features demoparser
 cargo build -p openfragd --release
 packaging/verify-linux-assets.sh
+scripts/e2e/headless-smoke.sh
 
 if rg -n 'https?://(?!127\.0\.0\.1)' --pcre2 packaging/linux crates/openfragd; then
     printf '%s\n' 'remote runtime endpoint found' >&2
