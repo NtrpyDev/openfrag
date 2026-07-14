@@ -3,8 +3,8 @@ use axum::{
     http::{Request, StatusCode},
 };
 use openfrag_gsi::{
-    Clock, EventSink, EvidenceReceipt, GsiConfig, GsiService, PollOutcome, StateOutput,
-    TransitionFact, router,
+    Clock, DUPLICATE_WINDOW, EventSink, EvidenceReceipt, GsiConfig, GsiService, PollOutcome,
+    StateOutput, TransitionFact, router,
 };
 use std::sync::{
     Arc, Mutex,
@@ -91,8 +91,22 @@ fn snapshot(
     health: i64,
 ) -> String {
     format!(
-        r#"{{"provider":{{"appid":730,"timestamp":1}},"map":{{"name":"{map}","mode":"competitive","phase":"live","round":{round}}},"player":{{"steamid":"{steam_id}","activity":"playing","state":{{"health":{health},"armor":50}},"match_stats":{{"kills":{kills},"deaths":{deaths},"round_kills":1}}}},"auth":{{"token":"{token}"}}}}"#
+        r#"{{"provider":{{"appid":730,"timestamp":1}},"map":{{"name":"{map}","mode":"competitive","phase":"live","round":{round}}},"player":{{"steamid":"{steam_id}","activity":"playing","state":{{"health":{health},"armor":50,"round_kills":1}},"match_stats":{{"kills":{kills},"deaths":{deaths}}}}},"auth":{{"token":"{token}"}}}}"#
     )
+}
+
+fn with_round_kills(body: String, round_kills: i64) -> String {
+    let mut payload: serde_json::Value = serde_json::from_str(&body).expect("test payload");
+    payload["player"]["state"]["round_kills"] = round_kills.into();
+    payload.to_string()
+}
+
+fn with_weapons(body: String) -> String {
+    let mut payload: serde_json::Value = serde_json::from_str(&body).expect("test payload");
+    payload["player"]["weapons"] = serde_json::json!({
+        "weapon_0": { "name": "weapon_ak47", "state": "active" }
+    });
+    payload.to_string()
 }
 
 async fn post(
@@ -155,6 +169,9 @@ async fn seeds_sanitized_evidence_and_accepts_json_content_type_parameters() {
     assert!(receipt.presence.map_round);
     assert!(receipt.presence.player);
     assert!(receipt.presence.player_state);
+    assert!(receipt.presence.player_health);
+    assert!(receipt.presence.player_round_kills);
+    assert!(!receipt.presence.player_weapons);
     assert!(receipt.presence.match_stats);
     assert!(receipt.presence.auth);
     assert!(receipt.presence.auth_token);
@@ -163,6 +180,14 @@ async fn seeds_sanitized_evidence_and_accepts_json_content_type_parameters() {
     assert!(!debug_receipt.contains(TOKEN));
     assert!(!debug_receipt.contains(STEAM_ID));
     assert!(!debug_receipt.contains("de_dust2"));
+    assert_eq!(
+        receipt.context.map_hash.as_deref(),
+        Some("371e8ec5af8518a1fd49f2d74644675ebf4d5514a865c0364e2a6a929cc57ff8")
+    );
+    assert_eq!(receipt.context.observed_round, Some(3));
+    assert_eq!(receipt.context.provider_timestamp, Some(1));
+    assert_eq!(receipt.context.round_kills, Some(1));
+    assert_eq!(receipt.context.health, Some(100));
 }
 
 #[tokio::test]
@@ -240,9 +265,10 @@ async fn derives_a_trusted_kill_fact_from_consecutive_snapshots() {
     assert_eq!(receipts[1].output, StateOutput::Healthy);
     assert_eq!(
         receipts[1].facts,
-        vec![TransitionFact::Kill {
+        vec![TransitionFact::CumulativeKillDelta {
             previous: 4,
-            current: 5
+            current: 5,
+            delta: 1,
         }]
     );
 }
@@ -264,9 +290,10 @@ async fn derives_a_trusted_death_fact_from_consecutive_snapshots() {
     assert_eq!(receipts[1].output, StateOutput::Healthy);
     assert_eq!(
         receipts[1].facts,
-        vec![TransitionFact::Death {
+        vec![TransitionFact::CumulativeDeathDelta {
             previous: 2,
-            current: 3
+            current: 3,
+            delta: 1,
         }]
     );
 }
@@ -361,9 +388,338 @@ async fn sink_failure_is_diagnostic_transactional_and_does_not_stop_the_listener
     assert_eq!(receipts[1].sequence, 2);
     assert_eq!(
         receipts[1].facts,
-        vec![TransitionFact::Kill {
+        vec![TransitionFact::CumulativeKillDelta {
             previous: 4,
-            current: 5
+            current: 5,
+            delta: 1,
         }]
+    );
+}
+
+#[tokio::test]
+async fn records_weapons_presence_without_retaining_weapon_payloads() {
+    let (service, _clock, sink) = harness();
+
+    post(
+        &service,
+        "application/json",
+        with_weapons(payload(TOKEN, STEAM_ID)),
+    )
+    .await;
+
+    let receipt = &sink.receipts()[0];
+    assert!(receipt.presence.player_weapons);
+    assert!(!format!("{receipt:?}").contains("weapon_ak47"));
+}
+
+#[tokio::test]
+async fn round_kill_delta_exposes_the_current_three_kill_rule_threshold() {
+    let (service, _clock, sink) = harness();
+    post(
+        &service,
+        "application/json",
+        with_round_kills(payload(TOKEN, STEAM_ID), 2),
+    )
+    .await;
+
+    post(
+        &service,
+        "application/json",
+        with_round_kills(payload(TOKEN, STEAM_ID), 3),
+    )
+    .await;
+
+    let receipt = &sink.receipts()[1];
+    assert_eq!(receipt.context.round_kills, Some(3));
+    assert_eq!(
+        receipt.facts,
+        vec![TransitionFact::RoundKillDelta {
+            previous: 2,
+            current: 3,
+            delta: 1,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn round_kill_reset_seeds_the_new_round_without_a_false_kill() {
+    let (service, _clock, sink) = harness();
+    post(
+        &service,
+        "application/json",
+        with_round_kills(payload(TOKEN, STEAM_ID), 3),
+    )
+    .await;
+    post(
+        &service,
+        "application/json",
+        with_round_kills(
+            snapshot(TOKEN, STEAM_ID, "de_dust2", 4, 4, 2, 100),
+            0,
+        ),
+    )
+    .await;
+    post(
+        &service,
+        "application/json",
+        with_round_kills(
+            snapshot(TOKEN, STEAM_ID, "de_dust2", 4, 4, 2, 100),
+            1,
+        ),
+    )
+    .await;
+
+    let receipts = sink.receipts();
+    assert_eq!(
+        receipts[1].facts,
+        vec![TransitionFact::RoundEnd {
+            completed: 3,
+            next: 4,
+        }]
+    );
+    assert_eq!(
+        receipts[2].facts,
+        vec![TransitionFact::RoundKillDelta {
+            previous: 0,
+            current: 1,
+            delta: 1,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn emits_health_depleted_only_on_a_positive_to_zero_transition() {
+    let (service, _clock, sink) = harness();
+    post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
+
+    post(
+        &service,
+        "application/json",
+        snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 4, 2, 0),
+    )
+    .await;
+
+    let receipt = &sink.receipts()[1];
+    assert_eq!(receipt.context.health, Some(0));
+    assert_eq!(
+        receipt.facts,
+        vec![TransitionFact::HealthDepleted {
+            previous: 100,
+            current: 0,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn multi_deltas_are_one_co_observed_batch_without_invented_event_order() {
+    let (service, _clock, sink) = harness();
+    post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
+
+    post(
+        &service,
+        "application/json",
+        with_round_kills(
+            snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 6, 3, 0),
+            3,
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        sink.receipts()[1].facts,
+        vec![
+            TransitionFact::CumulativeKillDelta {
+                previous: 4,
+                current: 6,
+                delta: 2,
+            },
+            TransitionFact::CumulativeDeathDelta {
+                previous: 2,
+                current: 3,
+                delta: 1,
+            },
+            TransitionFact::RoundKillDelta {
+                previous: 1,
+                current: 3,
+                delta: 2,
+            },
+            TransitionFact::HealthDepleted {
+                previous: 100,
+                current: 0,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn identical_payload_is_accepted_again_after_the_duplicate_window() {
+    let (service, clock, sink) = harness();
+    let body = payload(TOKEN, STEAM_ID);
+    post(&service, "application/json", body.clone()).await;
+    clock.advance(DUPLICATE_WINDOW + Duration::from_millis(1));
+
+    post(&service, "application/json", body).await;
+
+    let receipts = sink.receipts();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[1].sequence, 2);
+    assert_eq!(receipts[1].output, StateOutput::Healthy);
+}
+
+#[tokio::test]
+async fn distinct_snapshots_with_equal_provider_timestamps_keep_arrival_order() {
+    let (service, _clock, sink) = harness();
+    post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
+    post(
+        &service,
+        "application/json",
+        snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 4, 2, 90),
+    )
+    .await;
+
+    let receipts = sink.receipts();
+    assert_eq!(receipts[0].context.provider_timestamp, Some(1));
+    assert_eq!(receipts[1].context.provider_timestamp, Some(1));
+    assert_eq!((receipts[0].sequence, receipts[1].sequence), (1, 2));
+    assert_eq!(receipts[1].context.health, Some(90));
+}
+
+#[tokio::test]
+async fn valid_token_identity_mismatch_clears_transition_baselines() {
+    let (service, _clock, sink) = harness();
+    post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
+    let mismatch = with_round_kills(
+        snapshot(TOKEN, "other-player", "de_dust2", 3, 99, 2, 100),
+        99,
+    );
+    assert_eq!(
+        post(&service, "application/json", mismatch).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    post(
+        &service,
+        "application/json",
+        with_round_kills(
+            snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 5, 2, 100),
+            2,
+        ),
+    )
+    .await;
+
+    let receipts = sink.receipts();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[1].output, StateOutput::Seeded);
+    assert!(receipts[1].facts.is_empty());
+}
+
+#[tokio::test]
+async fn invalid_token_cannot_reset_a_valid_transition_baseline() {
+    let (service, _clock, sink) = harness();
+    post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
+    post(
+        &service,
+        "application/json",
+        snapshot("attacker", "other-player", "de_dust2", 3, 99, 2, 100),
+    )
+    .await;
+
+    post(
+        &service,
+        "application/json",
+        with_round_kills(
+            snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 5, 2, 100),
+            2,
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        sink.receipts()[1].facts,
+        vec![
+            TransitionFact::CumulativeKillDelta {
+                previous: 4,
+                current: 5,
+                delta: 1,
+            },
+            TransitionFact::RoundKillDelta {
+                previous: 1,
+                current: 2,
+                delta: 1,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn recovery_reseeds_before_later_round_kill_progress() {
+    let (service, clock, sink) = harness();
+    post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
+    clock.advance(Duration::from_secs(30));
+    assert_eq!(service.poll_stale(), Ok(PollOutcome::Stale));
+    let recovered = with_round_kills(
+        snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 5, 2, 80),
+        2,
+    );
+    post(&service, "application/json", recovered.clone()).await;
+    post(&service, "application/json", recovered).await;
+    post(
+        &service,
+        "application/json",
+        with_round_kills(
+            snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 6, 2, 80),
+            3,
+        ),
+    )
+    .await;
+
+    let receipts = sink.receipts();
+    assert_eq!(receipts.len(), 4);
+    assert_eq!(receipts[2].output, StateOutput::Recovered);
+    assert!(receipts[2].facts.is_empty());
+    assert_eq!(
+        receipts[3].facts,
+        vec![
+            TransitionFact::CumulativeKillDelta {
+                previous: 5,
+                current: 6,
+                delta: 1,
+            },
+            TransitionFact::RoundKillDelta {
+                previous: 2,
+                current: 3,
+                delta: 1,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn round_jump_records_each_implied_round_end() {
+    let (service, _clock, sink) = harness();
+    post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
+
+    post(
+        &service,
+        "application/json",
+        with_round_kills(
+            snapshot(TOKEN, STEAM_ID, "de_dust2", 5, 4, 2, 100),
+            0,
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        sink.receipts()[1].facts,
+        vec![
+            TransitionFact::RoundEnd {
+                completed: 3,
+                next: 4,
+            },
+            TransitionFact::RoundEnd {
+                completed: 4,
+                next: 5,
+            },
+        ]
     );
 }
