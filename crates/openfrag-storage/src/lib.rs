@@ -368,6 +368,13 @@ pub struct DeleteResult {
     pub clip_deleted: bool,
     pub artifact_deleted: bool,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManualFlagSaveLink {
+    pub manual_flag_id: ManualFlagId,
+    pub save_attempt_id: SaveAttemptId,
+    pub desired_start_monotonic_ns: i64,
+    pub desired_end_monotonic_ns: i64,
+}
 impl ClipDisposition {
     fn as_str(self) -> &'static str {
         match self {
@@ -968,6 +975,74 @@ impl Storage {
         let id = ManualFlagId::new();
         self.connection.execute("INSERT INTO manual_flags(id,capture_session_id,flagged_monotonic_ns,created_at_ms) VALUES(?,?,?,?)",params![id.as_str(),session.as_str(),monotonic_ns,now_ms()])?;
         Ok(id)
+    }
+    pub fn join_manual_flag_save(
+        &self,
+        manual_flag: &ManualFlagId,
+        save_attempt: &SaveAttemptId,
+        desired_start_ns: i64,
+        desired_end_ns: i64,
+    ) -> Result<()> {
+        if desired_start_ns < 0 || desired_end_ns < desired_start_ns {
+            return Err(Error::Invalid("manual flag save range"));
+        }
+        let flag_session: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT capture_session_id FROM manual_flags WHERE id=?",
+                [manual_flag.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let flag_session = flag_session.ok_or(Error::NotFound("manual flag"))?;
+        let attempt_session: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT capture_session_id FROM recorder_save_attempts WHERE id=?",
+                [save_attempt.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let attempt_session = attempt_session.ok_or(Error::NotFound("save attempt"))?;
+        if flag_session != attempt_session {
+            return Err(Error::Invalid("manual flag save session mismatch"));
+        }
+        let changed = self.connection.execute(
+            "INSERT OR IGNORE INTO manual_flag_save_attempts(manual_flag_id,save_attempt_id,desired_start_monotonic_ns,desired_end_monotonic_ns) VALUES(?,?,?,?)",
+            params![manual_flag.as_str(), save_attempt.as_str(), desired_start_ns, desired_end_ns],
+        )?;
+        if changed == 1 {
+            return Ok(());
+        }
+        let existing = self.manual_flag_save_link(manual_flag, save_attempt)?;
+        if existing.desired_start_monotonic_ns == desired_start_ns
+            && existing.desired_end_monotonic_ns == desired_end_ns
+        {
+            Ok(())
+        } else {
+            Err(Error::Conflict("manual flag save join"))
+        }
+    }
+    pub fn manual_flag_save_link(
+        &self,
+        manual_flag: &ManualFlagId,
+        save_attempt: &SaveAttemptId,
+    ) -> Result<ManualFlagSaveLink> {
+        self.connection
+            .query_row(
+                "SELECT desired_start_monotonic_ns,desired_end_monotonic_ns FROM manual_flag_save_attempts WHERE manual_flag_id=? AND save_attempt_id=?",
+                params![manual_flag.as_str(), save_attempt.as_str()],
+                |row| {
+                    Ok(ManualFlagSaveLink {
+                        manual_flag_id: manual_flag.clone(),
+                        save_attempt_id: save_attempt.clone(),
+                        desired_start_monotonic_ns: row.get(0)?,
+                        desired_end_monotonic_ns: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(Error::NotFound("manual flag save join"))
     }
     pub fn complete_clip_model_metadata(
         &self,
@@ -2220,6 +2295,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
+    }
+    #[test]
+    fn manual_flag_save_join_is_idempotent_and_survives_reopen() {
+        let (dir, storage) = store();
+        let session = storage.create_capture_session("765").unwrap();
+        let flag = storage
+            .create_manual_flag(&session, 42_000_000_000)
+            .unwrap();
+        let attempt = storage
+            .request_save(&session, "manual:42000:1", 42_000_000_000)
+            .unwrap();
+        storage
+            .join_manual_flag_save(&flag, &attempt, 27_000_000_000, 42_000_000_000)
+            .unwrap();
+        storage
+            .join_manual_flag_save(&flag, &attempt, 27_000_000_000, 42_000_000_000)
+            .unwrap();
+        drop(storage);
+
+        let reopened = Storage::open(Layout::at(dir.path())).unwrap();
+        assert_eq!(
+            reopened.manual_flag_save_link(&flag, &attempt).unwrap(),
+            ManualFlagSaveLink {
+                manual_flag_id: flag,
+                save_attempt_id: attempt,
+                desired_start_monotonic_ns: 27_000_000_000,
+                desired_end_monotonic_ns: 42_000_000_000,
+            }
+        );
+    }
+    #[test]
+    fn manual_flag_save_join_rejects_range_mutation_and_reversed_ranges() {
+        let (_dir, storage) = store();
+        let session = storage.create_capture_session("765").unwrap();
+        let flag = storage.create_manual_flag(&session, 42).unwrap();
+        let attempt = storage.request_save(&session, "manual-range", 42).unwrap();
+        storage
+            .join_manual_flag_save(&flag, &attempt, 27, 42)
+            .unwrap();
+        assert!(matches!(
+            storage.join_manual_flag_save(&flag, &attempt, 26, 42),
+            Err(Error::Conflict("manual flag save join"))
+        ));
+        assert!(matches!(
+            storage.join_manual_flag_save(&flag, &attempt, 43, 42),
+            Err(Error::Invalid("manual flag save range"))
+        ));
+        assert_eq!(
+            storage
+                .manual_flag_save_link(&flag, &attempt)
+                .unwrap()
+                .desired_start_monotonic_ns,
+            27
+        );
+    }
+    #[test]
+    fn manual_flag_save_join_rejects_cross_session_relationships() {
+        let (_dir, storage) = store();
+        let flag_session = storage.create_capture_session("765").unwrap();
+        let attempt_session = storage.create_capture_session("765").unwrap();
+        let flag = storage.create_manual_flag(&flag_session, 42).unwrap();
+        let attempt = storage
+            .request_save(&attempt_session, "wrong-session", 42)
+            .unwrap();
+        assert!(matches!(
+            storage.join_manual_flag_save(&flag, &attempt, 27, 42),
+            Err(Error::Invalid("manual flag save session mismatch"))
+        ));
     }
     #[test]
     fn clip_review_metadata_and_rejection_survive_reopen() {
