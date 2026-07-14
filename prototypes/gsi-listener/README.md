@@ -66,6 +66,20 @@ Keep that terminal running.
 
 Restart CS2 or load a map after installing the file. The receiver is bound to `127.0.0.1` only. Captures are written to `prototypes/gsi-listener/captures/gsi-listener-capture.jsonl` and may contain names, SteamIDs, team state, scores, weapons, and map/round details.
 
+## Automated local capture
+
+The harness can run an official local bot match without keyboard or mouse input. It restarts only the current user's CS2, places the game window on virtual desktop 2 by default, waits for a mode-matched `playing` payload, writes a redacted summary, and cleans up its game config, listener, and CS2 process:
+
+```sh
+GSI_HARNESS_CONFIRM_RESTART=YES \
+  prototypes/gsi-listener/scripts/official_map_harness.sh competitive de_dust2
+
+GSI_HARNESS_CONFIRM_RESTART=YES \
+  prototypes/gsi-listener/scripts/official_map_harness.sh deathmatch de_dust2
+```
+
+The current shared Steam filesystem cannot protect a cfg token, so the harness uses a clearly public marker and relies only on its verified IPv4 loopback bind. It refuses an existing openfrag GSI config, an existing Competitive server override, a busy listener port, or a non-allowlisted map. It does not queue public matchmaking or claim that local Competitive proves Premier behavior.
+
 ## Capture checklist
 
 Use a disposable local account or a session whose data you are comfortable retaining. Record the listener output and timestamps for each case:
