@@ -36,7 +36,7 @@ Idempotency keys are:
 - calculation run: `source_sha256 + parser_commit + parser_build + generated_proto_build + requested_schema_hash + metric_definition_version + formula_version + evidence_semantics_epoch`;
 - Match: `source_sha256` and immutable stored-artifact identity;
 - live candidate: `live_candidate_id`;
-- recorder save attempt: `live_candidate_id + save_request_id`;
+- recorder save attempt: globally unique `recorder_request_id`, linked separately to one or more live candidates or a Manual Flag;
 - verified raw Clip artifact: `raw_media_sha256` only after a successful save and verification;
 - reconciliation analysis run: `live_candidate_id + analysis_run_id`;
 
