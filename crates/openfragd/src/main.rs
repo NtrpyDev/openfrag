@@ -1,7 +1,8 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use openfrag_setup::{
-    Discovery, HostFacts, HostProbe, ProbeCommands, ProbeEnvironment, ProbeFilesystem, SystemProbe,
-    evaluate, install_gsi,
+    CaptureConfiguration, CaptureRecorder, Discovery, HostFacts, HostProbe, ProbeCommands,
+    ProbeEnvironment, ProbeFilesystem, SystemProbe, evaluate, install_gsi,
+    write_capture_configuration,
 };
 use openfragd::{AppConfig, app};
 use std::{
@@ -48,6 +49,29 @@ enum Command {
         #[arg(long)]
         steam_id: String,
     },
+    /// Persist private replay capture settings without starting the recorder.
+    SetupCapture {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long, value_enum)]
+        recorder: CaptureRecorderChoice,
+        #[arg(long)]
+        recorder_path: Option<PathBuf>,
+        #[arg(long)]
+        capture_target: String,
+        #[arg(long)]
+        output_dir: PathBuf,
+        #[arg(long)]
+        ffprobe_path: PathBuf,
+        #[arg(long, action = clap::ArgAction::Set, required = true)]
+        enabled: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CaptureRecorderChoice {
+    Native,
+    Flatpak,
 }
 
 #[tokio::main]
@@ -65,7 +89,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cs2_cfg_dir,
             steam_id,
         } => setup_gsi(data_dir, &cs2_cfg_dir, &steam_id),
+        Command::SetupCapture {
+            data_dir,
+            recorder,
+            recorder_path,
+            capture_target,
+            output_dir,
+            ffprobe_path,
+            enabled,
+        } => setup_capture(
+            data_dir,
+            recorder,
+            recorder_path,
+            &capture_target,
+            output_dir,
+            ffprobe_path,
+            enabled,
+        ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn setup_capture(
+    data_dir: Option<PathBuf>,
+    recorder: CaptureRecorderChoice,
+    recorder_path: Option<PathBuf>,
+    capture_target: &str,
+    output_directory: PathBuf,
+    ffprobe_path: PathBuf,
+    enabled: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let data_directory = data_dir.unwrap_or_else(default_data_directory);
+    fs::create_dir_all(&data_directory)?;
+    let recorder = match (recorder, recorder_path) {
+        (CaptureRecorderChoice::Native, Some(path)) => CaptureRecorder::Native(path),
+        (CaptureRecorderChoice::Native, None) => {
+            return Err("--recorder-path is required for the native recorder".into());
+        }
+        (CaptureRecorderChoice::Flatpak, None) => CaptureRecorder::Flatpak,
+        (CaptureRecorderChoice::Flatpak, Some(_)) => {
+            return Err("--recorder-path is not accepted for the Flatpak recorder".into());
+        }
+    };
+    let configuration = CaptureConfiguration::new(
+        enabled,
+        recorder,
+        capture_target,
+        output_directory,
+        ffprobe_path,
+    )
+    .map_err(|error| format!("invalid capture configuration: {error:?}"))?;
+    let installation = write_capture_configuration(&data_directory, &configuration)
+        .map_err(|error| format!("failed to persist capture configuration: {error:?}"))?;
+    println!(
+        "Replay capture configured at {}",
+        installation.path.display()
+    );
+    Ok(())
 }
 
 fn doctor(
