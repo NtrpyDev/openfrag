@@ -3,8 +3,8 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -12,6 +12,7 @@ use uuid::Uuid;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
 const CONTRACT_MIGRATION: &str = include_str!("../migrations/0002_contract.sql");
 const ENFORCEMENT_MIGRATION: &str = include_str!("../migrations/0003_enforcement.sql");
+const IMPORT_LIFECYCLE_MIGRATION: &str = include_str!("../migrations/0004_import_lifecycle.sql");
 
 #[derive(Debug)]
 pub enum Error {
@@ -100,6 +101,80 @@ pub enum ClipDisposition {
     Kept,
     Deleted,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImportPhase {
+    Queued,
+    Leased,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+impl ImportPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Leased => "leased",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "leased" => Ok(Self::Leased),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => Err(Error::Invalid("import phase")),
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportJob {
+    pub id: ImportJobId,
+    pub phase: ImportPhase,
+    pub progress_bp: i64,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at_ms: Option<i64>,
+    pub error_code: Option<String>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactAvailability {
+    Expected,
+    Present,
+    Missing,
+    Deleted,
+}
+impl ArtifactAvailability {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "expected" => Ok(Self::Expected),
+            "present" => Ok(Self::Present),
+            "missing" => Ok(Self::Missing),
+            "deleted" => Ok(Self::Deleted),
+            _ => Err(Error::Invalid("artifact availability")),
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactInfo {
+    pub sha256: String,
+    pub availability: ArtifactAvailability,
+    pub relative_path: Option<String>,
+    pub byte_length: i64,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryResult {
+    pub removed_staging_files: usize,
+    pub marked_missing: usize,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeleteResult {
+    pub clip_deleted: bool,
+    pub artifact_deleted: bool,
+}
 impl ClipDisposition {
     fn as_str(self) -> &'static str {
         match self {
@@ -126,6 +201,7 @@ pub struct Layout {
     pub database: PathBuf,
     pub artifacts: PathBuf,
     pub staging: PathBuf,
+    pub quarantine: PathBuf,
 }
 impl Layout {
     pub fn at(root: impl Into<PathBuf>) -> Self {
@@ -134,6 +210,7 @@ impl Layout {
             database: root.join("openfrag.sqlite3"),
             artifacts: root.join("artifacts/sha256"),
             staging: root.join("staging"),
+            quarantine: root.join("quarantine"),
             root,
         }
     }
@@ -166,15 +243,19 @@ impl Storage {
     pub fn open(layout: Layout) -> Result<Self> {
         fs::create_dir_all(&layout.artifacts)?;
         fs::create_dir_all(&layout.staging)?;
+        fs::create_dir_all(&layout.quarantine)?;
         set_private_permissions(&layout.root)?;
         set_private_permissions(&layout.staging)?;
+        set_private_permissions(&layout.quarantine)?;
         let connection = Connection::open(&layout.database)?;
+        set_file_private_permissions(&layout.database)?;
         connection.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
         )?;
         let storage = Self { connection, layout };
         storage.migrate()?;
         storage.recover_staging()?;
+        storage.recover_artifacts()?;
         Ok(storage)
     }
     pub fn layout(&self) -> &Layout {
@@ -241,17 +322,53 @@ impl Storage {
         } else {
             apply_migration(&self.connection, 3, ENFORCEMENT_MIGRATION, &checksum)?;
         }
+        let checksum = hex_sha256(IMPORT_LIFECYCLE_MIGRATION.as_bytes());
+        let exists: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version=4",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(found) = exists {
+            if found != checksum {
+                return Err(Error::Invalid("migration checksum mismatch"));
+            }
+        } else {
+            apply_migration(&self.connection, 4, IMPORT_LIFECYCLE_MIGRATION, &checksum)?;
+        }
         Ok(())
     }
     pub fn stage_artifact(&self, bytes: &[u8]) -> Result<StagedArtifact> {
-        let sha256 = hex_sha256(bytes);
+        self.stage_from_reader(&mut std::io::Cursor::new(bytes))
+    }
+    pub fn stage_from_reader(&self, reader: &mut impl Read) -> Result<StagedArtifact> {
         let path = self.layout.staging.join(format!("{}.part", Uuid::now_v7()));
-        let mut file = File::create(&path)?;
-        file.write_all(bytes)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        set_file_private_permissions(&path)?;
+        let mut hasher = Sha256::new();
+        let mut length = 0_u64;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+            file.write_all(&buffer[..count])?;
+            length = length
+                .checked_add(u64::try_from(count).map_err(|_| Error::Invalid("reader length"))?)
+                .ok_or(Error::Invalid("artifact too large"))?;
+        }
         file.sync_all()?;
+        sync_parent(&path)?;
         Ok(StagedArtifact {
-            sha256,
-            byte_length: bytes.len() as u64,
+            sha256: format!("{:x}", hasher.finalize()),
+            byte_length: length,
             path,
         })
     }
@@ -274,9 +391,14 @@ impl Storage {
         let parent = target.parent().ok_or(Error::Invalid("artifact path"))?;
         fs::create_dir_all(parent)?;
         if target.exists() {
+            if fs::symlink_metadata(&target)?.file_type().is_symlink() {
+                return Err(Error::Invalid("artifact target symlink"));
+            }
             fs::remove_file(&staged.path)?;
         } else {
             fs::rename(&staged.path, &target)?;
+            set_file_private_permissions(&target)?;
+            sync_parent(&target)?;
         }
         let byte_length =
             i64::try_from(staged.byte_length).map_err(|_| Error::Invalid("artifact too large"))?;
@@ -286,11 +408,198 @@ impl Storage {
     pub fn recover_staging(&self) -> Result<()> {
         for entry in fs::read_dir(&self.layout.staging)? {
             let entry = entry?;
+            if entry.file_type()?.is_symlink() {
+                return Err(Error::Invalid("staging symlink"));
+            }
             if entry.file_type()?.is_file() {
                 fs::remove_file(entry.path())?;
             }
         }
         Ok(())
+    }
+    #[allow(clippy::type_complexity)]
+    pub fn artifact(&self, sha256: &str) -> Result<ArtifactInfo> {
+        let row:Option<(String,String,Option<String>,i64)>=self.connection.query_row("SELECT sha256,availability,relative_path,byte_length FROM artifacts WHERE sha256=?",[sha256],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let (sha256, availability, relative_path, byte_length) =
+            row.ok_or(Error::NotFound("artifact"))?;
+        Ok(ArtifactInfo {
+            sha256,
+            availability: ArtifactAvailability::parse(&availability)?,
+            relative_path,
+            byte_length,
+        })
+    }
+    pub fn expect_artifact(
+        &self,
+        sha256: &str,
+        byte_length: i64,
+        media_type: Option<&str>,
+    ) -> Result<()> {
+        if sha256.len() != 64 || byte_length < 0 {
+            return Err(Error::Invalid("expected artifact"));
+        }
+        let n=self.connection.execute("INSERT OR IGNORE INTO artifacts(sha256,byte_length,media_type,availability,created_at_ms) VALUES(?,?,?,'expected',?)",params![sha256,byte_length,media_type,now_ms()])?;
+        if n == 0 {
+            return Err(Error::Conflict("expected artifact"));
+        }
+        Ok(())
+    }
+    pub fn recover_artifacts(&self) -> Result<RecoveryResult> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT sha256,relative_path FROM artifacts WHERE availability='present'")?;
+        let rows = statement.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        let mut missing = 0;
+        for row in rows {
+            let (sha, path) = row?;
+            let Some(path) = path else {
+                continue;
+            };
+            let target = self.layout.root.join(&path);
+            if !target.exists() {
+                self.connection.execute("UPDATE artifacts SET availability='missing',missing_reason='file_missing' WHERE sha256=? AND availability='present'",[sha])?;
+                missing += 1;
+            }
+        }
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.layout.staging)? {
+            let entry = entry?;
+            if entry.file_type()?.is_symlink() {
+                continue;
+            }
+            if entry.file_type()?.is_file() {
+                fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+        for prefix in fs::read_dir(&self.layout.artifacts)? {
+            let prefix = prefix?;
+            if prefix.file_type()?.is_symlink() {
+                return Err(Error::Invalid("artifact tree symlink"));
+            }
+            if !prefix.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(prefix.path())? {
+                let entry = entry?;
+                if entry.file_type()?.is_symlink() {
+                    continue;
+                }
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                let Some((sha, _extension)) = name.split_once('.') else {
+                    self.quarantine_orphan(&entry.path())?;
+                    continue;
+                };
+                if sha.len() != 64 || sha != hex_sha256(&fs::read(entry.path())?) {
+                    self.quarantine_orphan(&entry.path())?;
+                    continue;
+                }
+                let exists: Option<String> = self
+                    .connection
+                    .query_row("SELECT sha256 FROM artifacts WHERE sha256=?", [sha], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                let relative = entry
+                    .path()
+                    .strip_prefix(&self.layout.root)
+                    .map_err(|_| Error::Invalid("orphan path"))?
+                    .to_string_lossy()
+                    .to_string();
+                if exists.is_none() {
+                    let byte_length = i64::try_from(fs::metadata(entry.path())?.len())
+                        .map_err(|_| Error::Invalid("orphan too large"))?;
+                    self.connection.execute("INSERT INTO artifacts(sha256,relative_path,byte_length,availability,created_at_ms) VALUES(?,?,?,'present',?)",params![sha,relative,byte_length,now_ms()])?;
+                } else {
+                    self.connection.execute("UPDATE artifacts SET availability='present',relative_path=?,missing_reason=NULL WHERE sha256=? AND availability IN ('expected','missing')",params![relative,sha])?;
+                }
+            }
+        }
+        Ok(RecoveryResult {
+            removed_staging_files: removed,
+            marked_missing: missing,
+        })
+    }
+    fn quarantine_orphan(&self, path: &Path) -> Result<()> {
+        let target = self.layout.quarantine.join(format!(
+            "{}-{}",
+            Uuid::now_v7(),
+            path.file_name()
+                .ok_or(Error::Invalid("orphan name"))?
+                .to_string_lossy()
+        ));
+        fs::rename(path, target)?;
+        Ok(())
+    }
+    pub fn integrity_check(&self) -> Result<bool> {
+        Ok(self
+            .connection
+            .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))?
+            == "ok")
+    }
+    #[cfg(test)]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn hold_write_lock_for_test(
+        &mut self,
+        ready: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> Result<()> {
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        ready
+            .send(())
+            .map_err(|_| Error::Invalid("test lock receiver"))?;
+        release
+            .recv()
+            .map_err(|_| Error::Invalid("test lock sender"))?;
+        self.connection.execute_batch("COMMIT")?;
+        Ok(())
+    }
+    pub fn delete_clip(&self, clip: &ClipId) -> Result<DeleteResult> {
+        let artifact: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT artifact_sha256 FROM clips WHERE id=? AND deleted_at_ms IS NULL",
+                [clip.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let artifact = artifact.ok_or(Error::NotFound("live clip"))?;
+        let n=self.connection.execute("UPDATE clips SET disposition='deleted',deleted_at_ms=? WHERE id=? AND deleted_at_ms IS NULL",params![now_ms(),clip.as_str()])?;
+        if n == 0 {
+            return Err(Error::IllegalTransition("clip delete"));
+        }
+        let remaining: i64 = self.connection.query_row(
+            "SELECT count(*) FROM clips WHERE artifact_sha256=? AND deleted_at_ms IS NULL",
+            [&artifact],
+            |r| r.get(0),
+        )?;
+        if remaining > 0 {
+            return Ok(DeleteResult {
+                clip_deleted: true,
+                artifact_deleted: false,
+            });
+        }
+        let info = self.artifact(&artifact)?;
+        if let Some(relative) = info.relative_path {
+            let path = self.layout.root.join(relative);
+            if path.exists() {
+                fs::remove_file(&path)?;
+                sync_parent(&path)?;
+            }
+        }
+        self.connection.execute(
+            "UPDATE artifacts SET availability='deleted',deleted_at_ms=? WHERE sha256=?",
+            params![now_ms(), artifact],
+        )?;
+        Ok(DeleteResult {
+            clip_deleted: true,
+            artifact_deleted: true,
+        })
     }
     pub fn create_capture_session(&self, local_steam_id: &str) -> Result<CaptureSessionId> {
         let id = CaptureSessionId::new();
@@ -582,6 +891,69 @@ impl Storage {
         }
         Ok(())
     }
+    #[allow(clippy::type_complexity)]
+    pub fn import_job(&self, id: &ImportJobId) -> Result<ImportJob> {
+        let row: Option<(String, i64, Option<String>, Option<i64>, Option<String>)> = self.connection.query_row("SELECT status,progress_bp,lease_owner,lease_expires_at_ms,error_code FROM import_jobs WHERE id=?",[id.as_str()],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let (phase, progress_bp, lease_owner, lease_expires_at_ms, error_code) =
+            row.ok_or(Error::NotFound("import job"))?;
+        Ok(ImportJob {
+            id: id.clone(),
+            phase: ImportPhase::parse(&phase)?,
+            progress_bp,
+            lease_owner,
+            lease_expires_at_ms,
+            error_code,
+        })
+    }
+    pub fn update_import_progress(
+        &self,
+        id: &ImportJobId,
+        owner: &str,
+        done: Option<i64>,
+        total: Option<i64>,
+        progress: i64,
+        heartbeat: i64,
+    ) -> Result<()> {
+        if !(0..=10_000).contains(&progress) {
+            return Err(Error::Invalid("progress"));
+        }
+        let n=self.connection.execute("UPDATE import_jobs SET bytes_done=?,bytes_total=?,progress_bp=?,heartbeat_at_ms=?,updated_at_ms=? WHERE id=? AND status='leased' AND lease_owner=?",params![done,total,progress,heartbeat,now_ms(),id.as_str(),owner])?;
+        if n == 0 {
+            return Err(Error::IllegalTransition("import progress lease"));
+        }
+        Ok(())
+    }
+    pub fn finish_import(
+        &self,
+        id: &ImportJobId,
+        owner: &str,
+        phase: ImportPhase,
+        error: Option<&str>,
+        remediation: Option<&str>,
+        retry_at: Option<i64>,
+    ) -> Result<()> {
+        if !matches!(
+            phase,
+            ImportPhase::Succeeded | ImportPhase::Failed | ImportPhase::Cancelled
+        ) {
+            return Err(Error::Invalid("terminal phase"));
+        }
+        let n=self.connection.execute("UPDATE import_jobs SET status=?,error_code=?,remediation_code=?,next_retry_at_ms=?,lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE id=? AND status='leased' AND lease_owner=?",params![phase.as_str(),error,remediation,retry_at,now_ms(),id.as_str(),owner])?;
+        if n == 0 {
+            return Err(Error::IllegalTransition("finish import"));
+        }
+        Ok(())
+    }
+    pub fn reset_import_retry(&self, id: &ImportJobId) -> Result<()> {
+        let n=self.connection.execute("UPDATE import_jobs SET status='queued',retry_budget=3,error_code=NULL,remediation_code=NULL,next_retry_at_ms=NULL,lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE id=? AND status IN ('failed','cancelled')",params![now_ms(),id.as_str()])?;
+        if n == 0 {
+            return Err(Error::IllegalTransition("manual retry"));
+        }
+        Ok(())
+    }
+    pub fn recover_expired_imports(&self, now: i64) -> Result<usize> {
+        Ok(self.connection.execute("UPDATE import_jobs SET status='queued',lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE status='leased' AND lease_expires_at_ms < ?",params![now,now])?)
+    }
     pub fn reconcile(
         &self,
         candidate: &LiveCandidateId,
@@ -651,6 +1023,19 @@ fn set_private_permissions(path: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
+    Ok(())
+}
+fn set_file_private_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+fn sync_parent(path: &Path) -> Result<()> {
+    let parent = path.parent().ok_or(Error::Invalid("path parent"))?;
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -753,5 +1138,251 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+    #[test]
+    fn import_lifecycle_persists_public_state() {
+        let (_dir, storage) = store();
+        let demo = storage
+            .commit_artifact(storage.stage_artifact(b"import").unwrap(), "dem", None)
+            .unwrap();
+        let job = storage.enqueue_import(&demo).unwrap();
+        assert_eq!(storage.import_job(&job).unwrap().phase, ImportPhase::Queued);
+        storage.lease_import(&job, "worker-a", i64::MAX).unwrap();
+        storage
+            .update_import_progress(&job, "worker-a", Some(5), Some(10), 5000, 77)
+            .unwrap();
+        storage
+            .finish_import(
+                &job,
+                "worker-a",
+                ImportPhase::Failed,
+                Some("network"),
+                Some("retry"),
+                Some(99),
+            )
+            .unwrap();
+        assert_eq!(storage.import_job(&job).unwrap().phase, ImportPhase::Failed);
+        storage.reset_import_retry(&job).unwrap();
+        assert_eq!(storage.import_job(&job).unwrap().phase, ImportPhase::Queued);
+    }
+    #[test]
+    fn import_lease_has_one_public_owner() {
+        let (_dir, storage) = store();
+        let demo = storage
+            .commit_artifact(storage.stage_artifact(b"lease").unwrap(), "dem", None)
+            .unwrap();
+        let job = storage.enqueue_import(&demo).unwrap();
+        storage.lease_import(&job, "first", i64::MAX).unwrap();
+        assert!(matches!(
+            storage.lease_import(&job, "second", i64::MAX),
+            Err(Error::IllegalTransition(_))
+        ));
+        assert_eq!(
+            storage.import_job(&job).unwrap().lease_owner.as_deref(),
+            Some("first")
+        );
+    }
+    #[test]
+    fn streaming_artifact_is_private_and_queryable() {
+        let (_dir, storage) = store();
+        let mut reader = std::io::Cursor::new(vec![7_u8; 130_000]);
+        let hash = storage
+            .commit_artifact(storage.stage_from_reader(&mut reader).unwrap(), "dem", None)
+            .unwrap();
+        let artifact = storage.artifact(&hash).unwrap();
+        assert_eq!(artifact.availability, ArtifactAvailability::Present);
+        assert_eq!(artifact.byte_length, 130_000);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(storage.layout().database.clone())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+    #[test]
+    fn unsafe_extension_is_rejected_without_public_artifact() {
+        let (_dir, storage) = store();
+        let staged = storage.stage_artifact(b"unsafe").unwrap();
+        let hash = staged.sha256.clone();
+        assert!(matches!(
+            storage.commit_artifact(staged, "../dem", None),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(storage.artifact(&hash), Err(Error::NotFound(_))));
+    }
+    #[test]
+    fn shared_delete_retains_then_tombstones_artifact() {
+        let (_dir, storage) = store();
+        let hash = storage
+            .commit_artifact(storage.stage_artifact(b"shared").unwrap(), "mkv", None)
+            .unwrap();
+        let session = storage.create_capture_session("765").unwrap();
+        let a = storage.request_save(&session, "delete-a", 1).unwrap();
+        storage.complete_save(&a, &hash, 1, 2).unwrap();
+        let first = storage.create_clip(&a, "raw_auto").unwrap();
+        let b = storage.request_save(&session, "delete-b", 1).unwrap();
+        storage.complete_save(&b, &hash, 1, 2).unwrap();
+        let second = storage.create_clip(&b, "raw_auto").unwrap();
+        assert_eq!(
+            storage.delete_clip(&first).unwrap(),
+            DeleteResult {
+                clip_deleted: true,
+                artifact_deleted: false
+            }
+        );
+        assert_eq!(
+            storage.delete_clip(&second).unwrap(),
+            DeleteResult {
+                clip_deleted: true,
+                artifact_deleted: true
+            }
+        );
+        assert_eq!(
+            storage.artifact(&hash).unwrap().availability,
+            ArtifactAvailability::Deleted
+        );
+    }
+    #[test]
+    fn reopen_marks_missing_referenced_artifact() {
+        let (dir, storage) = store();
+        let hash = storage
+            .commit_artifact(storage.stage_artifact(b"missing").unwrap(), "dem", None)
+            .unwrap();
+        let path = storage
+            .layout()
+            .root
+            .join(storage.artifact(&hash).unwrap().relative_path.unwrap());
+        drop(storage);
+        fs::remove_file(path).unwrap();
+        let reopened = Storage::open(Layout::at(dir.path())).unwrap();
+        assert_eq!(
+            reopened.artifact(&hash).unwrap().availability,
+            ArtifactAvailability::Missing
+        );
+    }
+    #[test]
+    fn reopen_repairs_verified_rename_before_catalog_commit() {
+        let (dir, storage) = store();
+        let staged = storage.stage_artifact(b"crash-window").unwrap();
+        let hash = staged.sha256.clone();
+        let target = storage
+            .layout()
+            .artifacts
+            .join(&hash[..2])
+            .join(format!("{hash}.dem"));
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::rename(staged.path, target).unwrap();
+        drop(storage);
+        let reopened = Storage::open(Layout::at(dir.path())).unwrap();
+        assert_eq!(
+            reopened.artifact(&hash).unwrap().availability,
+            ArtifactAvailability::Present
+        );
+    }
+    #[test]
+    fn reopen_quarantines_unrecognized_orphan_without_cataloging() {
+        let (dir, storage) = store();
+        let path = storage.layout().artifacts.join("aa/orphan.dem");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"untrusted").unwrap();
+        drop(storage);
+        let reopened = Storage::open(Layout::at(dir.path())).unwrap();
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_dir(&reopened.layout().quarantine).unwrap().count(),
+            1
+        );
+    }
+    #[test]
+    fn reopen_repairs_expected_artifact_at_verified_path() {
+        let (dir, storage) = store();
+        let staged = storage.stage_artifact(b"expected").unwrap();
+        let hash = staged.sha256.clone();
+        storage
+            .expect_artifact(&hash, i64::try_from(staged.byte_length).unwrap(), None)
+            .unwrap();
+        let path = storage
+            .layout()
+            .artifacts
+            .join(&hash[..2])
+            .join(format!("{hash}.dem"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::rename(staged.path, path).unwrap();
+        drop(storage);
+        let reopened = Storage::open(Layout::at(dir.path())).unwrap();
+        assert_eq!(
+            reopened.artifact(&hash).unwrap().availability,
+            ArtifactAvailability::Present
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn staging_symlink_is_rejected_without_following_it() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        fs::create_dir_all(&layout.staging).unwrap();
+        symlink("/etc/passwd", layout.staging.join("bad.part")).unwrap();
+        assert!(matches!(
+            Storage::open(layout),
+            Err(Error::Invalid("staging symlink"))
+        ));
+    }
+    #[test]
+    fn two_open_handles_preserve_independent_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Storage::open(Layout::at(dir.path())).unwrap();
+        let second = Storage::open(Layout::at(dir.path())).unwrap();
+        let a = first.create_capture_session("one").unwrap();
+        let b = second.create_capture_session("two").unwrap();
+        assert_ne!(a.as_str(), b.as_str());
+        drop(first);
+        drop(second);
+        let reopened = Storage::open(Layout::at(dir.path())).unwrap();
+        assert!(reopened.create_capture_session("three").is_ok());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn artifact_tree_symlink_is_rejected_without_following_it() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        fs::create_dir_all(&layout.artifacts).unwrap();
+        symlink("/etc", layout.artifacts.join("aa")).unwrap();
+        assert!(matches!(
+            Storage::open(layout),
+            Err(Error::Invalid("artifact tree symlink"))
+        ));
+    }
+    #[test]
+    fn independent_connections_wait_for_real_write_lock_and_reopen_cleanly() {
+        use std::sync::mpsc;
+        use std::thread;
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        let mut locked = Storage::open(layout.clone()).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = thread::spawn(move || locked.hold_write_lock_for_test(ready_tx, release_rx));
+        ready_rx.recv().unwrap();
+        let writer_layout = layout.clone();
+        let writer = thread::spawn(move || {
+            let storage = Storage::open(writer_layout).unwrap();
+            storage.create_capture_session("contender")
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap().unwrap();
+        let id = writer.join().unwrap().unwrap();
+        assert!(!id.as_str().is_empty());
+        let reopened = Storage::open(layout).unwrap();
+        assert!(reopened.integrity_check().unwrap());
+        assert!(reopened.create_capture_session("after").is_ok());
     }
 }

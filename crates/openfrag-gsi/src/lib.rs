@@ -1,246 +1,413 @@
-use serde::Deserialize;
+#![allow(clippy::missing_errors_doc, clippy::struct_excessive_bools)]
+
+use axum::{
+    Router,
+    body::Bytes,
+    extract::{DefaultBodyLimit, State},
+    http::{HeaderMap, StatusCode},
+    routing::post,
+};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 pub const MAX_BODY_BYTES: usize = 128 * 1024;
-pub const DUPLICATE_WINDOW: Duration = Duration::from_secs(2);
 
-#[derive(Debug, Clone)]
-pub struct IngestConfig {
-    pub auth_token: String,
-    pub local_steamid: String,
+pub trait Clock: Send + Sync {
+    fn now(&self) -> Duration;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IngestError {
-    TooLarge,
-    InvalidJson,
-    WrongApp,
-    Unauthorized,
-    SinkFailure,
+pub trait EventSink: Send + Sync {
+    fn emit(&self, receipt: EvidenceReceipt) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvidenceReceipt {
+    pub sequence: u64,
+    pub received_at: Duration,
+    pub payload_hash: String,
+    pub presence: PresenceBits,
+    pub output: StateOutput,
+    pub facts: Vec<TransitionFact>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PresenceBits {
+    pub provider: bool,
+    pub provider_timestamp: bool,
+    pub map: bool,
+    pub map_round: bool,
+    pub player: bool,
+    pub player_state: bool,
+    pub match_stats: bool,
+    pub auth: bool,
+    pub auth_token: bool,
+    pub player_steamid: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum StateOutput {
+    Seeded,
+    Healthy,
+    Stale,
+    Recovered,
+    SessionReset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HttpStatus {
-    Ok,
-    BadRequest,
-    Unauthorized,
-    PayloadTooLarge,
-    MethodNotAllowed,
-    NotFound,
-    InternalError,
-}
-pub fn http_status(error: Option<&IngestError>) -> HttpStatus {
-    match error {
-        None => HttpStatus::Ok,
-        Some(IngestError::TooLarge) => HttpStatus::PayloadTooLarge,
-        Some(IngestError::Unauthorized) => HttpStatus::Unauthorized,
-        Some(IngestError::WrongApp | IngestError::InvalidJson) => HttpStatus::BadRequest,
-        Some(IngestError::SinkFailure) => HttpStatus::InternalError,
-    }
-}
-pub trait ReceiptSink {
-    fn persist(&mut self, receipt: &Receipt) -> Result<(), String>;
+pub enum PollOutcome {
+    NoChange,
+    Stale,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct Payload {
-    pub provider: Option<Provider>,
-    pub map: Option<MapState>,
-    pub player: Option<PlayerState>,
-    pub auth: Option<Auth>,
-}
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct Provider {
-    pub appid: Option<u64>,
-    pub timestamp: Option<String>,
-    pub steamid: Option<String>,
-}
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct MapState {
-    pub name: Option<String>,
-    pub mode: Option<String>,
-    pub phase: Option<String>,
-    pub round: Option<u64>,
-}
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct PlayerState {
-    pub activity: Option<String>,
-    pub state: Option<PlayerHealth>,
-}
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct PlayerHealth {
-    pub health: Option<i64>,
-    pub armor: Option<i64>,
-}
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct Auth {
-    pub token: Option<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceDiagnostic {
+    StateUnavailable,
+    SinkFailure,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Evidence {
-    Provisional,
-    Confirmed,
-}
-#[derive(Debug, Clone, PartialEq)]
-pub struct Receipt {
-    pub sequence: u64,
-    pub payload: Payload,
-    pub redacted: String,
-    pub evidence: Evidence,
-    pub payload_hash: String,
-    pub arrival_ordinal: u64,
-    pub receive_elapsed_ms: u128,
-}
-#[derive(Debug, Default)]
-pub struct IngestState {
-    seen: HashSet<String>,
-    next: u64,
-    pub seed: Option<Receipt>,
-    hashes: HashMap<String, Instant>,
-    started: Option<Instant>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum TransitionFact {
+    Kill { previous: i64, current: i64 },
+    Death { previous: i64, current: i64 },
+    RoundEnd { completed: u64, next: u64 },
 }
 
-pub fn ingest_configured(
-    state: &mut IngestState,
-    config: &IngestConfig,
-    body: &[u8],
-) -> Result<Option<Receipt>, IngestError> {
-    if body.len() > MAX_BODY_BYTES {
-        return Err(IngestError::TooLarge);
+#[derive(Debug, Clone)]
+pub struct GsiConfig {
+    auth_token_hash: [u8; 32],
+    local_steamid_hash: [u8; 32],
+    heartbeat: Duration,
+}
+
+impl GsiConfig {
+    #[must_use]
+    pub fn new(auth_token: &str, local_steamid: &str, heartbeat: Duration) -> Self {
+        Self {
+            auth_token_hash: digest(auth_token.as_bytes()),
+            local_steamid_hash: digest(local_steamid.as_bytes()),
+            heartbeat,
+        }
     }
-    let mut hasher = Sha256::new();
-    hasher.update(body);
-    let hash = format!("{:x}", hasher.finalize());
-    let now = Instant::now();
-    let start = *state.started.get_or_insert(now);
-    let payload: Payload = serde_json::from_slice(body).map_err(|_| IngestError::InvalidJson)?;
-    if payload.provider.as_ref().and_then(|p| p.appid) != Some(730) {
-        return Err(IngestError::WrongApp);
+}
+
+#[derive(Clone)]
+pub struct GsiService {
+    config: GsiConfig,
+    clock: Arc<dyn Clock>,
+    sink: Arc<dyn EventSink>,
+    engine: Arc<Mutex<EngineState>>,
+}
+
+impl GsiService {
+    #[must_use]
+    pub fn new(config: GsiConfig, clock: Arc<dyn Clock>, sink: Arc<dyn EventSink>) -> Self {
+        Self {
+            config,
+            clock,
+            sink,
+            engine: Arc::new(Mutex::new(EngineState::default())),
+        }
     }
-    if payload.provider.as_ref().and_then(|p| p.steamid.as_deref())
-        != Some(config.local_steamid.as_str())
+
+    /// Polls the deterministic clock and emits a single stale receipt per outage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an explicit diagnostic if state cannot be locked or evidence cannot be emitted.
+    pub fn poll_stale(&self) -> Result<PollOutcome, ServiceDiagnostic> {
+        let now = self.clock.now();
+        let mut guard = self
+            .engine
+            .lock()
+            .map_err(|_| ServiceDiagnostic::StateUnavailable)?;
+        let Some(last_received_at) = guard.last_received_at else {
+            return Ok(PollOutcome::NoChange);
+        };
+        if guard.stale || now.saturating_sub(last_received_at) < stale_after(self.config.heartbeat)
+        {
+            return Ok(PollOutcome::NoChange);
+        }
+        let (Some(payload_hash), Some(presence)) = (guard.last_hash.clone(), guard.last_presence)
+        else {
+            return Ok(PollOutcome::NoChange);
+        };
+        let receipt = EvidenceReceipt {
+            sequence: guard.sequence + 1,
+            received_at: now,
+            payload_hash,
+            presence,
+            output: StateOutput::Stale,
+            facts: Vec::new(),
+        };
+        self.sink
+            .emit(receipt.clone())
+            .map_err(|_| ServiceDiagnostic::SinkFailure)?;
+        guard.sequence = receipt.sequence;
+        guard.stale = true;
+        Ok(PollOutcome::Stale)
+    }
+}
+
+#[must_use]
+pub fn stale_after(heartbeat: Duration) -> Duration {
+    heartbeat.saturating_mul(3).min(Duration::from_secs(90))
+}
+
+pub fn router(service: GsiService) -> Router {
+    Router::new()
+        .route("/gsi/router", post(route_post))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .with_state(service)
+}
+
+async fn route_post(
+    State(service): State<GsiService>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, &'static str) {
+    if headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_none_or(|media_type| !media_type.eq_ignore_ascii_case("application/json"))
     {
-        return Err(IngestError::WrongApp);
+        return (StatusCode::UNSUPPORTED_MEDIA_TYPE, "wrong-content-type");
     }
-    if payload.auth.as_ref().and_then(|a| a.token.as_deref()) != Some(config.auth_token.as_str()) {
-        return Err(IngestError::WrongApp);
-    }
-    state
-        .hashes
-        .retain(|_, seen| now.duration_since(*seen) <= DUPLICATE_WINDOW);
-    if state.hashes.insert(hash.clone(), now).is_some() {
-        return Ok(None);
-    }
-    state.next += 1;
-    let mut value: serde_json::Value =
-        serde_json::from_slice(body).map_err(|_| IngestError::InvalidJson)?;
-    if let Some(obj) = value.as_object_mut() {
-        obj.remove("auth");
-        if let Some(p) = obj.get_mut("provider").and_then(|v| v.as_object_mut()) {
-            p.remove("steamid");
-        }
-    }
-    let receipt = Receipt {
-        sequence: state.next,
-        payload,
-        redacted: value.to_string(),
-        evidence: Evidence::Provisional,
-        payload_hash: hash,
-        arrival_ordinal: state.next,
-        receive_elapsed_ms: start.elapsed().as_millis(),
+
+    let Ok(payload) = serde_json::from_slice::<Payload>(&body) else {
+        return (StatusCode::BAD_REQUEST, "invalid-json");
     };
-    if state.seed.is_none() {
-        state.seed = Some(receipt.clone());
+    let token_matches = payload
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.token.as_deref())
+        .is_some_and(|token| digest(token.as_bytes()) == service.config.auth_token_hash);
+    let player_matches = payload
+        .player
+        .as_ref()
+        .and_then(|player| player.steamid.as_deref())
+        .is_some_and(|steamid| digest(steamid.as_bytes()) == service.config.local_steamid_hash);
+    if !token_matches || !player_matches {
+        return (StatusCode::UNAUTHORIZED, "unauthorized");
     }
-    Ok(Some(receipt))
-}
 
-pub fn post_gsi(
-    state: &mut IngestState,
-    config: &IngestConfig,
-    method: &str,
-    path: &str,
-    content_type: &str,
-    body: &[u8],
-    sink: &mut dyn ReceiptSink,
-) -> (HttpStatus, Option<Receipt>) {
-    if method != "POST" {
-        return (HttpStatus::MethodNotAllowed, None);
-    }
-    if path != "/gsi" {
-        return (HttpStatus::NotFound, None);
-    }
-    if content_type != "application/json" {
-        return (HttpStatus::BadRequest, None);
-    }
-    match ingest_configured(state, config, body) {
-        Ok(Some(r)) => {
-            if sink.persist(&r).is_err() {
-                return (HttpStatus::InternalError, None);
-            }
-            (HttpStatus::Ok, Some(r))
-        }
-        Ok(None) => (HttpStatus::Ok, None),
-        Err(e) => (http_status(Some(&e)), None),
-    }
-}
-
-pub fn ingest(state: &mut IngestState, body: &[u8]) -> Result<Option<Receipt>, IngestError> {
-    if body.len() > MAX_BODY_BYTES {
-        return Err(IngestError::TooLarge);
-    }
-    let payload: Payload = serde_json::from_slice(body).map_err(|_| IngestError::InvalidJson)?;
-    if payload.provider.as_ref().and_then(|p| p.appid) != Some(730) {
-        return Err(IngestError::WrongApp);
-    }
-    let fingerprint = payload
+    if payload
         .provider
         .as_ref()
-        .and_then(|p| p.timestamp.clone())
-        .unwrap_or_default();
-    if !state.seen.insert(fingerprint) {
-        return Ok(None);
+        .and_then(|provider| provider.appid)
+        != Some(730)
+    {
+        return (StatusCode::BAD_REQUEST, "wrong-app");
     }
-    state.next += 1;
-    let mut value: serde_json::Value =
-        serde_json::from_slice(body).map_err(|_| IngestError::InvalidJson)?;
-    if let Some(obj) = value.as_object_mut() {
-        obj.remove("auth");
-        if let Some(provider) = obj.get_mut("provider").and_then(|v| v.as_object_mut()) {
-            provider.remove("steamid");
-        }
-    }
-    let receipt = Receipt {
-        sequence: state.next,
-        payload,
-        redacted: value.to_string(),
-        evidence: Evidence::Provisional,
-        payload_hash: String::new(),
-        arrival_ordinal: state.next,
-        receive_elapsed_ms: 0,
+
+    let received_at = service.clock.now();
+    let hash = hex_digest(&body);
+    let Ok(mut guard) = service.engine.lock() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "state-unavailable");
     };
-    if state.seed.is_none() {
-        state.seed = Some(receipt.clone());
+    if guard.last_hash.as_deref() == Some(hash.as_str()) {
+        return (StatusCode::OK, "duplicate");
     }
-    Ok(Some(receipt))
+
+    let snapshot = TrustedSnapshot::from(&payload);
+    let (output, facts) = match guard.snapshot.as_ref() {
+        None => (StateOutput::Seeded, Vec::new()),
+        Some(_) if guard.stale => (StateOutput::Recovered, Vec::new()),
+        Some(previous) => derive_transition(previous, &snapshot),
+    };
+    let presence = PresenceBits::from(&payload);
+    let receipt = EvidenceReceipt {
+        sequence: guard.sequence + 1,
+        received_at,
+        payload_hash: hash.clone(),
+        presence,
+        output,
+        facts,
+    };
+    if service.sink.emit(receipt.clone()).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "sink-failure");
+    }
+    guard.sequence = receipt.sequence;
+    guard.last_hash = Some(hash);
+    guard.last_presence = Some(presence);
+    guard.last_received_at = Some(received_at);
+    guard.snapshot = Some(snapshot);
+    guard.stale = false;
+    (StatusCode::OK, "seeded")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn cap_and_duplicate_and_redaction() {
-        let mut s = IngestState::default();
-        let b=br#"{"provider":{"appid":730,"timestamp":"1","steamid":"secret"},"auth":{"token":"secret"}}"#;
-        let r = ingest(&mut s, b).unwrap().unwrap();
-        assert!(!r.redacted.contains("secret"));
-        assert!(ingest(&mut s, b).unwrap().is_none());
-        assert_eq!(
-            ingest(&mut s, &vec![b'x'; MAX_BODY_BYTES + 1]),
-            Err(IngestError::TooLarge)
-        );
+#[derive(Deserialize)]
+struct Payload {
+    provider: Option<Provider>,
+    map: Option<MapState>,
+    auth: Option<Auth>,
+    player: Option<PlayerState>,
+}
+
+#[derive(Deserialize)]
+struct Provider {
+    appid: Option<u64>,
+    timestamp: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct MapState {
+    name: Option<String>,
+    mode: Option<String>,
+    round: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct Auth {
+    token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PlayerState {
+    steamid: Option<String>,
+    state: Option<PlayerVitals>,
+    match_stats: Option<MatchStats>,
+}
+
+#[derive(Deserialize)]
+struct PlayerVitals {}
+
+#[derive(Deserialize)]
+struct MatchStats {
+    kills: Option<i64>,
+    deaths: Option<i64>,
+}
+
+impl From<&Payload> for PresenceBits {
+    fn from(payload: &Payload) -> Self {
+        Self {
+            provider: payload.provider.is_some(),
+            provider_timestamp: payload
+                .provider
+                .as_ref()
+                .is_some_and(|provider| provider.timestamp.is_some()),
+            map: payload.map.is_some(),
+            map_round: payload.map.as_ref().is_some_and(|map| map.round.is_some()),
+            player: payload.player.is_some(),
+            player_state: payload
+                .player
+                .as_ref()
+                .is_some_and(|player| player.state.is_some()),
+            match_stats: payload
+                .player
+                .as_ref()
+                .is_some_and(|player| player.match_stats.is_some()),
+            auth: payload.auth.is_some(),
+            auth_token: payload
+                .auth
+                .as_ref()
+                .is_some_and(|auth| auth.token.is_some()),
+            player_steamid: payload
+                .player
+                .as_ref()
+                .is_some_and(|player| player.steamid.is_some()),
+        }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct EngineState {
+    sequence: u64,
+    snapshot: Option<TrustedSnapshot>,
+    last_hash: Option<String>,
+    last_presence: Option<PresenceBits>,
+    last_received_at: Option<Duration>,
+    stale: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TrustedSnapshot {
+    session_hash: Option<[u8; 32]>,
+    round: Option<u64>,
+    kills: Option<i64>,
+    deaths: Option<i64>,
+}
+
+impl From<&Payload> for TrustedSnapshot {
+    fn from(payload: &Payload) -> Self {
+        let session_hash = payload.map.as_ref().and_then(|map| {
+            if map.name.is_none() && map.mode.is_none() {
+                return None;
+            }
+            let mut session = Sha256::new();
+            if let Some(name) = &map.name {
+                session.update(name.as_bytes());
+            }
+            session.update([0]);
+            if let Some(mode) = &map.mode {
+                session.update(mode.as_bytes());
+            }
+            Some(session.finalize().into())
+        });
+        let stats = payload
+            .player
+            .as_ref()
+            .and_then(|player| player.match_stats.as_ref());
+        Self {
+            session_hash,
+            round: payload.map.as_ref().and_then(|map| map.round),
+            kills: stats.and_then(|stats| stats.kills),
+            deaths: stats.and_then(|stats| stats.deaths),
+        }
+    }
+}
+
+fn derive_transition(
+    previous: &TrustedSnapshot,
+    current: &TrustedSnapshot,
+) -> (StateOutput, Vec<TransitionFact>) {
+    if session_reset(previous, current) {
+        return (StateOutput::SessionReset, Vec::new());
+    }
+
+    let mut facts = Vec::new();
+    if let (Some(previous), Some(current)) = (previous.kills, current.kills)
+        && previous >= 0
+        && current > previous
+    {
+        facts.push(TransitionFact::Kill { previous, current });
+    }
+    if let (Some(previous), Some(current)) = (previous.deaths, current.deaths)
+        && previous >= 0
+        && current > previous
+    {
+        facts.push(TransitionFact::Death { previous, current });
+    }
+    if let (Some(completed), Some(next)) = (previous.round, current.round)
+        && next > completed
+    {
+        facts.push(TransitionFact::RoundEnd { completed, next });
+    }
+    (StateOutput::Healthy, facts)
+}
+
+fn session_reset(previous: &TrustedSnapshot, current: &TrustedSnapshot) -> bool {
+    matches!(
+        (previous.session_hash, current.session_hash),
+        (Some(previous), Some(current)) if previous != current
+    ) || decreased(previous.round, current.round)
+        || decreased(previous.kills, current.kills)
+        || decreased(previous.deaths, current.deaths)
+}
+
+fn decreased<T: PartialOrd>(previous: Option<T>, current: Option<T>) -> bool {
+    matches!((previous, current), (Some(previous), Some(current)) if current < previous)
+}
+
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
