@@ -195,9 +195,7 @@ where
                 self.held = false;
                 Ok(PollOutcome::Released)
             }
-            PortalSignal::Activated(_) | PortalSignal::Deactivated(_) => {
-                Ok(PollOutcome::Ignored)
-            }
+            PortalSignal::Activated(_) | PortalSignal::Deactivated(_) => Ok(PollOutcome::Ignored),
         }
     }
 

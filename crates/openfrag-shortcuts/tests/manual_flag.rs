@@ -19,7 +19,10 @@ struct FakePortal {
 
 impl FakePortal {
     fn push_signal(&self, signal: PortalSignal) {
-        self.signals.lock().expect("signals lock").push_back(Ok(signal));
+        self.signals
+            .lock()
+            .expect("signals lock")
+            .push_back(Ok(signal));
     }
 
     fn push_open_error(&self, error: ShortcutDiagnostic) {
@@ -74,7 +77,10 @@ impl PortalBackend for FakePortal {
     }
 
     async fn close(&self, session: &SessionHandle) -> Result<(), ShortcutDiagnostic> {
-        self.closes.lock().expect("closes lock").push(session.clone());
+        self.closes
+            .lock()
+            .expect("closes lock")
+            .push(session.clone());
         Ok(())
     }
 }
@@ -107,12 +113,14 @@ impl ManualFlagSink for RecordingSink {
     }
 }
 
-fn harness() -> (
+type Harness = (
     ManualFlagService<FakePortal, RecordingSink, MemoryStore>,
     Arc<FakePortal>,
     Arc<RecordingSink>,
     Arc<MemoryStore>,
-) {
+);
+
+fn harness() -> Harness {
     let portal = Arc::new(FakePortal::default());
     let sink = Arc::new(RecordingSink::default());
     let store = Arc::new(MemoryStore::default());
@@ -137,7 +145,10 @@ async fn creates_one_user_approved_manual_flag_shortcut_and_persists_only_its_to
     assert_eq!(opens[0].1.len(), 1);
     assert_eq!(opens[0].1[0].id, MANUAL_FLAG_ID);
     assert_eq!(opens[0].1[0].description, "Save the preceding play");
-    assert_eq!(opens[0].1[0].preferred_trigger.as_deref(), Some("CTRL+ALT+F10"));
+    assert_eq!(
+        opens[0].1[0].preferred_trigger.as_deref(),
+        Some("CTRL+ALT+F10")
+    );
     assert_eq!(
         store.saves.lock().expect("saves lock").as_slice(),
         &[RestoreToken::new("restore-1")]
@@ -151,7 +162,10 @@ async fn restores_the_persisted_session_token() {
 
     service.start().await.expect("shortcut restores");
 
-    assert_eq!(portal.opens()[0].0, Some(RestoreToken::new("existing-token")));
+    assert_eq!(
+        portal.opens()[0].0,
+        Some(RestoreToken::new("existing-token"))
+    );
     assert!(store.saves.lock().expect("saves lock").is_empty());
 }
 
@@ -194,8 +208,14 @@ async fn closes_the_live_session_cleanly_without_deleting_the_restore_token() {
 
     service.shutdown().await.expect("shortcut shuts down");
 
-    assert_eq!(portal.closes.lock().expect("closes lock").as_slice(), &[SessionHandle::new("session-1")]);
-    assert_eq!(store.load().expect("token loads"), Some(RestoreToken::new("restore-1")));
+    assert_eq!(
+        portal.closes.lock().expect("closes lock").as_slice(),
+        &[SessionHandle::new("session-1")]
+    );
+    assert_eq!(
+        store.load().expect("token loads"),
+        Some(RestoreToken::new("restore-1"))
+    );
 }
 
 #[tokio::test]

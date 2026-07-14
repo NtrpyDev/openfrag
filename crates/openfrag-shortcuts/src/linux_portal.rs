@@ -20,7 +20,10 @@ use ashpd::{
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream::BoxStream};
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::{sync::Mutex, task::JoinHandle};
 
 struct ActiveSession {
@@ -82,10 +85,7 @@ impl PortalBackend for LinuxPortalBackend {
             return Err(ShortcutDiagnostic::Unavailable);
         }
         let activated = portal.receive_activated().await.map_err(map_open_error)?;
-        let deactivated = portal
-            .receive_deactivated()
-            .await
-            .map_err(map_open_error)?;
+        let deactivated = portal.receive_deactivated().await.map_err(map_open_error)?;
         let portal_session = Arc::new(
             portal
                 .create_session(CreateSessionOptions::default())
