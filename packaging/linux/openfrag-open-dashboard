@@ -3,7 +3,7 @@
 set -eu
 
 host=127.0.0.1
-port=9680
+port=7130
 url="http://${host}:${port}/"
 
 if ! (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then

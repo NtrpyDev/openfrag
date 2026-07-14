@@ -7,7 +7,7 @@ Type=simple
 Environment=XDG_STATE_HOME=%S
 Environment=XDG_CACHE_HOME=%C
 Environment=XDG_RUNTIME_DIR=%t
-ExecStart=%h/.local/bin/openfragd serve --bind 127.0.0.1:9680
+ExecStart=%h/.local/bin/openfragd serve --bind 127.0.0.1:7130
 Restart=on-failure
 RestartSec=2s
 UMask=0077
