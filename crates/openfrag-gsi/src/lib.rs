@@ -1,10 +1,58 @@
+use axum::{
+    Router,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::post,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const MAX_BODY_BYTES: usize = 128 * 1024;
 pub const DUPLICATE_WINDOW: Duration = Duration::from_secs(2);
+
+#[derive(Clone)]
+pub struct RouterState {
+    pub ingest: Arc<Mutex<IngestState>>,
+    pub config: IngestConfig,
+}
+pub fn router(state: RouterState) -> Router {
+    Router::new()
+        .route("/gsi", post(route_post))
+        .with_state(state)
+}
+async fn route_post(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> (StatusCode, String) {
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if ct != "application/json" {
+        return (StatusCode::BAD_REQUEST, "content-type".into());
+    }
+    if body.len() > MAX_BODY_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "too-large".into());
+    }
+    let mut guard = state.ingest.lock().expect("state");
+    match ingest_configured(&mut guard, &state.config, &body) {
+        Ok(Some(r)) => (StatusCode::OK, r.redacted),
+        Ok(None) => (StatusCode::OK, "duplicate".into()),
+        Err(e) => {
+            let code = match http_status(Some(&e)) {
+                HttpStatus::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+                HttpStatus::Unauthorized => StatusCode::UNAUTHORIZED,
+                HttpStatus::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (code, format!("{e:?}"))
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
