@@ -94,7 +94,7 @@ impl CalculationSeriesIdentity {
         OFR_V1_FORMULA
     }
 
-    pub fn differs_only_by_parser(&self, other: &Self) -> bool {
+    pub fn differs_only_by_parser_or_proto(&self, other: &Self) -> bool {
         self.local_player_id == other.local_player_id
             && self.metric_definition_version == other.metric_definition_version
             && self.evidence_semantics_epoch == other.evidence_semantics_epoch

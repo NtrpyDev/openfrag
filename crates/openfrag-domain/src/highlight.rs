@@ -27,6 +27,10 @@ pub enum CandidateTrigger {
     OfficialRoundEndCapture,
 }
 
+pub fn live_kill_trigger(local_identity_valid: bool, round_kills: u8) -> Option<CandidateTrigger> {
+    (local_identity_valid && round_kills >= 3).then_some(CandidateTrigger::KillMilestone)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HighlightCandidate {
     pub capture_session_id: String,
@@ -267,7 +271,7 @@ pub fn retention_decisions(
     let mut retained_bytes: u64 = items
         .iter()
         .zip(&decisions)
-        .filter(|(_, (_, reason))| *reason == RetentionReason::Retain)
+        .filter(|(item, (_, reason))| !item.confirmed && *reason == RetentionReason::Retain)
         .map(|(item, _)| item.bytes)
         .fold(0, u64::saturating_add);
     let mut candidates: Vec<_> = items
@@ -348,6 +352,16 @@ mod tests {
                 FinalHighlightLabel::Clutch,
                 FinalHighlightLabel::Knife,
             ])
+        );
+    }
+
+    #[test]
+    fn live_kill_candidates_require_identity_and_three_round_kills() {
+        assert_eq!(live_kill_trigger(true, 2), None);
+        assert_eq!(live_kill_trigger(false, 3), None);
+        assert_eq!(
+            live_kill_trigger(true, 3),
+            Some(CandidateTrigger::KillMilestone)
         );
     }
 

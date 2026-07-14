@@ -411,4 +411,40 @@ mod tests {
             assert!(after >= before);
         }
     }
+
+    #[test]
+    fn neutral_components_produce_exactly_one_and_scale_with_duplicated_rounds() {
+        let neutral = RatingMetrics {
+            eligible_rounds: 20,
+            direct_damage: 1_600,
+            kills: 20,
+            deaths: 20,
+            opening_wins: 1,
+            opening_losses: 1,
+            trade_kills: 5,
+            utility_damage: 300,
+            flash_assists: 5,
+            clutch_wins: 1,
+            clutch_opportunities: 2,
+        };
+        let once = calculate_rating(input(neutral)).unwrap();
+        assert_eq!(once.rating_bp.unwrap().get(), 10_000);
+        let duplicated = RatingMetrics {
+            eligible_rounds: 40,
+            direct_damage: 3_200,
+            kills: 40,
+            deaths: 40,
+            opening_wins: 2,
+            opening_losses: 2,
+            trade_kills: 10,
+            utility_damage: 600,
+            flash_assists: 10,
+            clutch_wins: 2,
+            clutch_opportunities: 4,
+        };
+        assert_eq!(
+            calculate_rating(input(duplicated)).unwrap().rating_exact,
+            once.rating_exact
+        );
+    }
 }

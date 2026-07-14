@@ -146,6 +146,7 @@ pub enum BaselineError {
     Exact(ExactError),
     EmptyStatistics,
     SideRatingForbidden,
+    MapSideScopeForbidden,
 }
 
 impl From<ExactError> for BaselineError {
@@ -167,6 +168,9 @@ pub fn build_side_component_lens(
     side: Side,
     component: ComponentKind,
 ) -> Result<BaselineReceipt, BaselineError> {
+    if !matches!(&query.scope, BaselineScope::AllMaps) {
+        return Err(BaselineError::MapSideScopeForbidden);
+    }
     let query = BaselineQuery {
         field: BaselineField::Component(component),
         ..query
@@ -804,5 +808,19 @@ mod tests {
                 .status,
             GoalStatus::VersionChanged
         );
+    }
+
+    #[test]
+    fn side_context_cannot_create_a_map_side_cohort_or_rating() {
+        let result = build_side_component_lens(
+            &[],
+            BaselineQuery {
+                scope: BaselineScope::Map("de_mirage".into()),
+                ..query()
+            },
+            Side::Terrorist,
+            ComponentKind::DirectDamage,
+        );
+        assert_eq!(result, Err(BaselineError::MapSideScopeForbidden));
     }
 }
