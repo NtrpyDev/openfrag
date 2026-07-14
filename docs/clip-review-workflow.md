@@ -23,16 +23,23 @@ and labels on the existing Clip.
    The title defaults to the Highlight type and timestamp. Names are ordinary
    local text, not inferred claims about skill.
 4. **Keep or delete.** Keep removes the Inbox state. Delete requires a
-   confirmation showing the exact file and removes the derivative and metadata
-   only after the file operation succeeds. The original is not recoverable in
-   v1 after confirmed deletion.
+   confirmation showing the exact original and derivatives. The Clip record
+   and each unshared file are removed only after successful file deletion. If a
+   file is referenced by another Clip, show that dependency and require a
+   separate detach confirmation; never delete the shared artifact implicitly.
+   The original is not recoverable in v1 after confirmed deletion.
 5. **Export.** Export a selected Clip to a user-chosen ordinary file. The
-   Discord option creates an MP4 derivative using H.264 video and AAC audio.
-   The default target is no more than 10 MiB, matching [Discord's documented
-   default upload limit](https://docs.discord.com/developers/reference#uploading-files),
-   and is user-configurable. If minimum acceptable encoding cannot fit, export
-   fails visibly and preserves the source. It never silently overshoots,
-   uploads, or contacts Discord.
+   Discord option creates a local MP4 derivative using H.264 `yuv420p` video
+   and AAC audio. It preserves source aspect ratio, caps output at 1920x1080
+   and 60 fps, and targets no more than 10 MiB by default, matching [Discord's
+   documented default upload limit](https://docs.discord.com/developers/reference#uploading-files).
+   The target is user-configurable. The encoder calculates a total bitrate
+   from the target, duration, and a 128 kbps AAC track, then verifies the
+   resulting file size. The lowest allowed profile is 640x360 at 30 fps with
+   400 kbps H.264 video and 64 kbps AAC audio. If that profile still exceeds
+   the chosen ceiling, or the verified output exceeds it, export fails
+   visibly and preserves the source. It never silently overshoots, uploads, or
+   contacts Discord.
 
 ## Merged triggers
 
@@ -44,6 +51,9 @@ arrives at `round_end + 10s` and has a desired range from
 Candidate merge is limited to triggers in the same round whose windows overlap
 or whose starts are at most 10 seconds apart. It preserves every trigger
 receipt and label and does not imply one raw file or one canonical Highlight.
+After Demo reconciliation, the presentation may show multiple final labels
+from contributing triggers, such as `multikill` and `clutch`, without forcing
+one canonical label.
 Raw Manual and later Auto saves remain independent; post-hoc consolidation is
 allowed only when both files cover the desired union. Other triggers remain
 separate Clips.
