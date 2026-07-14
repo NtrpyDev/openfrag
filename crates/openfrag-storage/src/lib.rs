@@ -3,8 +3,8 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -140,6 +140,31 @@ pub struct ImportJob {
     pub lease_expires_at_ms: Option<i64>,
     pub error_code: Option<String>,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactAvailability {
+    Expected,
+    Present,
+    Missing,
+    Deleted,
+}
+impl ArtifactAvailability {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "expected" => Ok(Self::Expected),
+            "present" => Ok(Self::Present),
+            "missing" => Ok(Self::Missing),
+            "deleted" => Ok(Self::Deleted),
+            _ => Err(Error::Invalid("artifact availability")),
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactInfo {
+    pub sha256: String,
+    pub availability: ArtifactAvailability,
+    pub relative_path: Option<String>,
+    pub byte_length: i64,
+}
 impl ClipDisposition {
     fn as_str(self) -> &'static str {
         match self {
@@ -209,6 +234,7 @@ impl Storage {
         set_private_permissions(&layout.root)?;
         set_private_permissions(&layout.staging)?;
         let connection = Connection::open(&layout.database)?;
+        set_file_private_permissions(&layout.database)?;
         connection.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
         )?;
@@ -300,14 +326,34 @@ impl Storage {
         Ok(())
     }
     pub fn stage_artifact(&self, bytes: &[u8]) -> Result<StagedArtifact> {
-        let sha256 = hex_sha256(bytes);
+        self.stage_from_reader(&mut std::io::Cursor::new(bytes))
+    }
+    pub fn stage_from_reader(&self, reader: &mut impl Read) -> Result<StagedArtifact> {
         let path = self.layout.staging.join(format!("{}.part", Uuid::now_v7()));
-        let mut file = File::create(&path)?;
-        file.write_all(bytes)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        set_file_private_permissions(&path)?;
+        let mut hasher = Sha256::new();
+        let mut length = 0_u64;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+            file.write_all(&buffer[..count])?;
+            length = length
+                .checked_add(u64::try_from(count).map_err(|_| Error::Invalid("reader length"))?)
+                .ok_or(Error::Invalid("artifact too large"))?;
+        }
         file.sync_all()?;
+        sync_parent(&path)?;
         Ok(StagedArtifact {
-            sha256,
-            byte_length: bytes.len() as u64,
+            sha256: format!("{:x}", hasher.finalize()),
+            byte_length: length,
             path,
         })
     }
@@ -330,9 +376,14 @@ impl Storage {
         let parent = target.parent().ok_or(Error::Invalid("artifact path"))?;
         fs::create_dir_all(parent)?;
         if target.exists() {
+            if fs::symlink_metadata(&target)?.file_type().is_symlink() {
+                return Err(Error::Invalid("artifact target symlink"));
+            }
             fs::remove_file(&staged.path)?;
         } else {
             fs::rename(&staged.path, &target)?;
+            set_file_private_permissions(&target)?;
+            sync_parent(&target)?;
         }
         let byte_length =
             i64::try_from(staged.byte_length).map_err(|_| Error::Invalid("artifact too large"))?;
@@ -342,11 +393,26 @@ impl Storage {
     pub fn recover_staging(&self) -> Result<()> {
         for entry in fs::read_dir(&self.layout.staging)? {
             let entry = entry?;
+            if entry.file_type()?.is_symlink() {
+                return Err(Error::Invalid("staging symlink"));
+            }
             if entry.file_type()?.is_file() {
                 fs::remove_file(entry.path())?;
             }
         }
         Ok(())
+    }
+    #[allow(clippy::type_complexity)]
+    pub fn artifact(&self, sha256: &str) -> Result<ArtifactInfo> {
+        let row:Option<(String,String,Option<String>,i64)>=self.connection.query_row("SELECT sha256,availability,relative_path,byte_length FROM artifacts WHERE sha256=?",[sha256],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let (sha256, availability, relative_path, byte_length) =
+            row.ok_or(Error::NotFound("artifact"))?;
+        Ok(ArtifactInfo {
+            sha256,
+            availability: ArtifactAvailability::parse(&availability)?,
+            relative_path,
+            byte_length,
+        })
     }
     pub fn create_capture_session(&self, local_steam_id: &str) -> Result<CaptureSessionId> {
         let id = CaptureSessionId::new();
@@ -772,6 +838,19 @@ fn set_private_permissions(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+fn set_file_private_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+fn sync_parent(path: &Path) -> Result<()> {
+    let parent = path.parent().ok_or(Error::Invalid("path parent"))?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -915,5 +994,39 @@ mod tests {
             storage.import_job(&job).unwrap().lease_owner.as_deref(),
             Some("first")
         );
+    }
+    #[test]
+    fn streaming_artifact_is_private_and_queryable() {
+        let (_dir, storage) = store();
+        let mut reader = std::io::Cursor::new(vec![7_u8; 130_000]);
+        let hash = storage
+            .commit_artifact(storage.stage_from_reader(&mut reader).unwrap(), "dem", None)
+            .unwrap();
+        let artifact = storage.artifact(&hash).unwrap();
+        assert_eq!(artifact.availability, ArtifactAvailability::Present);
+        assert_eq!(artifact.byte_length, 130_000);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(storage.layout().database.clone())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+    #[test]
+    fn unsafe_extension_is_rejected_without_public_artifact() {
+        let (_dir, storage) = store();
+        let staged = storage.stage_artifact(b"unsafe").unwrap();
+        let hash = staged.sha256.clone();
+        assert!(matches!(
+            storage.commit_artifact(staged, "../dem", None),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(storage.artifact(&hash), Err(Error::NotFound(_))));
     }
 }
