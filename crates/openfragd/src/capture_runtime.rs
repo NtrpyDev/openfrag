@@ -1,8 +1,9 @@
 use openfrag_capture::{
-    Clock, Config, Error as SupervisorError, Filesystem, MediaProbe, RecorderInstall, ReplayConfig,
-    SaveAcknowledgement, SaveDisposition, SaveProvenance, Supervisor, replay_launch,
+    replay_launch, Clock, Config, Error as SupervisorError, Filesystem, MediaProbe,
+    RecorderInstall, ReplayConfig, SaveAcknowledgement, SaveDisposition, SaveProvenance,
+    Supervisor,
 };
-use openfrag_setup::{CaptureConfigError, CaptureRecorder, read_capture_configuration};
+use openfrag_setup::{read_capture_configuration, CaptureConfigError, CaptureRecorder};
 use std::{ffi::OsString, path::Path};
 
 const FLATPAK_APP_ID: &str = "com.dec05eba.gpu_screen_recorder";
@@ -128,10 +129,11 @@ where
 
     pub fn request_save(
         &mut self,
+        request_id: &str,
         provenance: SaveProvenance,
     ) -> Result<SaveDisposition, RuntimeError> {
         self.supervisor_mut()?
-            .request_save(provenance)
+            .request_save(request_id, provenance)
             .map_err(RuntimeError::Supervisor)
     }
 
@@ -186,8 +188,13 @@ where
         self.available_from_ms.unwrap_or(0)
     }
 
-    fn request_save(&mut self, provenance: SaveProvenance) -> Result<SaveDisposition, String> {
-        CaptureRuntime::request_save(self, provenance).map_err(|error| format!("{error:?}"))
+    fn request_save(
+        &mut self,
+        request_id: &str,
+        provenance: SaveProvenance,
+    ) -> Result<SaveDisposition, String> {
+        CaptureRuntime::request_save(self, request_id, provenance)
+            .map_err(|error| format!("{error:?}"))
     }
 
     fn poll(&mut self) -> Result<Option<i32>, String> {
