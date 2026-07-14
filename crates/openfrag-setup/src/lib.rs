@@ -2,6 +2,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -282,20 +283,41 @@ impl CommandRunner for StdCommandRunner {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        let mut output = child
-            .wait_with_output()
-            .map_err(|error| error.to_string())?;
-        if output.stdout.len() > limit || output.stderr.len() > limit {
-            return Err(format!("{program} output exceeded {limit} bytes"));
-        }
-        output.stdout.truncate(limit);
-        output.stderr.truncate(limit);
+        let stdout = read_limited(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| format!("{program} stdout was not piped"))?,
+            limit,
+            program,
+        )?;
+        let stderr = read_limited(
+            child
+                .stderr
+                .take()
+                .ok_or_else(|| format!("{program} stderr was not piped"))?,
+            limit,
+            program,
+        )?;
+        let status = child.wait().map_err(|error| error.to_string())?;
         Ok(CommandOutput {
-            success: output.status.success(),
-            stdout: output.stdout,
-            stderr: output.stderr,
+            success: status.success(),
+            stdout,
+            stderr,
         })
     }
+}
+
+fn read_limited(reader: impl Read, limit: usize, program: &str) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(limit.min(8192));
+    reader
+        .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > limit {
+        return Err(format!("{program} output exceeded {limit} bytes"));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
