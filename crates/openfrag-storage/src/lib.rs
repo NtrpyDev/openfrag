@@ -18,6 +18,7 @@ const RATING_AVAILABILITY_MIGRATION: &str =
     include_str!("../migrations/0005_rating_availability.sql");
 const CLIP_REVIEW_MIGRATION: &str = include_str!("../migrations/0006_clip_review.sql");
 const CLIP_MODEL_MIGRATION: &str = include_str!("../migrations/0007_clip_model.sql");
+const CLIP_REVIEW_TIME_MIGRATION: &str = include_str!("../migrations/0008_clip_review_time.sql");
 
 #[derive(Debug)]
 pub enum Error {
@@ -311,6 +312,7 @@ pub struct DurableClipModelRecord {
     pub capture_session_id: String,
     pub duration_ms: u64,
     pub revision: u64,
+    pub reviewed_at_ms: Option<u64>,
     pub origin: DurableClipOriginRecord,
 }
 #[derive(Debug)]
@@ -452,6 +454,7 @@ impl Storage {
     pub fn layout(&self) -> &Layout {
         &self.layout
     }
+    #[allow(clippy::too_many_lines)]
     pub fn migrate(&self) -> Result<()> {
         let checksum = hex_sha256(INITIAL_MIGRATION.as_bytes());
         let migration_table_exists: bool = self.connection.query_row(
@@ -552,6 +555,7 @@ impl Storage {
         }
         ensure_migration(&self.connection, 6, CLIP_REVIEW_MIGRATION)?;
         ensure_migration(&self.connection, 7, CLIP_MODEL_MIGRATION)?;
+        ensure_migration(&self.connection, 8, CLIP_REVIEW_TIME_MIGRATION)?;
         Ok(())
     }
     pub fn stage_artifact(&self, bytes: &[u8]) -> Result<StagedArtifact> {
@@ -1020,7 +1024,7 @@ impl Storage {
         } else {
             ClipReviewDecision::Pending
         };
-        let changed=self.connection.execute("UPDATE clips SET disposition=?, title=?, favorite=?, review_decision=?, review_revision=CASE WHEN review_revision IS NULL THEN NULL ELSE review_revision+1 END WHERE id=? AND disposition <> 'deleted'",params![disposition.as_str(),title,i64::from(favorite),review_decision.as_str(),clip.as_str()])?;
+        let changed=self.connection.execute("UPDATE clips SET disposition=?, title=?, favorite=?, review_decision=?, review_revision=CASE WHEN review_revision IS NULL THEN NULL ELSE review_revision+1 END, reviewed_at_ms=? WHERE id=? AND disposition <> 'deleted'",params![disposition.as_str(),title,i64::from(favorite),review_decision.as_str(),now_ms(),clip.as_str()])?;
         if changed == 0 {
             return Err(Error::IllegalTransition("clip missing or deleted"));
         }
@@ -1054,13 +1058,13 @@ impl Storage {
             ClipReviewDecision::Pending | ClipReviewDecision::Reject => ClipDisposition::InReview,
         };
         let changed = transaction.execute(
-            "UPDATE clips SET disposition=?,title=?,note=?,favorite=?,review_decision=?,review_revision=CASE WHEN review_revision IS NULL THEN NULL ELSE review_revision+1 END WHERE id=? AND disposition<>'deleted'",
+            "UPDATE clips SET disposition=?,title=?,note=?,favorite=?,review_decision=?,review_revision=CASE WHEN review_revision IS NULL THEN NULL ELSE review_revision+1 END,reviewed_at_ms=? WHERE id=? AND disposition<>'deleted'",
             params![
                 disposition.as_str(),
                 title,
                 note,
                 i64::from(favorite),
-                decision.as_str(),
+                decision.as_str(), now_ms(),
                 clip_id
             ],
         )?;
@@ -1102,9 +1106,9 @@ impl Storage {
             ClipReviewDecision::Pending | ClipReviewDecision::Reject => ClipDisposition::InReview,
         };
         let changed = transaction.execute(
-            "UPDATE clips SET disposition=?,title=?,note=?,favorite=?,review_decision=?,review_revision=? WHERE id=? AND disposition<>'deleted' AND review_revision=?",
+            "UPDATE clips SET disposition=?,title=?,note=?,favorite=?,review_decision=?,review_revision=?,reviewed_at_ms=? WHERE id=? AND disposition<>'deleted' AND review_revision=?",
             params![
-                disposition.as_str(), title, note, i64::from(favorite), decision.as_str(), next,
+                disposition.as_str(), title, note, i64::from(favorite), decision.as_str(), next, now_ms(),
                 clip_id, expected
             ],
         )?;
@@ -1193,12 +1197,12 @@ impl Storage {
                 ),
             };
             transaction.execute(
-                "INSERT INTO clips(id,artifact_sha256,capture_session_id,disposition,title,favorite,provenance,created_at_ms,recorded_at_ms,pre_roll_truncated,retention_class,note,review_decision,review_revision,origin_kind,manual_flag_time_ms) VALUES(?,?,?,'kept',?,?,'trim_derivative',?,?,?,?,?,'keep',0,?,?)",
+                "INSERT INTO clips(id,artifact_sha256,capture_session_id,disposition,title,favorite,provenance,created_at_ms,recorded_at_ms,pre_roll_truncated,retention_class,note,review_decision,review_revision,origin_kind,manual_flag_time_ms,reviewed_at_ms) VALUES(?,?,?,'kept',?,?,'trim_derivative',?,?,?,?,?,'keep',0,?,?,?)",
                 params![
                     derived.as_str(), request.staged.sha256, source.capture_session_id,
                     request.title, i64::from(request.favorite), now_ms(),
                     source.detail.summary.recorded_at_ms, i64::from(source.detail.pre_roll_truncated),
-                    source.detail.retention_class, request.note, origin_kind, flag_time
+                    source.detail.retention_class, request.note, origin_kind, flag_time, now_ms()
                 ],
             )?;
             replace_clip_tags(&transaction, derived.as_str(), request.tags)?;
@@ -1722,19 +1726,22 @@ impl Storage {
     pub fn durable_clip_model(&self, id: &str) -> Result<DurableClipModelRecord> {
         let detail = self.clip_detail(id)?;
         let artifact = self.clip_artifact_file(id)?;
-        let row: Option<(String, Option<i64>, Option<i64>, Option<String>)> = self
+        let row: Option<(String, Option<i64>, Option<i64>, Option<String>, Option<i64>)> = self
             .connection
             .query_row(
-                "SELECT c.capture_session_id,c.review_revision,a.media_duration_ms,c.origin_kind FROM clips c JOIN artifacts a ON a.sha256=c.artifact_sha256 WHERE c.id=? AND c.disposition<>'deleted'",
+                "SELECT c.capture_session_id,c.review_revision,a.media_duration_ms,c.origin_kind,c.reviewed_at_ms FROM clips c JOIN artifacts a ON a.sha256=c.artifact_sha256 WHERE c.id=? AND c.disposition<>'deleted'",
                 [id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()?;
-        let (capture_session_id, revision, duration, origin_kind) =
+        let (capture_session_id, revision, duration, origin_kind, reviewed_at_ms) =
             row.ok_or(Error::NotFound("live clip"))?;
         let revision = revision.ok_or(Error::Unavailable("clip review revision"))?;
         let duration = duration.ok_or(Error::Unavailable("verified media duration"))?;
         let origin_kind = origin_kind.ok_or(Error::Unavailable("clip origin evidence"))?;
+        if detail.review_decision != ClipReviewDecision::Pending && reviewed_at_ms.is_none() {
+            return Err(Error::Unavailable("clip review time"));
+        }
         let origin = match origin_kind.as_str() {
             "auto" => {
                 let trigger_receipts = self.origin_receipts(id, "trigger")?;
@@ -1775,6 +1782,10 @@ impl Storage {
                 .map_err(|_| Error::Invalid("verified media duration"))?,
             revision: u64::try_from(revision)
                 .map_err(|_| Error::Invalid("clip review revision"))?,
+            reviewed_at_ms: reviewed_at_ms
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| Error::Invalid("clip review time"))?,
             origin,
         })
     }
@@ -2898,6 +2909,7 @@ mod tests {
         let reopened = Storage::open(Layout::at(dir.path())).unwrap();
         let model = reopened.durable_clip_model(clip.as_str()).unwrap();
         assert_eq!(model.revision, 1);
+        assert!(model.reviewed_at_ms.is_some());
         assert_eq!(model.detail.review_decision, ClipReviewDecision::Keep);
         assert_eq!(model.detail.tags, ["clutch"]);
     }
@@ -2935,6 +2947,7 @@ mod tests {
         let model = storage.durable_clip_model(derived.as_str()).unwrap();
         assert_eq!(model.duration_ms, 30_000);
         assert_eq!(model.revision, 0);
+        assert!(model.reviewed_at_ms.is_some());
         assert_eq!(model.detail.provenance, "trim_derivative");
         assert_eq!(model.detail.tags, ["trimmed"]);
         assert_eq!(
