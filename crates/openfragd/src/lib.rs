@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use openfrag_gsi::{Clock, EventSink, EvidenceReceipt, GsiConfig, GsiService};
-use openfrag_storage::{CaptureSessionId, Layout, Storage};
+use openfrag_storage::{CaptureSessionId, Layout, Storage, StoredRatingAvailability};
 use serde::Serialize;
 use std::{
     fs,
@@ -89,7 +89,7 @@ pub fn app(config: &AppConfig) -> Result<Router, AppError> {
             config.data_directory.clone(),
             local_steam_id,
         ),
-        api::SetupResponse { checks: Vec::new() },
+        setup_response(credentials.is_some(), local_steam_id.is_some()),
     );
     router = router.merge(api::router_without_health(Arc::new(local_api)));
     if let Some((token, steam_id)) = credentials {
@@ -116,6 +116,25 @@ async fn dashboard() -> Html<&'static str> {
 }
 
 async fn health(State(state): State<AppState>) -> Json<Health> {
+    let rating = state
+        .storage
+        .lock()
+        .ok()
+        .and_then(|storage| storage.list_matches().ok())
+        .and_then(|matches| matches.into_iter().next())
+        .map(|record| record.rating);
+    let (rating_state, rating) = match rating {
+        Some(StoredRatingAvailability::Available { rating_bp, .. }) => (
+            "rated",
+            Some(format!(
+                "{}.{:02}",
+                rating_bp / 100,
+                rating_bp.unsigned_abs() % 100
+            )),
+        ),
+        Some(StoredRatingAvailability::Pending) => ("preview", None),
+        Some(StoredRatingAvailability::Unavailable { .. }) | None => ("unavailable", None),
+    };
     Json(Health {
         version: env!("CARGO_PKG_VERSION"),
         binding: "loopback",
@@ -127,9 +146,49 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         } else {
             "setup_required"
         },
-        rating_state: "unavailable",
-        rating: None,
+        rating_state,
+        rating,
     })
+}
+
+fn setup_response(gsi_configured: bool, identity_configured: bool) -> api::SetupResponse {
+    let mut checks = vec![api::SetupCheck {
+        id: "storage".into(),
+        status: "ready".into(),
+        summary: "Private local storage is ready".into(),
+    }];
+    checks.push(api::SetupCheck {
+        id: "demo_import".into(),
+        status: if identity_configured {
+            "ready".into()
+        } else {
+            "blocked".into()
+        },
+        summary: if identity_configured {
+            "Local Demo import and Rating are ready".into()
+        } else {
+            "Configure the local Steam identity before importing a Demo".into()
+        },
+    });
+    checks.push(api::SetupCheck {
+        id: "gsi".into(),
+        status: if gsi_configured {
+            "ready".into()
+        } else {
+            "blocked".into()
+        },
+        summary: if gsi_configured {
+            "Private loopback GSI is ready".into()
+        } else {
+            "Run setup-gsi before using live evidence".into()
+        },
+    });
+    checks.push(api::SetupCheck {
+        id: "capture".into(),
+        status: "blocked".into(),
+        summary: "Run Doctor and configure replay capture before using Manual Flag".into(),
+    });
+    api::SetupResponse { checks }
 }
 
 async fn gsi_unavailable() -> (StatusCode, &'static str) {
@@ -248,6 +307,29 @@ mod tests {
         assert_eq!(health["telemetry"], false);
         assert_eq!(health["upload_path"], false);
         assert_eq!(health["database"], "ready");
+    }
+
+    #[tokio::test]
+    async fn setup_reports_missing_identity_and_gsi_without_guessing() {
+        let directory = tempfile::tempdir().expect("temporary data directory");
+        let response = app(&AppConfig::for_test(directory.path()))
+            .expect("application starts")
+            .oneshot(
+                Request::builder()
+                    .uri("/api/setup")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("setup response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("setup body");
+        let setup: Value = serde_json::from_slice(&body).expect("setup json");
+        assert_eq!(setup["checks"][0]["status"], "ready");
+        assert_eq!(setup["checks"][1]["status"], "blocked");
+        assert_eq!(setup["checks"][2]["status"], "blocked");
     }
 
     #[tokio::test]
