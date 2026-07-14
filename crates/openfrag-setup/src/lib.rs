@@ -429,19 +429,7 @@ impl<E: ProbeEnvironment, F: ProbeFilesystem, C: ProbeCommands> HostProbe for Sy
             ],
             "gpu-screen-recorder Flatpak",
         );
-        let audio = if matches!(
-            self.commands
-                .run("pw-cli", &["info", "0"], 8192, Duration::from_secs(1)),
-            Ok((true, _, _))
-        ) || matches!(
-            self.commands
-                .run("pactl", &["info"], 8192, Duration::from_secs(1)),
-            Ok((true, _, _))
-        ) {
-            Discovery::Available
-        } else {
-            Discovery::Missing("no PipeWire or PulseAudio source is available".into())
-        };
+        let audio = discover_audio(&self.environment, &self.filesystem, &self.commands);
         let session = match self.environment.var("XDG_SESSION_TYPE").as_deref() {
             Some(value) if value == "wayland" => SessionKind::Wayland,
             Some(value) if value == "x11" => SessionKind::X11,
@@ -480,6 +468,30 @@ impl<E: ProbeEnvironment, F: ProbeFilesystem, C: ProbeCommands> HostProbe for Sy
             portal_service,
             portal_binding: PortalBinding::Unapproved,
         }
+    }
+}
+fn discover_audio<E: ProbeEnvironment, F: ProbeFilesystem, C: ProbeCommands>(
+    environment: &E,
+    filesystem: &F,
+    commands: &C,
+) -> Discovery {
+    let pipewire_socket = environment
+        .var("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .is_some_and(|runtime| filesystem.exists(&runtime.join("pipewire-0")));
+    if pipewire_socket
+        || matches!(
+            commands.run("pw-cli", &["info", "0"], 8192, Duration::from_secs(1)),
+            Ok((true, _, _))
+        )
+        || matches!(
+            commands.run("pactl", &["info"], 8192, Duration::from_secs(1)),
+            Ok((true, _, _))
+        )
+    {
+        Discovery::Available
+    } else {
+        Discovery::Missing("no PipeWire or PulseAudio source is available".into())
     }
 }
 impl From<&DiscoveredHost> for HostFacts {
