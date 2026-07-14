@@ -1,5 +1,6 @@
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     extract::State,
     http::{HeaderMap, StatusCode},
     routing::post,
@@ -21,6 +22,7 @@ pub struct RouterState {
 pub fn router(state: RouterState) -> Router {
     Router::new()
         .route("/gsi", post(route_post))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 async fn route_post(
@@ -246,7 +248,7 @@ pub fn post_gsi(
     if path != "/gsi" {
         return (HttpStatus::NotFound, None);
     }
-    if content_type != "application/json" {
+    if !content_type.starts_with("application/json") {
         return (HttpStatus::BadRequest, None);
     }
     match ingest_configured(state, config, body) {
