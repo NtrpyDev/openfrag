@@ -1,0 +1,14 @@
+[package]
+name = "openfrag-analysis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+openfrag-domain = { path = "../openfrag-domain" }
+openfrag-import = { path = "../openfrag-import", features = ["demoparser"] }
+
+[lints]
+workspace = true
