@@ -1,0 +1,26 @@
+[Unit]
+Description=OpenFrag local dashboard daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+Environment=XDG_STATE_HOME=%S
+Environment=XDG_CACHE_HOME=%C
+Environment=XDG_RUNTIME_DIR=%t
+ExecStart=%h/.local/bin/openfragd serve --bind 127.0.0.1:7130
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target
