@@ -16,6 +16,10 @@ use axum::{
     routing::{get, post},
 };
 use openfrag_gsi::{Clock, EventSink, EvidenceReceipt, GsiConfig, GsiService};
+use openfrag_setup::{
+    CaptureConfigError, SetupFact, SetupFacts, SetupStepId, SetupStepStatus, evaluate_setup_flow,
+    read_capture_configuration,
+};
 use openfrag_storage::{CaptureSessionId, Layout, Storage, StoredRatingAvailability};
 use serde::Serialize;
 use std::{
@@ -93,7 +97,11 @@ pub fn app(config: &AppConfig) -> Result<Router, AppError> {
             config.data_directory.clone(),
             local_steam_id,
         ),
-        setup_response(credentials.is_some(), local_steam_id.is_some()),
+        setup_response(
+            &config.data_directory,
+            credentials.is_some(),
+            local_steam_id.is_some(),
+        ),
     );
     router = router.merge(api::router_without_health(Arc::new(local_api)));
     if let Some((token, steam_id)) = credentials {
@@ -155,44 +163,120 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
     })
 }
 
-fn setup_response(gsi_configured: bool, identity_configured: bool) -> api::SetupResponse {
-    let mut checks = vec![api::SetupCheck {
-        id: "storage".into(),
-        status: "ready".into(),
-        summary: "Private local storage is ready".into(),
-    }];
-    checks.push(api::SetupCheck {
-        id: "demo_import".into(),
-        status: if identity_configured {
-            "ready".into()
+fn setup_response(
+    data_directory: &Path,
+    gsi_configured: bool,
+    identity_configured: bool,
+) -> api::SetupResponse {
+    let (capture_recorder, ffprobe) = capture_setup_facts(data_directory);
+    let flow = evaluate_setup_flow(&SetupFacts {
+        storage: SetupFact::ready("Private local storage is ready"),
+        local_steam_identity: if identity_configured {
+            SetupFact::ready("Local Steam identity is configured")
         } else {
-            "blocked".into()
+            SetupFact::blocked(
+                "Local Steam identity is missing",
+                "Run setup-gsi with the local Steam ID before importing a Demo",
+            )
         },
-        summary: if identity_configured {
-            "Local Demo import and Rating are ready".into()
+        gsi_config: if gsi_configured {
+            SetupFact::ready("Private loopback GSI is configured")
         } else {
-            "Configure the local Steam identity before importing a Demo".into()
+            SetupFact::blocked(
+                "Private loopback GSI is not configured",
+                "Run setup-gsi before using live evidence",
+            )
         },
+        capture_recorder,
+        ffprobe,
+        test_capture: SetupFact::blocked(
+            "A replay test capture has not been verified",
+            "Run the bounded headless replay test before enabling live capture",
+        ),
+        local_demo_validation: if identity_configured {
+            SetupFact::ready("Local Demo validation is available")
+        } else {
+            SetupFact::blocked(
+                "Local Demo validation needs the player identity",
+                "Configure the local Steam identity before selecting a Demo",
+            )
+        },
+        manual_flag: SetupFact::blocked(
+            "Manual Flag is not approved",
+            "Complete the replay test, then approve the Global Shortcuts portal binding",
+        ),
     });
-    checks.push(api::SetupCheck {
-        id: "gsi".into(),
-        status: if gsi_configured {
-            "ready".into()
-        } else {
-            "blocked".into()
-        },
-        summary: if gsi_configured {
-            "Private loopback GSI is ready".into()
-        } else {
-            "Run setup-gsi before using live evidence".into()
-        },
-    });
-    checks.push(api::SetupCheck {
-        id: "capture".into(),
-        status: "blocked".into(),
-        summary: "Run Doctor and configure replay capture before using Manual Flag".into(),
-    });
-    api::SetupResponse { checks }
+    api::SetupResponse {
+        checks: flow
+            .steps
+            .into_iter()
+            .map(|step| {
+                let summary = match step.remediation {
+                    Some(remediation) => format!("{}. {remediation}", step.summary),
+                    None => step.summary,
+                };
+                api::SetupCheck {
+                    id: setup_step_id(step.id).into(),
+                    status: match step.status {
+                        SetupStepStatus::Ready => "ready",
+                        SetupStepStatus::Blocked => "blocked",
+                        SetupStepStatus::Skipped => "skipped",
+                    }
+                    .into(),
+                    summary,
+                }
+            })
+            .collect(),
+    }
+}
+
+fn capture_setup_facts(data_directory: &Path) -> (SetupFact, SetupFact) {
+    match read_capture_configuration(data_directory) {
+        Ok(configuration) if configuration.enabled() => (
+            SetupFact::ready("Replay capture is explicitly enabled"),
+            SetupFact::ready("The configured ffprobe executable is valid"),
+        ),
+        Ok(_) => (
+            SetupFact::blocked(
+                "Replay capture is explicitly disabled",
+                "Re-run setup-capture with --enabled true after the headless test passes",
+            ),
+            SetupFact::ready("The configured ffprobe executable is valid"),
+        ),
+        Err(CaptureConfigError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => (
+            SetupFact::blocked(
+                "Replay capture is not configured",
+                "Run Doctor, then run setup-capture with validated local paths",
+            ),
+            SetupFact::blocked(
+                "ffprobe is not configured",
+                "Run Doctor and configure an absolute ffprobe executable path",
+            ),
+        ),
+        Err(error) => (
+            SetupFact::blocked(
+                format!("Replay capture configuration is invalid: {error:?}"),
+                "Re-run setup-capture with validated local paths",
+            ),
+            SetupFact::blocked(
+                "ffprobe cannot be trusted from the current capture configuration",
+                "Re-run setup-capture with an absolute executable ffprobe path",
+            ),
+        ),
+    }
+}
+
+const fn setup_step_id(id: SetupStepId) -> &'static str {
+    match id {
+        SetupStepId::Storage => "storage",
+        SetupStepId::LocalSteamIdentity => "local_steam_identity",
+        SetupStepId::GsiConfig => "gsi",
+        SetupStepId::CaptureRecorder => "capture",
+        SetupStepId::Ffprobe => "ffprobe",
+        SetupStepId::TestCapture => "test_capture",
+        SetupStepId::LocalDemoValidation => "demo_import",
+        SetupStepId::ManualFlag => "manual_flag",
+    }
 }
 
 async fn gsi_unavailable() -> (StatusCode, &'static str) {
@@ -331,9 +415,17 @@ mod tests {
             .await
             .expect("setup body");
         let setup: Value = serde_json::from_slice(&body).expect("setup json");
-        assert_eq!(setup["checks"][0]["status"], "ready");
-        assert_eq!(setup["checks"][1]["status"], "blocked");
-        assert_eq!(setup["checks"][2]["status"], "blocked");
+        let checks = setup["checks"].as_array().expect("setup checks");
+        let status = |id: &str| {
+            checks
+                .iter()
+                .find(|check| check["id"] == id)
+                .and_then(|check| check["status"].as_str())
+        };
+        assert_eq!(status("storage"), Some("ready"));
+        assert_eq!(status("local_steam_identity"), Some("blocked"));
+        assert_eq!(status("gsi"), Some("skipped"));
+        assert_eq!(status("capture"), Some("blocked"));
     }
 
     #[tokio::test]
