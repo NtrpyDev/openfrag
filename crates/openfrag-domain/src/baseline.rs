@@ -38,16 +38,23 @@ pub enum MatchTrendExclusion {
     EvidenceRule,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum MapContext {
+    Known(String),
+    Unknown,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoryMatch {
     pub match_id: String,
     pub demo_hash: String,
+    pub calculation_run_id: String,
     pub series: CalculationSeriesIdentity,
     pub canonical: bool,
-    pub map: String,
+    pub map: MapContext,
     pub interval: Option<MatchInterval>,
-    pub rating: RatingBasisPoints,
-    pub components: ComponentVector,
+    pub rating: Option<RatingBasisPoints>,
+    pub components: Option<ComponentVector>,
     pub side_vectors: BTreeMap<Side, SideComponentVector>,
     pub trend_exclusion: Option<MatchTrendExclusion>,
 }
@@ -84,6 +91,8 @@ pub enum CohortExclusionReason {
     DuplicateDemo,
     OutsideRecentWindow,
     MissingSideVector,
+    MissingCanonicalValue,
+    UnknownMap,
     OverlappingChronology,
 }
 
@@ -136,6 +145,8 @@ pub struct BaselineReceipt {
     pub query: BaselineQuery,
     pub included_match_ids: Vec<String>,
     pub included_demo_hashes: Vec<String>,
+    pub included_calculation_run_ids: Vec<String>,
+    pub selected_values: Vec<Rational>,
     pub exclusions: Vec<CohortExclusion>,
     pub maturity: BaselineMaturity,
     pub stats: Option<RobustStats>,
@@ -211,15 +222,29 @@ fn build_lens(
                 continue;
             }
         } else {
-            match_value(item, &query.field)
+            let Some(value) = match_value(item, &query.field) else {
+                exclusions.push(CohortExclusion {
+                    match_id: item.match_id.clone(),
+                    reason: CohortExclusionReason::MissingCanonicalValue,
+                });
+                continue;
+            };
+            value
         };
         candidates.push((item, value));
     }
+    finalize_baseline(candidates, exclusions, query)
+}
+
+fn finalize_baseline(
+    mut candidates: Vec<(&HistoryMatch, Rational)>,
+    mut exclusions: Vec<CohortExclusion>,
+    query: BaselineQuery,
+) -> Result<BaselineReceipt, BaselineError> {
     candidates.sort_by(|(left, _), (right, _)| {
-        let left_interval = left.interval.expect("validated above");
-        let right_interval = right.interval.expect("validated above");
-        (right_interval.end_utc_ms, &right.demo_hash)
-            .cmp(&(left_interval.end_utc_ms, &left.demo_hash))
+        let left_end = left.interval.map_or(0, |interval| interval.end_utc_ms);
+        let right_end = right.interval.map_or(0, |interval| interval.end_utc_ms);
+        (right_end, &right.demo_hash).cmp(&(left_end, &left.demo_hash))
     });
     let mut seen = BTreeSet::new();
     candidates.retain(|(item, _)| {
@@ -279,6 +304,11 @@ fn build_lens(
             .iter()
             .map(|(item, _)| item.demo_hash.clone())
             .collect(),
+        included_calculation_run_ids: candidates
+            .iter()
+            .map(|(item, _)| item.calculation_run_id.clone())
+            .collect(),
+        selected_values: candidates.iter().map(|(_, value)| *value).collect(),
         exclusions,
         maturity,
         stats,
@@ -301,21 +331,23 @@ fn cohort_reason(item: &HistoryMatch, query: &BaselineQuery) -> Option<CohortExc
     if interval.start_utc_ms > interval.end_utc_ms {
         return Some(CohortExclusionReason::ReversedChronology);
     }
-    if interval.end_utc_ms >= query.cutoff_start_utc_ms {
+    if interval.end_utc_ms > query.cutoff_start_utc_ms {
         return Some(CohortExclusionReason::CurrentOrFutureMatch);
     }
-    if let BaselineScope::Map(map) = &query.scope
-        && item.map != *map
-    {
-        return Some(CohortExclusionReason::ScopeMismatch);
+    if let BaselineScope::Map(map) = &query.scope {
+        match &item.map {
+            MapContext::Known(item_map) if item_map == map => {}
+            MapContext::Known(_) => return Some(CohortExclusionReason::ScopeMismatch),
+            MapContext::Unknown => return Some(CohortExclusionReason::UnknownMap),
+        }
     }
     None
 }
 
-fn match_value(item: &HistoryMatch, field: &BaselineField) -> Rational {
+fn match_value(item: &HistoryMatch, field: &BaselineField) -> Option<Rational> {
     match *field {
-        BaselineField::Rating => item.rating.exact(),
-        BaselineField::Component(kind) => item.components.get(kind).exact(),
+        BaselineField::Rating => item.rating.map(RatingBasisPoints::exact),
+        BaselineField::Component(kind) => item.components.map(|vector| vector.get(kind).exact()),
     }
 }
 
@@ -556,7 +588,14 @@ pub fn evaluate_goal(
             });
             continue;
         }
-        candidates.push((item, interval, match_value(item, &goal.field)));
+        let Some(value) = match_value(item, &goal.field) else {
+            exclusions.push(CohortExclusion {
+                match_id: item.match_id.clone(),
+                reason: CohortExclusionReason::MissingCanonicalValue,
+            });
+            continue;
+        };
+        candidates.push((item, interval, value));
     }
     candidates.sort_by_key(|(item, interval, _)| {
         (interval.start_utc_ms, interval.end_utc_ms, &item.demo_hash)
@@ -627,7 +666,9 @@ mod tests {
     use crate::UnitInterval;
 
     fn series(parser: &str) -> CalculationSeriesIdentity {
-        CalculationSeriesIdentity::ofr_v1("local", parser, "proto", "metrics", "epoch")
+        CalculationSeriesIdentity::ofr_v1(
+            "local", "commit", parser, "proto", "schema", "metrics", "epoch",
+        )
     }
 
     fn vector(value: Rational) -> ComponentVector {
@@ -646,15 +687,16 @@ mod tests {
         HistoryMatch {
             match_id: format!("match-{index:02}"),
             demo_hash: format!("demo-{index:02}"),
+            calculation_run_id: format!("run-{index:02}"),
             series: series("parser-a"),
             canonical: true,
-            map: "de_mirage".into(),
+            map: MapContext::Known("de_mirage".into()),
             interval: Some(MatchInterval {
                 start_utc_ms: index * 10_000,
                 end_utc_ms: index * 10_000 + 5_000,
             }),
-            rating: RatingBasisPoints::new(rating).unwrap(),
-            components: vector(Rational::HALF),
+            rating: Some(RatingBasisPoints::new(rating).unwrap()),
+            components: Some(vector(Rational::HALF)),
             side_vectors: BTreeMap::new(),
             trend_exclusion: None,
         }

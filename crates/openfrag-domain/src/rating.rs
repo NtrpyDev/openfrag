@@ -66,6 +66,82 @@ pub enum EvidenceFailure {
     FailedReconciliation,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequiredEvidenceKind {
+    EligibleRoundLedger,
+    ExcludedRoundLedger,
+    DirectDamage,
+    FragBalance,
+    OpeningDuels,
+    TradeKills,
+    Utility,
+    ClutchConversion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptEvidenceSet {
+    pub ids: Vec<String>,
+}
+
+impl ReceiptEvidenceSet {
+    pub fn new(ids: impl Into<Vec<String>>) -> Self {
+        Self { ids: ids.into() }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RatingEvidenceBundle {
+    pub eligible_round_ledger: ReceiptEvidenceSet,
+    pub excluded_round_ledger: ReceiptEvidenceSet,
+    pub direct_damage: ReceiptEvidenceSet,
+    pub frag_balance: ReceiptEvidenceSet,
+    pub opening_duels: ReceiptEvidenceSet,
+    pub trade_kills: ReceiptEvidenceSet,
+    pub utility: ReceiptEvidenceSet,
+    pub clutch_conversion: ReceiptEvidenceSet,
+}
+
+impl RatingEvidenceBundle {
+    fn first_missing(&self) -> Option<RequiredEvidenceKind> {
+        [
+            (
+                RequiredEvidenceKind::EligibleRoundLedger,
+                &self.eligible_round_ledger,
+            ),
+            (
+                RequiredEvidenceKind::ExcludedRoundLedger,
+                &self.excluded_round_ledger,
+            ),
+            (RequiredEvidenceKind::DirectDamage, &self.direct_damage),
+            (RequiredEvidenceKind::FragBalance, &self.frag_balance),
+            (RequiredEvidenceKind::OpeningDuels, &self.opening_duels),
+            (RequiredEvidenceKind::TradeKills, &self.trade_kills),
+            (RequiredEvidenceKind::Utility, &self.utility),
+            (
+                RequiredEvidenceKind::ClutchConversion,
+                &self.clutch_conversion,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(kind, evidence)| evidence.is_empty().then_some(kind))
+    }
+
+    fn component_evidence(&self, kind: ComponentKind) -> &ReceiptEvidenceSet {
+        match kind {
+            ComponentKind::DirectDamage => &self.direct_damage,
+            ComponentKind::FragBalance => &self.frag_balance,
+            ComponentKind::OpeningDuels => &self.opening_duels,
+            ComponentKind::TradeKills => &self.trade_kills,
+            ComponentKind::Utility => &self.utility,
+            ComponentKind::ClutchConversion => &self.clutch_conversion,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RatingInput {
     pub identity: CalculationIdentity,
@@ -73,13 +149,14 @@ pub struct RatingInput {
     pub metrics: RatingMetrics,
     pub irregularities: MatchIrregularities,
     pub evidence_failure: Option<EvidenceFailure>,
-    pub evidence_receipts: Vec<String>,
+    pub evidence: RatingEvidenceBundle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnavailableReason {
     InsufficientEligibleRounds { observed: u32, required: u32 },
     Evidence(EvidenceFailure),
+    MissingRequiredEvidence(RequiredEvidenceKind),
     ForfeitWithoutCanonicalWinner,
 }
 
@@ -110,12 +187,22 @@ pub struct RatingReceipt {
     pub game_build: String,
     pub inputs: RatingMetrics,
     pub irregularities: MatchIrregularities,
-    pub evidence_receipts: Vec<String>,
+    pub evidence: RatingEvidenceBundle,
     pub status: RatingStatus,
     pub trend_exclusions: Vec<TrendExclusionReason>,
     pub components: Option<ComponentVector>,
+    pub component_receipts: Option<Vec<ComponentReceipt>>,
     pub rating_exact: Option<Rational>,
     pub rating_bp: Option<RatingBasisPoints>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentReceipt {
+    pub kind: ComponentKind,
+    pub exact_numerator: i64,
+    pub exact_denominator: i64,
+    pub weight: Rational,
+    pub evidence_ids: Vec<String>,
 }
 
 impl RatingReceipt {
@@ -141,7 +228,9 @@ pub fn calculate_rating(input: RatingInput) -> Result<RatingReceipt, RatingInput
         return Err(RatingInputError::ClutchWinsExceedOpportunities);
     }
 
-    let unavailable = if let Some(failure) = input.evidence_failure {
+    let unavailable = if let Some(kind) = input.evidence.first_missing() {
+        Some(UnavailableReason::MissingRequiredEvidence(kind))
+    } else if let Some(failure) = input.evidence_failure {
         Some(UnavailableReason::Evidence(failure))
     } else if input.irregularities.forfeit_without_canonical_winner {
         Some(UnavailableReason::ForfeitWithoutCanonicalWinner)
@@ -160,16 +249,18 @@ pub fn calculate_rating(input: RatingInput) -> Result<RatingReceipt, RatingInput
             game_build: input.game_build,
             inputs: input.metrics,
             irregularities: input.irregularities,
-            evidence_receipts: input.evidence_receipts,
+            evidence: input.evidence,
             status: RatingStatus::Unavailable(reason),
             trend_exclusions: vec![TrendExclusionReason::Unavailable],
             components: None,
+            component_receipts: None,
             rating_exact: None,
             rating_bp: None,
         });
     }
 
     let components = component_vector(input.metrics)?;
+    let component_receipts = component_receipts(components, &input.evidence)?;
     let rating_exact = weighted_rating(components)?;
     let rounded = rating_exact
         .checked_mul(Rational::from_integer(10_000))?
@@ -209,13 +300,41 @@ pub fn calculate_rating(input: RatingInput) -> Result<RatingReceipt, RatingInput
         game_build: input.game_build,
         inputs: input.metrics,
         irregularities: input.irregularities,
-        evidence_receipts: input.evidence_receipts,
+        evidence: input.evidence,
         status,
         trend_exclusions,
         components: Some(components),
+        component_receipts: Some(component_receipts),
         rating_exact: Some(rating_exact),
         rating_bp: Some(rating_bp),
     })
+}
+
+fn component_receipts(
+    components: ComponentVector,
+    evidence: &RatingEvidenceBundle,
+) -> Result<Vec<ComponentReceipt>, ExactError> {
+    let definitions = [
+        (ComponentKind::DirectDamage, Rational::new(3, 10)?),
+        (ComponentKind::FragBalance, Rational::new(3, 10)?),
+        (ComponentKind::OpeningDuels, Rational::new(3, 20)?),
+        (ComponentKind::TradeKills, Rational::new(1, 10)?),
+        (ComponentKind::Utility, Rational::new(1, 10)?),
+        (ComponentKind::ClutchConversion, Rational::new(1, 20)?),
+    ];
+    Ok(definitions
+        .into_iter()
+        .map(|(kind, weight)| {
+            let exact = components.get(kind).exact();
+            ComponentReceipt {
+                kind,
+                exact_numerator: exact.numerator(),
+                exact_denominator: exact.denominator(),
+                weight,
+                evidence_ids: evidence.component_evidence(kind).ids.clone(),
+            }
+        })
+        .collect())
 }
 
 fn component_vector(metrics: RatingMetrics) -> Result<ComponentVector, ExactError> {
@@ -311,7 +430,9 @@ mod tests {
     use super::*;
 
     fn identity() -> CalculationIdentity {
-        CalculationIdentity::ofr_v1("demo", "parser", "proto", "metrics")
+        CalculationIdentity::ofr_v1(
+            "demo", "commit", "parser", "proto", "schema", "metrics", "epoch",
+        )
     }
 
     fn worked_metrics() -> RatingMetrics {
@@ -331,13 +452,23 @@ mod tests {
     }
 
     fn input(metrics: RatingMetrics) -> RatingInput {
+        let evidence = |id: &str| ReceiptEvidenceSet::new(vec![id.to_owned()]);
         RatingInput {
             identity: identity(),
             game_build: "game".into(),
             metrics,
             irregularities: MatchIrregularities::default(),
             evidence_failure: None,
-            evidence_receipts: vec!["round-ledger".into()],
+            evidence: RatingEvidenceBundle {
+                eligible_round_ledger: evidence("eligible-ledger"),
+                excluded_round_ledger: evidence("excluded-ledger"),
+                direct_damage: evidence("damage"),
+                frag_balance: evidence("frag"),
+                opening_duels: evidence("opening"),
+                trade_kills: evidence("trade"),
+                utility: evidence("utility"),
+                clutch_conversion: evidence("clutch"),
+            },
         }
     }
 
