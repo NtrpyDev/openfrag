@@ -95,7 +95,11 @@ fn snapshot(
     )
 }
 
-async fn post(service: &GsiService, content_type: &str, body: impl Into<Body>) -> axum::response::Response {
+async fn post(
+    service: &GsiService,
+    content_type: &str,
+    body: impl Into<Body>,
+) -> axum::response::Response {
     router(service.clone())
         .oneshot(
             Request::post("/gsi")
@@ -111,7 +115,12 @@ async fn post(service: &GsiService, content_type: &str, body: impl Into<Body>) -
 async fn rejects_an_invalid_auth_token_without_emitting_evidence() {
     let (service, _clock, sink) = harness();
 
-    let response = post(&service, "application/json", payload("wrong-token", STEAM_ID)).await;
+    let response = post(
+        &service,
+        "application/json",
+        payload("wrong-token", STEAM_ID),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert!(sink.receipts().is_empty());
@@ -288,28 +297,28 @@ async fn derives_a_trusted_round_end_fact_from_consecutive_snapshots() {
 
 #[tokio::test]
 async fn stale_polling_emits_once_and_the_next_snapshot_recovers() {
-        let (service, clock, sink) = harness();
-        post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
+    let (service, clock, sink) = harness();
+    post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
 
-        clock.advance(Duration::from_secs(29));
-        assert_eq!(service.poll_stale(), Ok(PollOutcome::NoChange));
-        clock.advance(Duration::from_secs(1));
-        assert_eq!(service.poll_stale(), Ok(PollOutcome::Stale));
-        assert_eq!(service.poll_stale(), Ok(PollOutcome::NoChange));
-        assert_eq!(sink.receipts()[1].output, StateOutput::Stale);
+    clock.advance(Duration::from_secs(29));
+    assert_eq!(service.poll_stale(), Ok(PollOutcome::NoChange));
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(service.poll_stale(), Ok(PollOutcome::Stale));
+    assert_eq!(service.poll_stale(), Ok(PollOutcome::NoChange));
+    assert_eq!(sink.receipts()[1].output, StateOutput::Stale);
 
-        clock.advance(Duration::from_secs(1));
-        let response = post(
-            &service,
-            "application/json",
-            snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 5, 2, 80),
-        )
-        .await;
+    clock.advance(Duration::from_secs(1));
+    let response = post(
+        &service,
+        "application/json",
+        snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 5, 2, 80),
+    )
+    .await;
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let receipts = sink.receipts();
-        assert_eq!(receipts[2].output, StateOutput::Recovered);
-        assert!(receipts[2].facts.is_empty());
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipts = sink.receipts();
+    assert_eq!(receipts[2].output, StateOutput::Recovered);
+    assert!(receipts[2].facts.is_empty());
 }
 
 #[tokio::test]

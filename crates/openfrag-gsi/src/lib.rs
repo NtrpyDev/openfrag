@@ -102,11 +102,7 @@ pub struct GsiService {
 
 impl GsiService {
     #[must_use]
-    pub fn new(
-        config: GsiConfig,
-        clock: Arc<dyn Clock>,
-        sink: Arc<dyn EventSink>,
-    ) -> Self {
+    pub fn new(config: GsiConfig, clock: Arc<dyn Clock>, sink: Arc<dyn EventSink>) -> Self {
         Self {
             config,
             clock,
@@ -133,8 +129,7 @@ impl GsiService {
         {
             return Ok(PollOutcome::NoChange);
         }
-        let (Some(payload_hash), Some(presence)) =
-            (guard.last_hash.clone(), guard.last_presence)
+        let (Some(payload_hash), Some(presence)) = (guard.last_hash.clone(), guard.last_presence)
         else {
             return Ok(PollOutcome::NoChange);
         };
@@ -160,7 +155,6 @@ pub fn stale_after(heartbeat: Duration) -> Duration {
     heartbeat.saturating_mul(3).min(Duration::from_secs(90))
 }
 
-#[must_use]
 pub fn router(service: GsiService) -> Router {
     Router::new()
         .route("/gsi", post(route_post))
@@ -200,7 +194,12 @@ async fn route_post(
         return (StatusCode::UNAUTHORIZED, "unauthorized");
     }
 
-    if payload.provider.as_ref().and_then(|provider| provider.appid) != Some(730) {
+    if payload
+        .provider
+        .as_ref()
+        .and_then(|provider| provider.appid)
+        != Some(730)
+    {
         return (StatusCode::BAD_REQUEST, "wrong-app");
     }
 
@@ -215,15 +214,10 @@ async fn route_post(
     }
 
     let snapshot = TrustedSnapshot::from(&payload);
-    let (output, facts) = if guard.snapshot.is_none() {
-        (StateOutput::Seeded, Vec::new())
-    } else if guard.stale {
-        (StateOutput::Recovered, Vec::new())
-    } else {
-        derive_transition(
-            guard.snapshot.as_ref().expect("snapshot checked above"),
-            &snapshot,
-        )
+    let (output, facts) = match guard.snapshot.as_ref() {
+        None => (StateOutput::Seeded, Vec::new()),
+        Some(_) if guard.stale => (StateOutput::Recovered, Vec::new()),
+        Some(previous) => derive_transition(previous, &snapshot),
     };
     let presence = PresenceBits::from(&payload);
     let receipt = EvidenceReceipt {
