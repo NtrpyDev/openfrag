@@ -138,3 +138,61 @@ async fn seeds_sanitized_evidence_and_accepts_json_content_type_parameters() {
     assert!(!debug_receipt.contains(STEAM_ID));
     assert!(!debug_receipt.contains("de_dust2"));
 }
+
+#[tokio::test]
+async fn rejects_a_mismatched_local_player_identity() {
+    let (service, _clock, sink) = harness();
+
+    let response = post(&service, "application/json", payload(TOKEN, "other-player")).await;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(sink.receipts().is_empty());
+}
+
+#[tokio::test]
+async fn rejects_oversized_json_before_the_handler_buffers_it() {
+    let (service, _clock, sink) = harness();
+
+    let response = post(
+        &service,
+        "application/json",
+        vec![b'x'; openfrag_gsi::MAX_BODY_BYTES + 1],
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(sink.receipts().is_empty());
+}
+
+#[tokio::test]
+async fn rejects_malformed_json_without_emitting_evidence() {
+    let (service, _clock, sink) = harness();
+
+    let response = post(&service, "application/json", "{").await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(sink.receipts().is_empty());
+}
+
+#[tokio::test]
+async fn rejects_a_non_json_content_type() {
+    let (service, _clock, sink) = harness();
+
+    let response = post(&service, "text/plain", payload(TOKEN, STEAM_ID)).await;
+
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert!(sink.receipts().is_empty());
+}
+
+#[tokio::test]
+async fn treats_a_repeated_snapshot_as_idempotent() {
+    let (service, _clock, sink) = harness();
+    let body = payload(TOKEN, STEAM_ID);
+
+    let first = post(&service, "application/json", body.clone()).await;
+    let repeated = post(&service, "application/json", body).await;
+
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(repeated.status(), StatusCode::OK);
+    assert_eq!(sink.receipts().len(), 1);
+}
