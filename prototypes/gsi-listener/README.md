@@ -30,6 +30,29 @@ test "$MODE" = 600 || { echo "installed config mode is $MODE, expected 600" >&2;
 trap - EXIT
 ```
 
+### Noah's shared Steam library
+
+The current `/mnt/shared` Steam library is a `fuseblk` mount with
+`allow_other`. It reports cfg files as mode 0755 and ignores both `chmod` and
+POSIX ACL changes, so the protected-token installation above correctly fails
+its mode check on this machine. Production openfrag must detect this condition
+and explain that the cfg token cannot be confidential on this library.
+
+For this throwaway loopback-only capture, use a deliberately non-secret marker
+instead of pretending the token is protected:
+
+```sh
+DEST='/mnt/shared/SteamLibrary/steamapps/common/Counter-Strike Global Offensive/game/csgo/cfg/gamestate_integration_openfrag_prototype.local.cfg'
+test ! -e "$DEST" && test ! -L "$DEST"
+sed 's/REPLACE_WITH_RANDOM_LOCAL_TOKEN/OPENFRAG_PROTOTYPE_PUBLIC_MARKER/' \
+  prototypes/gsi-listener/gamestate_integration_openfrag_prototype.cfg > "$DEST"
+GSI_TOKEN=OPENFRAG_PROTOTYPE_PUBLIC_MARKER \
+cargo run --release --manifest-path prototypes/gsi-listener/Cargo.toml
+```
+
+The marker is not authentication. Loopback binding is the only exposure
+boundary in this fallback test.
+
 Then, from the repository root, start the listener with one command. The token is explicit and the prototype uses its fixed capture path:
 
 ```sh
