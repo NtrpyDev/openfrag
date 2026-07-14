@@ -277,7 +277,7 @@ mod tests {
         assert!(!r.redacted.contains("secret"));
         assert!(ingest_configured(&mut s, &c, b).unwrap().is_none());
         assert_eq!(
-            ingest(&mut s, &vec![b'x'; MAX_BODY_BYTES + 1]),
+            ingest_configured(&mut s, &c, &vec![b'x'; MAX_BODY_BYTES + 1]),
             Err(IngestError::TooLarge)
         );
     }
