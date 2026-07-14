@@ -276,7 +276,7 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
     use demoparser_parser::{
         first_pass::parser_settings::ParserInputs,
         parse_demo::{Parser, ParsingMode},
-        second_pass::variants::{OutputSerdeHelperStruct, soa_to_aos},
+        second_pass::variants::{soa_to_aos, OutputSerdeHelperStruct},
     };
     let bytes = std::fs::read(path).map_err(|e| ParserError::Io(e.to_string()))?;
     let huf = create_huffman_lookup_table();
@@ -1009,10 +1009,9 @@ mod tests {
         let j = o
             .acquire_lease(j, "a", now, Duration::from_secs(60))
             .unwrap();
-        assert!(
-            o.acquire_lease(j.clone(), "b", now, Duration::from_secs(60))
-                .is_err()
-        );
+        assert!(o
+            .acquire_lease(j.clone(), "b", now, Duration::from_secs(60))
+            .is_err());
         let j = o.renew_lease(j, "a", now, Duration::from_secs(60)).unwrap();
         o.release_lease(j, "a").unwrap();
     }
@@ -1106,12 +1105,10 @@ mod tests {
         assert_eq!(death.victim(), Some(76561198073049527));
         assert_eq!(death.weapon(), Some("p250"));
         assert!(!parsed.player_snapshots.is_empty());
-        assert!(parsed.player_snapshots.iter().all(|snapshot| {
-            parsed
-                .participants
-                .iter()
-                .any(|participant| participant.steam_id == snapshot.steam_id)
-        }));
+        assert!(parsed.player_snapshots.iter().all(|snapshot| parsed
+            .participants
+            .iter()
+            .any(|participant| participant.steam_id == snapshot.steam_id)));
         assert!(
             parsed.metadata.tick_rate.is_some()
                 || parsed.metadata.tick_rate_unavailable_reason.is_some()
@@ -1121,12 +1118,10 @@ mod tests {
             "84a1a4191302bdd2a3bbb5a727842093744b1fb1a228aeec630369e44b622cb2"
         );
         assert_eq!(parsed.identity.formula_version, "ofr-1.0.0");
-        assert!(
-            parsed
-                .events
-                .iter()
-                .any(|e| e.name == "player_death" && !e.fields.is_empty())
-        );
+        assert!(parsed
+            .events
+            .iter()
+            .any(|e| e.name == "player_death" && !e.fields.is_empty()));
         let ordinals: Vec<u64> = parsed
             .receipts
             .iter()

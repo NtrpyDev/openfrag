@@ -4,11 +4,11 @@
 //!
 //! Usage: parse_bench <demo.dem> [iters=5] [mode=both|st|mt]
 
-use ahash::AHashMap;
-use memmap2::MmapOptions;
 use parser::first_pass::parser_settings::ParserInputs;
 use parser::parse_demo::{Parser, ParsingMode};
 use parser::second_pass::parser_settings::create_huffman_lookup_table;
+use ahash::AHashMap;
+use memmap2::MmapOptions;
 use std::env;
 use std::fs::File;
 use std::time::Instant;
@@ -17,32 +17,14 @@ use std::time::Instant;
 /// exercise the entity + prop-decode hot path without being a synthetic micro-case.
 fn wanted_props() -> Vec<String> {
     [
-        "tick",
-        "health",
-        "X",
-        "Y",
-        "Z",
-        "velocity_X",
-        "velocity_Y",
-        "velocity_Z",
+        "tick", "health", "X", "Y", "Z",
+        "velocity_X", "velocity_Y", "velocity_Z",
         "CCSPlayerPawn.m_angEyeAngles",
-        "is_alive",
-        "team_num",
-        "active_weapon_name",
-        "FORWARD",
-        "LEFT",
-        "RIGHT",
-        "BACK",
-        "FIRE",
-        "is_walking",
-        "is_airborne",
-        "flash_duration",
-        "armor_value",
-        "balance",
+        "is_alive", "team_num", "active_weapon_name",
+        "FORWARD", "LEFT", "RIGHT", "BACK", "FIRE", "is_walking", "is_airborne",
+        "flash_duration", "armor_value", "balance",
     ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+    .iter().map(|s| s.to_string()).collect()
 }
 
 fn settings<'a>(huf: &'a Vec<(u8, u8)>) -> ParserInputs<'a> {
