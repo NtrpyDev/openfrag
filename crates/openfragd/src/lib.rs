@@ -47,7 +47,7 @@ struct Health {
     database: &'static str,
 }
 
-pub async fn app(config: AppConfig) -> Result<Router, AppError> {
+pub fn app(config: AppConfig) -> Result<Router, AppError> {
     let storage = Storage::open(Layout::at(config.data_directory))
         .map_err(|error| AppError::Storage(format!("{error:?}")))?;
     let state = AppState {
@@ -87,7 +87,6 @@ mod tests {
     async fn health_reports_private_local_v1() {
         let directory = tempfile::tempdir().expect("temporary data directory");
         let response = app(AppConfig::for_test(directory.path()))
-            .await
             .expect("application starts")
             .oneshot(
                 Request::builder()
@@ -114,7 +113,6 @@ mod tests {
     async fn dashboard_is_embedded_and_has_no_remote_assets() {
         let directory = tempfile::tempdir().expect("temporary data directory");
         let response = app(AppConfig::for_test(directory.path()))
-            .await
             .expect("application starts")
             .oneshot(
                 Request::builder()
