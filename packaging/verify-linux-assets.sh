@@ -6,6 +6,7 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 service="$root/linux/openfragd.service"
 desktop="$root/linux/openfrag.desktop"
 helper="$root/linux/openfrag-open-dashboard"
+installer="$root/install-user.sh"
 
 require_line() {
     grep -Fqx -- "$2" "$1" || { printf 'missing required line: %s\n' "$2" >&2; exit 1; }
@@ -16,7 +17,7 @@ require_line "$service" 'Restart=on-failure'
 require_line "$service" 'NoNewPrivileges=yes'
 require_line "$service" 'ProtectSystem=strict'
 require_line "$service" 'UMask=0077'
-require_line "$desktop" 'Exec=/usr/libexec/openfrag/openfrag-open-dashboard'
+require_line "$desktop" 'Exec=openfrag-open-dashboard'
 require_line "$helper" 'host=127.0.0.1'
 require_line "$helper" 'port=7130'
 grep -Fq '/dev/tcp/${host}/${port}' "$helper"
@@ -37,6 +38,7 @@ if [ -n "$remote_endpoints" ]; then
 fi
 
 bash -n "$helper"
+bash -n "$installer"
 if command -v desktop-file-validate >/dev/null 2>&1; then
     desktop-file-validate "$desktop"
 fi
