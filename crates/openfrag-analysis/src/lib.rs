@@ -23,6 +23,7 @@ pub enum AnalysisUnavailable {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RoundExclusion {
+    Warmup,
     MissingFreezeState,
     LocalPlayerNotAlive,
     InvalidTeam,
@@ -157,11 +158,41 @@ pub fn analyze(
         utility: ReceiptEvidenceSet::new(component_ids.clone()),
         clutch_conversion: ReceiptEvidenceSet::new(component_ids),
     };
+    let short_roster_rounds = rounds
+        .iter()
+        .filter(|round| round.eligible)
+        .filter(|round| {
+            [2, 3].into_iter().any(|team| {
+                parsed
+                    .participants
+                    .iter()
+                    .filter(|participant| participant.team == Some(team))
+                    .filter(|participant| {
+                        snapshot_at(parsed, participant.steam_id, round.freeze_tick)
+                            .and_then(|snapshot| snapshot.alive)
+                            == Some(true)
+                    })
+                    .count()
+                    < 5
+            })
+        })
+        .count();
+    let irregularities = MatchIrregularities {
+        missed_live_round: rounds
+            .iter()
+            .any(|round| round.exclusion == Some(RoundExclusion::MissingFreezeState)),
+        roster_imbalanced: short_roster_rounds > 1,
+        surrender: parsed.events.iter().any(|event| {
+            event.name == "cs_win_panel_match" && event.bool_field("surrendered") == Some(true)
+        }),
+        forfeit_without_canonical_winner: false,
+        overtime: metrics.eligible_rounds > 24,
+    };
     let rating_input = RatingInput {
         identity,
         game_build,
         metrics,
-        irregularities: MatchIrregularities::default(),
+        irregularities,
         evidence_failure: None,
         evidence,
     };
@@ -195,23 +226,37 @@ fn build_rounds(
     parsed: &ParsedOutput,
     local: u64,
 ) -> Result<Vec<RoundLedger>, AnalysisUnavailable> {
-    let freezes = parsed
+    let freezes: Vec<&ParsedEvent> = parsed
         .events
         .iter()
-        .filter(|e| e.name == "round_freeze_end");
+        .filter(|e| e.name == "round_freeze_end")
+        .collect();
     let ends: Vec<&ParsedEvent> = parsed
         .events
         .iter()
         .filter(|e| e.name == "round_end")
         .collect();
     let mut rounds = Vec::new();
-    for (index, freeze) in freezes.enumerate() {
-        let Some(end) = ends.iter().copied().find(|end| end.tick > freeze.tick) else {
-            continue;
-        };
+    for (index, freeze) in freezes.iter().copied().enumerate() {
+        let next_freeze_tick = freezes.get(index + 1).map_or(i32::MAX, |event| event.tick);
+        let matching: Vec<&ParsedEvent> = ends
+            .iter()
+            .copied()
+            .filter(|end| end.tick > freeze.tick && end.tick < next_freeze_tick)
+            .collect();
+        if matching.len() != 1 {
+            return Err(AnalysisUnavailable::MalformedEvidence);
+        }
+        let end = matching[0];
         let snapshot = snapshot_at(parsed, local, freeze.tick);
+        let snapshot = snapshot.filter(|state| state.tick == freeze.tick);
+        let warmup = freeze
+            .bool_field("warmup")
+            .or_else(|| freeze.bool_field("warmup_period"))
+            .unwrap_or(false);
         let (team, alive, exclusion) = match snapshot {
-            None => (0, false, Some(RoundExclusion::MissingFreezeState)),
+            _ if warmup => (0, false, Some(RoundExclusion::Warmup)),
+            None => return Err(AnalysisUnavailable::MissingTeamOrLiveness),
             Some(state) if !state.alive.unwrap_or(false) => (
                 state.team.unwrap_or(0),
                 false,
@@ -224,6 +269,17 @@ fn build_rounds(
             ),
             Some(state) => (state.team.unwrap_or(0), true, None),
         };
+        if exclusion.is_none() {
+            let start_counter = snapshot
+                .and_then(|state| state.round_counter)
+                .ok_or(AnalysisUnavailable::MissingTeamOrLiveness)?;
+            let end_counter = snapshot_at(parsed, local, end.tick)
+                .and_then(|state| state.round_counter)
+                .ok_or(AnalysisUnavailable::MissingTeamOrLiveness)?;
+            if end_counter != start_counter + 1 {
+                return Err(AnalysisUnavailable::MalformedEvidence);
+            }
+        }
         let winner = end.winner().ok_or(AnalysisUnavailable::MalformedEvidence)?;
         let hashes = parsed
             .receipts
@@ -241,6 +297,9 @@ fn build_rounds(
             exclusion,
             ordered_evidence_hashes: hashes,
         });
+    }
+    if ends.len() != rounds.len() {
+        return Err(AnalysisUnavailable::MalformedEvidence);
     }
     if rounds.is_empty() {
         return Err(AnalysisUnavailable::MissingRequiredStream(
@@ -330,7 +389,12 @@ fn score_round(
                 .u64_field("assister_steamid")
                 .or_else(|| event.assister());
             if event.assisted_flash() == Some(true) && assister == Some(local) {
-                metrics.flash_assists += 1;
+                let attacker = attacker.ok_or(AnalysisUnavailable::MissingIdentity)?;
+                if team_at(parsed, attacker, event.tick) == team_at(parsed, local, event.tick) {
+                    metrics.flash_assists += 1;
+                } else {
+                    return Err(AnalysisUnavailable::MalformedEvidence);
+                }
             }
         }
     }
@@ -349,19 +413,20 @@ fn score_round(
             metrics.trade_kills += 1;
         }
     }
-    let local_alive = snapshot_at(parsed, local, round.freeze_tick)
-        .and_then(|s| s.alive)
-        .ok_or(AnalysisUnavailable::MissingTeamOrLiveness)?;
-    if local_alive {
+    let transition_ticks = parsed
+        .player_snapshots
+        .iter()
+        .filter(|snapshot| snapshot.tick >= round.freeze_tick && snapshot.tick <= round.end_tick)
+        .map(|snapshot| snapshot.tick);
+    for tick in transition_ticks {
+        let local_alive = snapshot_at(parsed, local, tick)
+            .and_then(|s| s.alive)
+            .ok_or(AnalysisUnavailable::MissingTeamOrLiveness)?;
         let teammates_alive = parsed
             .participants
             .iter()
             .filter(|p| p.steam_id != local && p.team == Some(round.local_team))
-            .filter(|p| {
-                snapshot_at(parsed, p.steam_id, round.end_tick)
-                    .and_then(|s| s.alive)
-                    .unwrap_or(false)
-            })
+            .filter(|p| snapshot_at(parsed, p.steam_id, tick).and_then(|s| s.alive) == Some(true))
             .count();
         let enemies_alive = parsed
             .participants
@@ -370,17 +435,14 @@ fn score_round(
                 p.team
                     .is_some_and(|team| team != round.local_team && matches!(team, 2 | 3))
             })
-            .filter(|p| {
-                snapshot_at(parsed, p.steam_id, round.end_tick)
-                    .and_then(|s| s.alive)
-                    .unwrap_or(false)
-            })
+            .filter(|p| snapshot_at(parsed, p.steam_id, tick).and_then(|s| s.alive) == Some(true))
             .count();
-        if teammates_alive == 0 && enemies_alive > 0 {
+        if local_alive && teammates_alive == 0 && enemies_alive > 0 {
             metrics.clutch_opportunities += 1;
             if i64::from(round.local_team) == round.winner {
                 metrics.clutch_wins += 1;
             }
+            break;
         }
     }
     Ok(())
