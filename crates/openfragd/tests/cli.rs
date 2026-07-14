@@ -31,7 +31,11 @@ fn setup_gsi_writes_a_private_local_configuration_without_printing_the_token() {
         .output()
         .expect("run GSI setup");
 
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 setup output");
     let config = std::fs::read_to_string(cfg.join("gamestate_integration_openfrag.cfg"))
         .expect("GSI config");
@@ -58,13 +62,21 @@ fn doctor_reports_json_without_requiring_capture_for_demo_import() {
         .output()
         .expect("run Compatibility Doctor");
 
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("Doctor JSON");
     let checks = report["checks"].as_array().expect("checks array");
-    assert!(checks.iter().any(|check| {
-        check["id"] == "demo_import" && check["status"] == "ready"
-    }));
-    assert!(checks.iter().any(|check| {
-        check["id"] == "capture" && check["status"] == "blocked"
-    }));
+    assert!(
+        checks
+            .iter()
+            .any(|check| { check["id"] == "demo_import" && check["status"] == "ready" })
+    );
+    assert!(
+        checks
+            .iter()
+            .any(|check| { check["id"] == "capture" && check["status"] == "blocked" })
+    );
 }
