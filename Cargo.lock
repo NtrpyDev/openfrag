@@ -745,6 +745,10 @@ name = "openfrag-capture"
 version = "1.0.0"
 
 [[package]]
+name = "openfrag-domain"
+version = "1.0.0"
+
+[[package]]
 name = "openfrag-gsi"
 version = "1.0.0"
 dependencies = [
