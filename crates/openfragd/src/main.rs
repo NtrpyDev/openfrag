@@ -122,7 +122,7 @@ async fn serve(
         return Err("openfrag only binds to a loopback address".into());
     }
     let data_dir = data_dir.unwrap_or_else(default_data_directory);
-    let router = app(AppConfig::new(data_dir))
+    let router = app(&AppConfig::new(data_dir))
         .map_err(|error| format!("failed to initialize openfrag: {error:?}"))?;
     let listener = TcpListener::bind(bind).await?;
     println!("openfrag v1 listening on http://{}", listener.local_addr()?);
