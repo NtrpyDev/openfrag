@@ -2,6 +2,7 @@
 
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -94,30 +95,95 @@ pub enum ParserCapability {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DemoMetadata {
+    pub map: Option<String>,
+    pub patch_build: Option<String>,
+    pub demo_stamp: Option<String>,
+    pub server: Option<String>,
+    pub game_directory: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Participant {
+    pub steam_id: u64,
+    pub name: Option<String>,
+    pub team: Option<i32>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedEvent {
+    pub name: String,
+    pub tick: i32,
+    pub ingestion_ordinal: u64,
+    pub fields: BTreeMap<String, String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventReceipt {
+    pub ingestion_ordinal: u64,
+    pub event_name: String,
+    pub tick: i32,
+    pub fields: BTreeMap<String, String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedRound {
+    pub number: u64,
+    pub end_tick: i32,
+    pub winner: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedOutput {
-    pub demo_metadata: String,
-    pub participants: Vec<String>,
-    pub rounds: u64,
-    pub events: u64,
-    pub receipts: Vec<String>,
+    pub metadata: DemoMetadata,
+    pub participants: Vec<Participant>,
+    pub rounds: Vec<ParsedRound>,
+    pub events: Vec<ParsedEvent>,
+    pub receipts: Vec<EventReceipt>,
     pub suspicious_empty: bool,
 }
+impl ParsedOutput {
+    pub fn round_count(&self) -> usize {
+        self.rounds.len()
+    }
+    pub fn event_count(&self) -> usize {
+        self.events.len()
+    }
+}
 
-/// The pinned LaihoE parser is not vendored in this crate yet. Production callers must
-/// surface `Unavailable` and never turn it into an empty Match.
+pub const DEMOPARSER_COMMIT: &str = "ba39cc44cd5abfd7f34df2b3c0a7dd3630048311";
+pub const DEMOPARSER_BUILD: &str = "parser-0.1.1/csgoproto-0.1.5";
+pub const QUERY_PLAN_VERSION: &str = "openfrag-v1-events-1";
+pub const QUERY_PLAN: &[&str] = &["player_death", "round_end"];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParserError {
+    Io(String),
+    Parse(String),
+    Quarantined { reason: &'static str },
+}
+
 pub fn parser_capability() -> ParserCapability {
-    ParserCapability::Unavailable { reason: "demoparser commit ba39cc44cd5abfd7f34df2b3c0a7dd3630048311 requires vendored generated protos and is not yet integrated".into() }
+    #[cfg(feature = "demoparser")]
+    {
+        return ParserCapability::Pinned {
+            commit: DEMOPARSER_COMMIT.into(),
+            build: DEMOPARSER_BUILD.into(),
+            schema_hash: QUERY_PLAN_VERSION.into(),
+        };
+    }
+    #[cfg(not(feature = "demoparser"))]
+    {
+        ParserCapability::Unavailable {
+            reason: "demoparser feature is disabled".into(),
+        }
+    }
 }
 
 #[cfg(feature = "demoparser")]
-pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, String> {
+pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserError> {
     use ahash::AHashMap;
     use demoparser_parser::second_pass::parser_settings::create_huffman_lookup_table;
     use demoparser_parser::{
         first_pass::parser_settings::ParserInputs,
         parse_demo::{Parser, ParsingMode},
     };
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(path).map_err(|e| ParserError::Io(e.to_string()))?;
     let huf = create_huffman_lookup_table();
     let inputs = ParserInputs {
         real_name_to_og_name: AHashMap::new(),
@@ -142,30 +208,83 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, String>
         fallback_bytes: None,
     };
     let mut parser = Parser::new(inputs, ParsingMode::Normal);
-    let out = parser.parse_demo(&bytes).map_err(|e| e.to_string())?;
-    let suspicious_empty = out.game_events.is_empty() || out.roster.is_empty();
-    if suspicious_empty {
-        return Err("parser returned suspiciously empty participants or events".into());
+    let out = parser
+        .parse_demo(&bytes)
+        .map_err(|e| ParserError::Parse(e.to_string()))?;
+    let header = out.header.unwrap_or_default();
+    let participants: Vec<Participant> = out
+        .roster
+        .iter()
+        .filter_map(|p| {
+            p.steamid.map(|id| Participant {
+                steam_id: id,
+                name: p.name.clone(),
+                team: p.team_number,
+            })
+        })
+        .collect();
+    let mut events = Vec::new();
+    let mut receipts = Vec::new();
+    let mut rounds = Vec::new();
+    let mut round_no = 0;
+    for (ordinal, event) in out.game_events.iter().enumerate() {
+        let fields: BTreeMap<String, String> = event
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), format!("{:?}", f.data)))
+            .collect();
+        let parsed = ParsedEvent {
+            name: event.name.clone(),
+            tick: event.tick,
+            ingestion_ordinal: ordinal as u64,
+            fields: fields.clone(),
+        };
+        if event.name == "round_end" {
+            round_no += 1;
+            rounds.push(ParsedRound {
+                number: round_no,
+                end_tick: event.tick,
+                winner: fields.get("winner").cloned(),
+            });
+        }
+        receipts.push(EventReceipt {
+            ingestion_ordinal: ordinal as u64,
+            event_name: event.name.clone(),
+            tick: event.tick,
+            fields: fields.clone(),
+        });
+        events.push(parsed);
+    }
+    let suspicious_empty = participants.is_empty()
+        || rounds.is_empty()
+        || !events.iter().any(|e| e.name == "player_death");
+    if participants.is_empty() {
+        return Err(ParserError::Quarantined {
+            reason: "no participants",
+        });
+    }
+    if rounds.is_empty() {
+        return Err(ParserError::Quarantined {
+            reason: "no canonical round_end events",
+        });
+    }
+    if !events.iter().any(|e| e.name == "player_death") {
+        return Err(ParserError::Quarantined {
+            reason: "no requested player_death events",
+        });
     }
     Ok(ParsedOutput {
-        demo_metadata: format!("header={:?}", out.header),
-        participants: out
-            .roster
-            .iter()
-            .filter_map(|p| p.steamid.map(|id| id.to_string()))
-            .collect(),
-        rounds: out
-            .game_events
-            .iter()
-            .filter(|e| e.name == "round_end")
-            .count() as u64,
-        events: out.game_events.len() as u64,
-        receipts: out
-            .game_events
-            .iter()
-            .enumerate()
-            .map(|(i, e)| format!("{}:{}:{}", i, e.name, e.tick))
-            .collect(),
+        metadata: DemoMetadata {
+            map: header.get("map_name").cloned(),
+            patch_build: header.get("patch_version").cloned(),
+            demo_stamp: header.get("demo_file_stamp").cloned(),
+            server: header.get("server_name").cloned(),
+            game_directory: header.get("game_directory").cloned(),
+        },
+        participants,
+        rounds,
+        events,
+        receipts,
         suspicious_empty,
     })
 }
@@ -486,8 +605,19 @@ pub fn hash_and_copy(
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).map_err(|_| ErrorCode::Io)?;
     }
-    let tmp = dst.with_extension(format!("staging-{}", std::process::id()));
-    let mut output = fs::File::create(&tmp).map_err(|_| ErrorCode::Io)?;
+    let tmp = dst.with_extension(format!(
+        "staging-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|_| ErrorCode::Io)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; CHUNK_BYTES];
     let mut done = 0;
@@ -688,12 +818,35 @@ mod tests {
     #[cfg(feature = "demoparser")]
     #[test]
     fn pinned_fixture_adapter_smoke_when_requested() {
-        let Ok(path) = std::env::var("OPENFRAG_DEMOPARSER_FIXTURE") else { return; };
+        let Ok(path) = std::env::var("OPENFRAG_DEMOPARSER_FIXTURE") else {
+            return;
+        };
         let start = std::time::Instant::now();
-        let parsed = parse_with_pinned_demoparser(Path::new(&path)).expect("pinned fixture must parse");
-        assert!(!parsed.suspicious_empty && parsed.participants.len() >= 2 && parsed.rounds > 0 && parsed.events > 0);
-        let ordinals: Vec<usize> = parsed.receipts.iter().enumerate().map(|(i, _)| i).collect();
+        let parsed =
+            parse_with_pinned_demoparser(Path::new(&path)).expect("pinned fixture must parse");
+        assert!(!parsed.suspicious_empty);
+        assert_eq!(parsed.metadata.map.as_deref(), Some("de_mirage"));
+        assert_eq!(parsed.participants.len(), 10);
+        assert_eq!(parsed.rounds.len(), 10);
+        assert_eq!(parsed.events.len(), 83);
+        assert!(parsed
+            .events
+            .iter()
+            .any(|e| e.name == "player_death" && !e.fields.is_empty()));
+        let ordinals: Vec<u64> = parsed
+            .receipts
+            .iter()
+            .map(|r| r.ingestion_ordinal)
+            .collect();
         assert!(ordinals.windows(2).all(|w| w[0] < w[1]));
-        eprintln!("fixture={} participants={} rounds={} events={} elapsed_ms={} metadata={}", path, parsed.participants.len(), parsed.rounds, parsed.events, start.elapsed().as_millis(), parsed.demo_metadata);
+        eprintln!(
+            "fixture={} participants={} rounds={} events={} elapsed_ms={} map={:?}",
+            path,
+            parsed.participants.len(),
+            parsed.rounds.len(),
+            parsed.events.len(),
+            start.elapsed().as_millis(),
+            parsed.metadata.map
+        );
     }
 }
