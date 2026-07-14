@@ -109,6 +109,67 @@ pub fn parser_capability() -> ParserCapability {
     ParserCapability::Unavailable { reason: "demoparser commit ba39cc44cd5abfd7f34df2b3c0a7dd3630048311 requires vendored generated protos and is not yet integrated".into() }
 }
 
+#[cfg(feature = "demoparser")]
+pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, String> {
+    use ahash::AHashMap;
+    use demoparser_parser::second_pass::parser_settings::create_huffman_lookup_table;
+    use demoparser_parser::{
+        first_pass::parser_settings::ParserInputs,
+        parse_demo::{Parser, ParsingMode},
+    };
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let huf = create_huffman_lookup_table();
+    let inputs = ParserInputs {
+        real_name_to_og_name: AHashMap::new(),
+        wanted_players: vec![],
+        wanted_player_props: vec![
+            "player_steamid".into(),
+            "team_num".into(),
+            "is_alive".into(),
+        ],
+        wanted_other_props: vec!["total_rounds_played".into()],
+        wanted_prop_states: AHashMap::new(),
+        wanted_ticks: vec![],
+        wanted_events: vec!["player_death".into(), "round_end".into()],
+        parse_ents: true,
+        parse_projectiles: false,
+        parse_grenades: false,
+        only_header: false,
+        only_convars: false,
+        huffman_lookup_table: &huf,
+        order_by_steamid: false,
+        list_props: false,
+        fallback_bytes: None,
+    };
+    let mut parser = Parser::new(inputs, ParsingMode::Normal);
+    let out = parser.parse_demo(&bytes).map_err(|e| e.to_string())?;
+    let suspicious_empty = out.game_events.is_empty() || out.roster.is_empty();
+    if suspicious_empty {
+        return Err("parser returned suspiciously empty participants or events".into());
+    }
+    Ok(ParsedOutput {
+        demo_metadata: format!("header={:?}", out.header),
+        participants: out
+            .roster
+            .iter()
+            .filter_map(|p| p.steamid.map(|id| id.to_string()))
+            .collect(),
+        rounds: out
+            .game_events
+            .iter()
+            .filter(|e| e.name == "round_end")
+            .count() as u64,
+        events: out.game_events.len() as u64,
+        receipts: out
+            .game_events
+            .iter()
+            .enumerate()
+            .map(|(i, e)| format!("{}:{}:{}", i, e.name, e.tick))
+            .collect(),
+        suspicious_empty,
+    })
+}
+
 pub trait ImportStore {
     fn save_attempt(&mut self, attempt: &Attempt) -> Result<(), ErrorCode>;
     fn load_attempt(&self, id: u64) -> Option<Attempt>;
