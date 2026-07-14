@@ -82,4 +82,38 @@ fn doctor_reports_json_without_requiring_capture_for_demo_import() {
             .iter()
             .any(|check| { check["id"] == "capture" && check["status"] == "blocked" })
     );
+    assert_eq!(report["diagnostics"]["ffprobe"]["status"], "missing");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_ffprobe_from_isolated_path_without_desktop_activation() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().expect("temporary Doctor root");
+    let bin = temp.path().join("bin");
+    let cfg = temp.path().join("cfg");
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let ffprobe = bin.join("ffprobe");
+    std::fs::write(&ffprobe, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&ffprobe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_openfragd"))
+        .args(["doctor", "--json", "--cs2-cfg-dir"])
+        .arg(&cfg)
+        .arg("--data-dir")
+        .arg(&data)
+        .env("PATH", &bin)
+        .env("HOME", temp.path())
+        .env("XDG_DATA_HOME", &data)
+        .output()
+        .expect("run isolated Compatibility Doctor");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["diagnostics"]["ffprobe"]["status"], "available");
 }
