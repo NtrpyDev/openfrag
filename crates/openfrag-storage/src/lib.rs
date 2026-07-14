@@ -1,7 +1,7 @@
 //! Local, transactional persistence for openfrag artifacts and analysis runs.
 #![allow(clippy::missing_errors_doc)]
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -168,6 +168,80 @@ pub struct ArtifactInfo {
     pub availability: ArtifactAvailability,
     pub relative_path: Option<String>,
     pub byte_length: i64,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StoredRatingAvailability {
+    Pending,
+    Available {
+        formula_id: String,
+        rating_bp: i64,
+        receipt_id: String,
+    },
+    Unavailable {
+        formula_id: String,
+        reason_code: String,
+        receipt_id: String,
+    },
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MatchSummaryRecord {
+    pub id: String,
+    pub map_name: Option<String>,
+    pub imported_at_ms: i64,
+    pub status: String,
+    pub rating: StoredRatingAvailability,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RatingComponentRecord {
+    pub component_key: String,
+    pub numerator: i64,
+    pub denominator: i64,
+    pub value_bp: i64,
+    pub weight_bp: i64,
+    pub receipt_id: Option<String>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MatchDetailRecord {
+    pub summary: MatchSummaryRecord,
+    pub demo_sha256: String,
+    pub local_steam_id: String,
+    pub game_build: Option<String>,
+    pub canonical_run_id: Option<String>,
+    pub components: Vec<RatingComponentRecord>,
+    pub receipt_ids: Vec<String>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptRecord {
+    pub id: String,
+    pub analysis_run_id: String,
+    pub round_id: Option<String>,
+    pub metric_key: String,
+    pub event_tick: Option<i64>,
+    pub ingestion_ordinal: Option<i64>,
+    pub participant_steam_ids_json: String,
+    pub raw_payload_json: String,
+    pub snapshots_json: String,
+    pub parameters_json: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipSummaryRecord {
+    pub id: String,
+    pub title: Option<String>,
+    pub disposition: String,
+    pub recorded_at_ms: i64,
+    pub created_at_ms: i64,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipDetailRecord {
+    pub summary: ClipSummaryRecord,
+    pub artifact_sha256: String,
+    pub artifact_availability: ArtifactAvailability,
+    pub provenance: String,
+    pub favorite: bool,
+    pub pre_roll_truncated: bool,
+    pub retention_class: String,
+    pub note: Option<String>,
+    pub tags: Vec<String>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryResult {
@@ -1039,6 +1113,178 @@ impl Storage {
             error_code,
         })
     }
+    pub fn import_job_by_id(&self, id: &str) -> Result<ImportJob> {
+        self.import_job(&ImportJobId(id.to_owned()))
+    }
+    pub fn list_matches(&self) -> Result<Vec<MatchSummaryRecord>> {
+        let mut statement = self.connection.prepare("SELECT id,map_name,imported_at_ms,status,canonical_run_id,local_steam_id FROM matches WHERE status<>'deleted' ORDER BY imported_at_ms DESC,id DESC")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut matches = Vec::new();
+        for row in rows {
+            let (id, map_name, imported_at_ms, status, run, local) = row?;
+            let rating = self.rating_availability(run.as_deref(), &local)?;
+            matches.push(MatchSummaryRecord {
+                id,
+                map_name,
+                imported_at_ms,
+                status,
+                rating,
+            });
+        }
+        Ok(matches)
+    }
+    #[allow(clippy::type_complexity)]
+    pub fn match_detail(&self, id: &str) -> Result<MatchDetailRecord> {
+        let row: Option<(String, Option<String>, i64, String, String, String, Option<String>, Option<String>)> = self.connection.query_row("SELECT id,map_name,imported_at_ms,status,demo_sha256,local_steam_id,game_build,canonical_run_id FROM matches WHERE id=? AND status<>'deleted'", [id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?))).optional()?;
+        let (
+            id,
+            map_name,
+            imported_at_ms,
+            status,
+            demo_sha256,
+            local_steam_id,
+            game_build,
+            canonical_run_id,
+        ) = row.ok_or(Error::NotFound("match"))?;
+        let rating = self.rating_availability(canonical_run_id.as_deref(), &local_steam_id)?;
+        let components = if let Some(run) = &canonical_run_id {
+            let mut statement = self.connection.prepare("SELECT c.component_key,c.numerator,c.denominator,c.value_bp,c.weight_bp,c.receipt_id FROM player_rating_components c JOIN player_rating_vectors v ON v.id=c.rating_vector_id WHERE v.analysis_run_id=? AND v.steam_id=? ORDER BY c.component_key")?;
+            statement
+                .query_map(params![run, local_steam_id], |row| {
+                    Ok(RatingComponentRecord {
+                        component_key: row.get(0)?,
+                        numerator: row.get(1)?,
+                        denominator: row.get(2)?,
+                        value_bp: row.get(3)?,
+                        weight_bp: row.get(4)?,
+                        receipt_id: row.get(5)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        let receipt_ids = if let Some(run) = &canonical_run_id {
+            let mut statement = self.connection.prepare("SELECT id FROM receipts WHERE analysis_run_id=? ORDER BY COALESCE(event_tick,-1),COALESCE(ingestion_ordinal,-1),id")?;
+            statement
+                .query_map([run], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<String>, _>>()?
+        } else {
+            Vec::new()
+        };
+        Ok(MatchDetailRecord {
+            summary: MatchSummaryRecord {
+                id,
+                map_name,
+                imported_at_ms,
+                status,
+                rating,
+            },
+            demo_sha256,
+            local_steam_id,
+            game_build,
+            canonical_run_id,
+            components,
+            receipt_ids,
+        })
+    }
+    pub fn receipt_by_id(&self, id: &str) -> Result<ReceiptRecord> {
+        self.connection.query_row("SELECT id,analysis_run_id,round_id,metric_key,event_tick,ingestion_ordinal,participant_steam_ids_json,raw_payload_json,snapshots_json,parameters_json FROM receipts WHERE id=?", [id], |row| Ok(ReceiptRecord { id: row.get(0)?, analysis_run_id: row.get(1)?, round_id: row.get(2)?, metric_key: row.get(3)?, event_tick: row.get(4)?, ingestion_ordinal: row.get(5)?, participant_steam_ids_json: row.get(6)?, raw_payload_json: row.get(7)?, snapshots_json: row.get(8)?, parameters_json: row.get(9)? })).optional()?.ok_or(Error::NotFound("receipt"))
+    }
+    pub fn list_clips(&self) -> Result<Vec<ClipSummaryRecord>> {
+        let mut statement = self.connection.prepare("SELECT id,title,disposition,recorded_at_ms,created_at_ms FROM clips WHERE disposition<>'deleted' ORDER BY recorded_at_ms DESC,created_at_ms DESC,id DESC")?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok(ClipSummaryRecord {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    disposition: row.get(2)?,
+                    recorded_at_ms: row.get(3)?,
+                    created_at_ms: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+    #[allow(clippy::type_complexity)]
+    pub fn clip_detail(&self, id: &str) -> Result<ClipDetailRecord> {
+        let row: Option<(String,Option<String>,String,i64,i64,String,String,i64,i64,String,String,Option<String>)> = self.connection.query_row("SELECT c.id,c.title,c.disposition,c.recorded_at_ms,c.created_at_ms,c.artifact_sha256,c.provenance,c.favorite,c.pre_roll_truncated,c.retention_class,a.availability,a.missing_reason FROM clips c JOIN artifacts a ON a.sha256=c.artifact_sha256 WHERE c.id=? AND c.disposition<>'deleted'", [id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?))).optional()?;
+        let (
+            id,
+            title,
+            disposition,
+            recorded_at_ms,
+            created_at_ms,
+            artifact_sha256,
+            provenance,
+            favorite,
+            pre_roll_truncated,
+            retention_class,
+            availability,
+            reason,
+        ) = row.ok_or(Error::NotFound("clip"))?;
+        let artifact_availability = if availability == "missing"
+            && reason
+                .as_deref()
+                .is_some_and(|value| value.starts_with("quarantined:"))
+        {
+            ArtifactAvailability::Quarantined
+        } else {
+            ArtifactAvailability::parse(&availability)?
+        };
+        Ok(ClipDetailRecord {
+            summary: ClipSummaryRecord {
+                id,
+                title,
+                disposition,
+                recorded_at_ms,
+                created_at_ms,
+            },
+            artifact_sha256,
+            artifact_availability,
+            provenance,
+            favorite: favorite != 0,
+            pre_roll_truncated: pre_roll_truncated != 0,
+            retention_class,
+            note: None,
+            tags: Vec::new(),
+        })
+    }
+
+    fn rating_availability(
+        &self,
+        run: Option<&str>,
+        local: &str,
+    ) -> Result<StoredRatingAvailability> {
+        let Some(run) = run else {
+            return Ok(StoredRatingAvailability::Pending);
+        };
+        let available: Option<(String,i64,String)> = self.connection.query_row("SELECT formula_id,rating_bp,receipt_id FROM player_rating_vectors WHERE analysis_run_id=? AND steam_id=?", params![run,local], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+        if let Some((formula_id, rating_bp, receipt_id)) = available {
+            return Ok(StoredRatingAvailability::Available {
+                formula_id,
+                rating_bp,
+                receipt_id,
+            });
+        }
+        let unavailable: Option<(String,String,String)> = self.connection.query_row("SELECT formula_id,reason_code,receipt_id FROM unavailable_rating_results WHERE analysis_run_id=? AND steam_id=?", params![run,local], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+        Ok(unavailable.map_or(
+            StoredRatingAvailability::Pending,
+            |(formula_id, reason_code, receipt_id)| StoredRatingAvailability::Unavailable {
+                formula_id,
+                reason_code,
+                receipt_id,
+            },
+        ))
+    }
     pub fn update_import_progress(
         &self,
         id: &ImportJobId,
@@ -1261,17 +1507,15 @@ mod tests {
                 "matched",
             )
             .unwrap();
-        assert!(
-            storage
-                .reconcile(
-                    &candidate,
-                    &run,
-                    None,
-                    ReconciliationStatus::Unconfirmed,
-                    "again"
-                )
-                .is_err()
-        );
+        assert!(storage
+            .reconcile(
+                &candidate,
+                &run,
+                None,
+                ReconciliationStatus::Unconfirmed,
+                "again"
+            )
+            .is_err());
     }
     #[test]
     fn import_lifecycle_persists_public_state() {
@@ -1383,6 +1627,93 @@ mod tests {
             .persist_unavailable_rating(&run, "765", "ofr-1.0.0", "missing_tick_rate", &receipt)
             .unwrap();
         storage.complete_analysis(&run).unwrap();
+        let summary = storage.list_matches().unwrap().pop().unwrap();
+        assert!(
+            matches!(summary.rating, StoredRatingAvailability::Unavailable { ref reason_code, .. } if reason_code == "missing_tick_rate")
+        );
+    }
+    #[test]
+    fn dashboard_read_models_return_jobs_matches_receipts_components_and_clips() {
+        let (_dir, mut storage) = store();
+        let demo = storage
+            .commit_artifact(storage.stage_artifact(b"read-demo").unwrap(), "dem", None)
+            .unwrap();
+        let job = storage.enqueue_import(&demo).unwrap();
+        assert_eq!(
+            storage.import_job_by_id(job.as_str()).unwrap().phase,
+            ImportPhase::Queued
+        );
+        storage.upsert_player("765", Some("Local")).unwrap();
+        let match_id = storage
+            .import_match(&demo, "765", Some("de_mirage"))
+            .unwrap();
+        storage
+            .add_match_participant(&match_id, "765", "full")
+            .unwrap();
+        let identity = AnalysisIdentity {
+            parser_commit: "a",
+            parser_build: "b",
+            generated_proto_build: "c",
+            requested_schema_hash: "d",
+            metric_definition_version: "e",
+            formula_id: "ofr-1.0.0",
+            evidence_semantics_epoch: "g",
+        };
+        let run = storage.begin_analysis(&match_id, &identity).unwrap();
+        let receipt = storage
+            .add_receipt(
+                &run,
+                None,
+                "ofr-1.0.0",
+                None,
+                None,
+                "[\"765\"]",
+                "{\"rating_bp\":10220}",
+                "[]",
+                "{}",
+            )
+            .unwrap();
+        let vector = storage
+            .persist_available_rating(&run, "765", "ofr-1.0.0", 10_220, &receipt)
+            .unwrap();
+        storage
+            .persist_rating_component(&vector, "direct_damage", 1, 2, 5_000, 3_000, &receipt)
+            .unwrap();
+        storage.complete_analysis(&run).unwrap();
+        let summary = storage.list_matches().unwrap().pop().unwrap();
+        assert!(matches!(
+            summary.rating,
+            StoredRatingAvailability::Available {
+                rating_bp: 10_220,
+                ..
+            }
+        ));
+        let detail = storage.match_detail(match_id.as_str()).unwrap();
+        assert_eq!(detail.components.len(), 1);
+        assert_eq!(detail.receipt_ids, vec![receipt.as_str().to_owned()]);
+        assert_eq!(
+            storage.receipt_by_id(receipt.as_str()).unwrap().metric_key,
+            "ofr-1.0.0"
+        );
+
+        let media = storage
+            .commit_artifact(storage.stage_artifact(b"media").unwrap(), "mkv", None)
+            .unwrap();
+        let session = storage.create_capture_session("765").unwrap();
+        let attempt = storage.request_save(&session, "read-clip", 1).unwrap();
+        storage.complete_save(&attempt, &media, 1, 2).unwrap();
+        let clip = storage.create_clip(&attempt, "raw_manual").unwrap();
+        storage
+            .set_clip_review(&clip, ClipDisposition::Kept, Some("Ace"), true)
+            .unwrap();
+        assert_eq!(
+            storage.list_clips().unwrap()[0].title.as_deref(),
+            Some("Ace")
+        );
+        let clip_detail = storage.clip_detail(clip.as_str()).unwrap();
+        assert!(clip_detail.favorite);
+        assert_eq!(clip_detail.note, None);
+        assert!(clip_detail.tags.is_empty());
     }
     #[test]
     fn quarantine_moves_unreferenced_artifact_and_records_reasoned_state() {
