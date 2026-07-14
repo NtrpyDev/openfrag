@@ -1,0 +1,6 @@
+captures/
+target/
+*.json
+gamestate_integration_openfrag_prototype.local.cfg
+gamestate_integration_openfrag_prototype.local.cfg.tmp.*
+.local-token
