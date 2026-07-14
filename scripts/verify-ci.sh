@@ -30,4 +30,5 @@ cargo test -p openfrag-import --features demoparser
 cargo test -p openfrag-pipeline --features demoparser
 cargo build -p openfragd --release
 packaging/verify-linux-assets.sh
+scripts/hardware/tests/verify-nvidia-host-self-test.sh
 scripts/e2e/headless-smoke.sh
