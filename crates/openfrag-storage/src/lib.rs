@@ -22,6 +22,8 @@ const CLIP_REVIEW_TIME_MIGRATION: &str = include_str!("../migrations/0008_clip_r
 const IMPORT_DIAGNOSTICS_MIGRATION: &str =
     include_str!("../migrations/0009_import_diagnostics.sql");
 const PARSER_PROGRESS_MIGRATION: &str = include_str!("../migrations/0010_parser_progress.sql");
+const SAVE_ATTEMPT_CLIPS_MIGRATION: &str =
+    include_str!("../migrations/0009_save_attempt_clips.sql");
 
 #[derive(Debug)]
 pub enum Error {
@@ -597,6 +599,7 @@ impl Storage {
         ensure_migration(&self.connection, 8, CLIP_REVIEW_TIME_MIGRATION)?;
         ensure_migration(&self.connection, 9, IMPORT_DIAGNOSTICS_MIGRATION)?;
         ensure_migration(&self.connection, 10, PARSER_PROGRESS_MIGRATION)?;
+        ensure_migration(&self.connection, 11, SAVE_ATTEMPT_CLIPS_MIGRATION)?;
         Ok(())
     }
     pub fn stage_artifact(&self, bytes: &[u8]) -> Result<StagedArtifact> {
@@ -1461,11 +1464,101 @@ impl Storage {
         Ok(())
     }
     pub fn create_clip(&self, attempt: &SaveAttemptId, provenance: &str) -> Result<ClipId> {
-        let row: Option<(String, String)> = self.connection.query_row("SELECT capture_session_id, verified_artifact_sha256 FROM recorder_save_attempts WHERE id=? AND status='saved'", [attempt.as_str()], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        validate_capture_provenance(provenance)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let existing: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT c.id,c.provenance FROM save_attempt_clips l JOIN clips c ON c.id=l.clip_id WHERE l.save_attempt_id=?",
+                [attempt.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((id, existing_provenance)) = existing {
+            return if existing_provenance == provenance {
+                Ok(ClipId(id))
+            } else {
+                Err(Error::Conflict("save attempt clip"))
+            };
+        }
+        let row: Option<(String, String)> = transaction.query_row("SELECT capture_session_id, verified_artifact_sha256 FROM recorder_save_attempts WHERE id=? AND status='saved'", [attempt.as_str()], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         let (session, artifact) = row.ok_or(Error::Invalid("save attempt is not verified"))?;
         let id = ClipId::new();
-        self.connection.execute("INSERT INTO clips(id,artifact_sha256,capture_session_id,disposition,provenance,created_at_ms) VALUES(?,?,?,'saved',?,?)", params![id.as_str(), artifact, session, provenance, now_ms()])?;
+        transaction.execute("INSERT INTO clips(id,artifact_sha256,capture_session_id,disposition,provenance,created_at_ms) VALUES(?,?,?,'saved',?,?)", params![id.as_str(), artifact, session, provenance, now_ms()])?;
+        transaction.execute(
+            "INSERT INTO save_attempt_clips(save_attempt_id,clip_id) VALUES(?,?)",
+            params![attempt.as_str(), id.as_str()],
+        )?;
+        transaction.commit()?;
         Ok(id)
+    }
+    pub fn finalize_captured_clip(
+        &self,
+        attempt: &SaveAttemptId,
+        artifact_sha256: &str,
+        actual_start_ns: i64,
+        actual_end_ns: i64,
+        provenance: &str,
+    ) -> Result<ClipId> {
+        validate_capture_provenance(provenance)?;
+        if actual_start_ns < 0 || actual_end_ns < actual_start_ns {
+            return Err(Error::Invalid("captured clip range"));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        #[allow(clippy::type_complexity)]
+        let existing: Option<(String,String,String,String,Option<String>,Option<i64>,Option<i64>)> = transaction.query_row(
+            "SELECT c.id,c.artifact_sha256,c.provenance,a.status,a.verified_artifact_sha256,a.actual_start_monotonic_ns,a.actual_end_monotonic_ns FROM save_attempt_clips l JOIN clips c ON c.id=l.clip_id JOIN recorder_save_attempts a ON a.id=l.save_attempt_id WHERE l.save_attempt_id=?",
+            [attempt.as_str()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+        ).optional()?;
+        if let Some((clip_id, clip_artifact, clip_provenance, status, verified, start, end)) =
+            existing
+        {
+            return if status == "saved"
+                && clip_artifact == artifact_sha256
+                && clip_provenance == provenance
+                && verified.as_deref() == Some(artifact_sha256)
+                && start == Some(actual_start_ns)
+                && end == Some(actual_end_ns)
+            {
+                Ok(ClipId(clip_id))
+            } else {
+                Err(Error::Conflict("captured clip retry"))
+            };
+        }
+        let artifact_present: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM artifacts WHERE sha256=? AND availability='present')",
+            [artifact_sha256],
+            |row| row.get(0),
+        )?;
+        if !artifact_present {
+            return Err(Error::NotFound("verified artifact"));
+        }
+        let session: Option<String> = transaction
+            .query_row(
+                "SELECT capture_session_id FROM recorder_save_attempts WHERE id=? AND status IN ('requested','acknowledged')",
+                [attempt.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let session = session.ok_or(Error::IllegalTransition("captured clip finalization"))?;
+        let changed = transaction.execute(
+            "UPDATE recorder_save_attempts SET status='saved',acknowledgement_count=acknowledgement_count+1,verified_artifact_sha256=?,actual_start_monotonic_ns=?,actual_end_monotonic_ns=?,error_code=NULL WHERE id=? AND status IN ('requested','acknowledged')",
+            params![artifact_sha256, actual_start_ns, actual_end_ns, attempt.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(Error::IllegalTransition("captured clip finalization"));
+        }
+        let clip = ClipId::new();
+        transaction.execute(
+            "INSERT INTO clips(id,artifact_sha256,capture_session_id,disposition,provenance,created_at_ms) VALUES(?,?,?,'saved',?,?)",
+            params![clip.as_str(), artifact_sha256, session, provenance, now_ms()],
+        )?;
+        transaction.execute(
+            "INSERT INTO save_attempt_clips(save_attempt_id,clip_id) VALUES(?,?)",
+            params![attempt.as_str(), clip.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(clip)
     }
     pub fn import_match(
         &self,
@@ -2167,6 +2260,13 @@ fn positive_i64(value: u64, field: &'static str) -> Result<i64> {
     i64::try_from(value).map_err(|_| Error::Invalid(field))
 }
 
+fn validate_capture_provenance(provenance: &str) -> Result<()> {
+    match provenance {
+        "raw_auto" | "raw_manual" => Ok(()),
+        _ => Err(Error::Invalid("captured clip provenance")),
+    }
+}
+
 fn validate_review_metadata(
     title: Option<&str>,
     note: Option<&str>,
@@ -2392,6 +2492,98 @@ mod tests {
             storage.create_clip(&attempt, "raw_auto"),
             Err(Error::Invalid(_))
         ));
+    }
+    #[test]
+    fn captured_clip_finalization_persists_attempt_and_clip_atomically() {
+        let (_dir, storage) = store();
+        let artifact = storage
+            .commit_artifact(
+                storage.stage_artifact(b"captured media").unwrap(),
+                "mkv",
+                None,
+            )
+            .unwrap();
+        let session = storage.create_capture_session("765").unwrap();
+        let attempt = storage
+            .request_save(&session, "atomic-finalize", 100)
+            .unwrap();
+
+        let clip = storage
+            .finalize_captured_clip(&attempt, &artifact, 90, 110, "raw_auto")
+            .unwrap();
+        assert_eq!(
+            storage
+                .finalize_captured_clip(&attempt, &artifact, 90, 110, "raw_auto")
+                .unwrap(),
+            clip
+        );
+        assert_eq!(
+            storage
+                .connection
+                .query_row(
+                    "SELECT status,acknowledgement_count,verified_artifact_sha256,actual_start_monotonic_ns,actual_end_monotonic_ns FROM recorder_save_attempts WHERE id=?",
+                    [attempt.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?)),
+                )
+                .unwrap(),
+            ("saved".into(), 1, artifact.clone(), 90, 110)
+        );
+        assert_eq!(
+            storage.clip_detail(clip.as_str()).unwrap().artifact_sha256,
+            artifact
+        );
+        assert_eq!(
+            storage
+                .connection
+                .query_row(
+                    "SELECT clip_id FROM save_attempt_clips WHERE save_attempt_id=?",
+                    [attempt.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            clip.as_str()
+        );
+    }
+    #[test]
+    fn captured_clip_finalization_rejects_conflicting_retry_without_mutation() {
+        let (_dir, storage) = store();
+        let artifact = storage
+            .commit_artifact(storage.stage_artifact(b"first media").unwrap(), "mkv", None)
+            .unwrap();
+        let replacement = storage
+            .commit_artifact(
+                storage.stage_artifact(b"replacement media").unwrap(),
+                "mkv",
+                None,
+            )
+            .unwrap();
+        let session = storage.create_capture_session("765").unwrap();
+        let attempt = storage
+            .request_save(&session, "finalize-conflict", 100)
+            .unwrap();
+        let clip = storage
+            .finalize_captured_clip(&attempt, &artifact, 90, 110, "raw_manual")
+            .unwrap();
+
+        assert!(matches!(
+            storage.finalize_captured_clip(&attempt, &replacement, 90, 110, "raw_manual"),
+            Err(Error::Conflict("captured clip retry"))
+        ));
+        assert_eq!(
+            storage
+                .connection
+                .query_row(
+                    "SELECT verified_artifact_sha256,actual_start_monotonic_ns,actual_end_monotonic_ns FROM recorder_save_attempts WHERE id=?",
+                    [attempt.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+                )
+                .unwrap(),
+            (artifact.clone(), 90, 110)
+        );
+        assert_eq!(
+            storage.clip_detail(clip.as_str()).unwrap().artifact_sha256,
+            artifact
+        );
     }
     #[test]
     fn shared_artifact_can_back_multiple_clips() {
