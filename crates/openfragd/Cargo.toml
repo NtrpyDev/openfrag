@@ -12,6 +12,7 @@ clap = { version = "4.5", features = ["derive"] }
 openfrag-capture = { path = "../openfrag-capture" }
 openfrag-gsi = { path = "../openfrag-gsi" }
 openfrag-import = { path = "../openfrag-import", features = ["demoparser"] }
+openfrag-pipeline = { path = "../openfrag-pipeline", features = ["demoparser"] }
 openfrag-setup = { path = "../openfrag-setup" }
 openfrag-storage = { path = "../openfrag-storage" }
 serde = { version = "1", features = ["derive"] }

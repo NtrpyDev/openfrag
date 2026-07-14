@@ -133,8 +133,16 @@ impl ApiState {
 }
 /// Future daemon integration: merge this router into `app()` with the daemon's concrete `LocalApi`.
 pub fn router(service: Arc<dyn LocalApi>) -> Router {
-    Router::new()
-        .route("/api/health", get(health))
+    routes(service, true)
+}
+
+/// Builds dashboard routes while leaving the daemon's richer health route in place.
+pub fn router_without_health(service: Arc<dyn LocalApi>) -> Router {
+    routes(service, false)
+}
+
+fn routes(service: Arc<dyn LocalApi>, include_health: bool) -> Router {
+    let router = Router::new()
         .route("/api/setup", get(setup))
         .route("/api/imports", post(import))
         .route("/api/imports/{id}", get(import_status))
@@ -146,8 +154,13 @@ pub fn router(service: Arc<dyn LocalApi>) -> Router {
         .route("/api/clips/{id}/trim", post(trim_clip))
         .route("/api/clips/{id}/export", post(export_clip))
         .route("/api/manual-flag", post(manual_flag))
-        .route("/api/diagnostics", get(diagnostics))
-        .with_state(ApiState::new(service))
+        .route("/api/diagnostics", get(diagnostics));
+    let router = if include_health {
+        router.route("/api/health", get(health))
+    } else {
+        router
+    };
+    router.with_state(ApiState::new(service))
 }
 
 macro_rules! get_handler {

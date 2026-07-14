@@ -1038,6 +1038,7 @@ dependencies = [
  "openfrag-capture",
  "openfrag-gsi",
  "openfrag-import",
+ "openfrag-pipeline",
  "openfrag-setup",
  "openfrag-storage",
  "serde",

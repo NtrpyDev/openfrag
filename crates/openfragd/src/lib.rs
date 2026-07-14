@@ -2,6 +2,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 pub mod api;
+pub mod service;
 
 use axum::{
     Json, Router,
@@ -61,10 +62,15 @@ struct Health {
     upload_path: bool,
     database: &'static str,
     gsi: &'static str,
+    rating_state: &'static str,
+    rating: Option<String>,
 }
 
 pub fn app(config: &AppConfig) -> Result<Router, AppError> {
     let credentials = read_gsi_credentials(&config.data_directory)?;
+    let local_steam_id = credentials
+        .as_ref()
+        .and_then(|(_, steam_id)| steam_id.parse::<u64>().ok());
     let storage = Storage::open(Layout::at(&config.data_directory))
         .map_err(|error| AppError::Storage(format!("{error:?}")))?;
     let storage = Arc::new(Mutex::new(storage));
@@ -76,6 +82,16 @@ pub fn app(config: &AppConfig) -> Result<Router, AppError> {
         .route("/", get(dashboard))
         .route("/api/health", get(health))
         .with_state(state);
+    let local_api = service::StorageApi::new(
+        storage.clone(),
+        service::PipelinePorts::new(
+            storage.clone(),
+            config.data_directory.clone(),
+            local_steam_id,
+        ),
+        api::SetupResponse { checks: Vec::new() },
+    );
+    router = router.merge(api::router_without_health(Arc::new(local_api)));
     if let Some((token, steam_id)) = credentials {
         let session = storage
             .lock()
@@ -111,6 +127,8 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         } else {
             "setup_required"
         },
+        rating_state: "unavailable",
+        rating: None,
     })
 }
 
