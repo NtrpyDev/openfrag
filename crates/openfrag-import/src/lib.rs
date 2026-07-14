@@ -3,8 +3,8 @@
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{self, Read, Write},
-    path::{Path, PathBuf},
+    io::{Read, Write},
+    path::Path,
     time::{Duration, SystemTime},
 };
 
