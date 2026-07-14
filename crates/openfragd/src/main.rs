@@ -40,6 +40,8 @@ enum Command {
         data_dir: Option<PathBuf>,
         #[arg(long)]
         cs2_cfg_dir: PathBuf,
+        #[arg(long)]
+        steam_id: String,
     },
 }
 
@@ -56,7 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::SetupGsi {
             data_dir,
             cs2_cfg_dir,
-        } => setup_gsi(data_dir, &cs2_cfg_dir),
+            steam_id,
+        } => setup_gsi(data_dir, &cs2_cfg_dir, &steam_id),
     }
 }
 
@@ -97,11 +100,12 @@ fn doctor(
 fn setup_gsi(
     data_dir: Option<PathBuf>,
     cs2_cfg_dir: &Path,
+    steam_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = data_dir.unwrap_or_else(default_data_directory);
     fs::create_dir_all(&data_dir)?;
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    let installation = install_gsi(cs2_cfg_dir, &data_dir, &token)
+    let installation = install_gsi(cs2_cfg_dir, &data_dir, &token, steam_id)
         .map_err(|error| format!("failed to install GSI configuration: {error:?}"))?;
     println!(
         "Game State Integration configured at {}",
