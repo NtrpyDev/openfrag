@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
 const CONTRACT_MIGRATION: &str = include_str!("../migrations/0002_contract.sql");
+const ENFORCEMENT_MIGRATION: &str = include_str!("../migrations/0003_enforcement.sql");
 
 #[derive(Debug)]
 pub enum Error {
@@ -18,6 +19,8 @@ pub enum Error {
     Io(std::io::Error),
     Invalid(&'static str),
     NotFound(&'static str),
+    IllegalTransition(&'static str),
+    Conflict(&'static str),
 }
 
 impl From<rusqlite::Error> for Error {
@@ -59,6 +62,11 @@ typed_id!(MatchId);
 typed_id!(AnalysisRunId);
 typed_id!(RoundId);
 typed_id!(ReconciliationId);
+typed_id!(LiveCandidateId);
+typed_id!(ManualFlagId);
+typed_id!(ReceiptId);
+typed_id!(ExportId);
+typed_id!(ImportJobId);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SaveAttemptStatus {
@@ -83,6 +91,24 @@ pub enum ReconciliationStatus {
     Confirmed,
     Unconfirmed,
     Rejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipDisposition {
+    Saved,
+    InReview,
+    Kept,
+    Deleted,
+}
+impl ClipDisposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Saved => "saved",
+            Self::InReview => "in_review",
+            Self::Kept => "kept",
+            Self::Deleted => "deleted",
+        }
+    }
 }
 impl ReconciliationStatus {
     fn as_str(self) -> &'static str {
@@ -196,15 +222,25 @@ impl Storage {
             if found != checksum {
                 return Err(Error::Invalid("migration checksum mismatch"));
             }
-            return Ok(());
+        } else {
+            apply_migration(&self.connection, 2, CONTRACT_MIGRATION, &checksum)?;
         }
-        let tx = self.connection.unchecked_transaction()?;
-        tx.execute_batch(CONTRACT_MIGRATION)?;
-        tx.execute(
-            "INSERT INTO schema_migrations(version, applied_at_ms, checksum) VALUES(2, ?, ?)",
-            params![now_ms(), checksum],
-        )?;
-        tx.commit()?;
+        let checksum = hex_sha256(ENFORCEMENT_MIGRATION.as_bytes());
+        let exists: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version=3",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(found) = exists {
+            if found != checksum {
+                return Err(Error::Invalid("migration checksum mismatch"));
+            }
+        } else {
+            apply_migration(&self.connection, 3, ENFORCEMENT_MIGRATION, &checksum)?;
+        }
         Ok(())
     }
     pub fn stage_artifact(&self, bytes: &[u8]) -> Result<StagedArtifact> {
@@ -259,6 +295,112 @@ impl Storage {
     pub fn create_capture_session(&self, local_steam_id: &str) -> Result<CaptureSessionId> {
         let id = CaptureSessionId::new();
         self.connection.execute("INSERT INTO capture_sessions(id,local_steam_id,started_at_ms,status) VALUES(?,?,?,'active')", params![id.as_str(), local_steam_id, now_ms()])?;
+        Ok(id)
+    }
+    pub fn record_gsi_snapshot(
+        &self,
+        session: &CaptureSessionId,
+        artifact_sha256: &str,
+        ordinal: i64,
+        received_at_ms: i64,
+        fields_json: &str,
+        listener_version: &str,
+    ) -> Result<()> {
+        let changed = self.connection.execute("INSERT OR IGNORE INTO gsi_snapshots(sha256,capture_session_id,arrival_ordinal,received_at_ms,field_presence_json,byte_length,listener_version,http_status) SELECT ?,?,?,?, ?,byte_length,?,200 FROM artifacts WHERE sha256=? AND availability='present'", params![artifact_sha256,session.as_str(),ordinal,received_at_ms,fields_json,listener_version,artifact_sha256])?;
+        if changed == 0 {
+            return Err(Error::Conflict("snapshot hash, ordinal, or artifact"));
+        }
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_candidate(
+        &self,
+        session: &CaptureSessionId,
+        rule_version: &str,
+        kind: &str,
+        map: Option<&str>,
+        round: Option<i64>,
+        first_ns: i64,
+        last_ns: i64,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Result<LiveCandidateId> {
+        if last_ns < first_ns || end_ns < start_ns {
+            return Err(Error::Invalid("candidate range"));
+        }
+        let id = LiveCandidateId::new();
+        let changed=self.connection.execute("INSERT OR IGNORE INTO live_candidates(id,capture_session_id,rule_version,observed_kind,observed_map,observed_round,first_transition_monotonic_ns,last_transition_monotonic_ns,candidate_start_monotonic_ns,candidate_end_monotonic_ns,status) VALUES(?,?,?,?,?,?,?,?,?,?,'provisional')",params![id.as_str(),session.as_str(),rule_version,kind,map,round,first_ns,last_ns,start_ns,end_ns])?;
+        if changed == 0 {
+            return Err(Error::Conflict("candidate dedupe"));
+        }
+        Ok(id)
+    }
+    pub fn add_candidate_trigger(
+        &self,
+        candidate: &LiveCandidateId,
+        snapshot_sha256: &str,
+        ordinal: i64,
+        kind: &str,
+        monotonic_ns: i64,
+    ) -> Result<()> {
+        let changed=self.connection.execute("INSERT OR IGNORE INTO candidate_trigger_receipts(candidate_id,snapshot_sha256,transition_ordinal,transition_kind,transition_monotonic_ns) VALUES(?,?,?,?,?)",params![candidate.as_str(),snapshot_sha256,ordinal,kind,monotonic_ns])?;
+        if changed == 0 {
+            return Err(Error::Conflict("candidate trigger"));
+        }
+        Ok(())
+    }
+    pub fn join_candidate_save(
+        &self,
+        candidate: &LiveCandidateId,
+        attempt: &SaveAttemptId,
+        desired_start_ns: i64,
+        desired_end_ns: i64,
+    ) -> Result<()> {
+        let changed=self.connection.execute("INSERT OR IGNORE INTO candidate_save_attempts(candidate_id,save_attempt_id,desired_start_monotonic_ns,desired_end_monotonic_ns) VALUES(?,?,?,?)",params![candidate.as_str(),attempt.as_str(),desired_start_ns,desired_end_ns])?;
+        if changed == 0 {
+            return Err(Error::Conflict("candidate save join"));
+        }
+        Ok(())
+    }
+    pub fn create_manual_flag(
+        &self,
+        session: &CaptureSessionId,
+        monotonic_ns: i64,
+    ) -> Result<ManualFlagId> {
+        let id = ManualFlagId::new();
+        self.connection.execute("INSERT INTO manual_flags(id,capture_session_id,flagged_monotonic_ns,created_at_ms) VALUES(?,?,?,?)",params![id.as_str(),session.as_str(),monotonic_ns,now_ms()])?;
+        Ok(id)
+    }
+    pub fn set_clip_review(
+        &self,
+        clip: &ClipId,
+        disposition: ClipDisposition,
+        title: Option<&str>,
+        favorite: bool,
+    ) -> Result<()> {
+        let changed=self.connection.execute("UPDATE clips SET disposition=?, title=?, favorite=? WHERE id=? AND disposition <> 'deleted'",params![disposition.as_str(),title,i64::from(favorite),clip.as_str()])?;
+        if changed == 0 {
+            return Err(Error::IllegalTransition("clip missing or deleted"));
+        }
+        Ok(())
+    }
+    pub fn derive_clip(
+        &self,
+        derived: &ClipId,
+        source: &ClipId,
+        operation: &str,
+        trim: Option<(i64, i64)>,
+    ) -> Result<()> {
+        let (start, end) = trim.map_or((None, None), |(a, b)| (Some(a), Some(b)));
+        let changed=self.connection.execute("INSERT OR IGNORE INTO clip_derivations(derived_clip_id,source_clip_id,operation,trim_start_ms,trim_end_ms,created_at_ms) VALUES(?,?,?,?,?,?)",params![derived.as_str(),source.as_str(),operation,start,end,now_ms()])?;
+        if changed == 0 {
+            return Err(Error::Conflict("clip derivation"));
+        }
+        Ok(())
+    }
+    pub fn enqueue_export(&self, clip: &ClipId, target: &str) -> Result<ExportId> {
+        let id = ExportId::new();
+        self.connection.execute("INSERT INTO clip_exports(id,clip_id,target_path,requested_at_ms,status) VALUES(?,?,?,?, 'queued')",params![id.as_str(),clip.as_str(),target,now_ms()])?;
         Ok(id)
     }
     pub fn request_save(
@@ -372,9 +514,77 @@ impl Storage {
         )?;
         Ok(id)
     }
+    pub fn upsert_player(&self, steam_id: &str, display_name: Option<&str>) -> Result<()> {
+        self.connection.execute("INSERT INTO players(steam_id,display_name,first_seen_at_ms,last_seen_at_ms) VALUES(?,?,?,?) ON CONFLICT(steam_id) DO UPDATE SET display_name=excluded.display_name,last_seen_at_ms=excluded.last_seen_at_ms",params![steam_id,display_name,now_ms(),now_ms()])?;
+        Ok(())
+    }
+    pub fn add_match_participant(
+        &self,
+        match_id: &MatchId,
+        steam_id: &str,
+        participation: &str,
+    ) -> Result<()> {
+        let changed=self.connection.execute("INSERT OR IGNORE INTO match_players(match_id,steam_id,participation_status) VALUES(?,?,?)",params![match_id.as_str(),steam_id,participation])?;
+        if changed == 0 {
+            return Err(Error::Conflict("match participant"));
+        }
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_receipt(
+        &self,
+        run: &AnalysisRunId,
+        round: Option<&RoundId>,
+        metric_key: &str,
+        tick: Option<i64>,
+        ordinal: Option<i64>,
+        participants_json: &str,
+        payload_json: &str,
+        snapshots_json: &str,
+        parameters_json: &str,
+    ) -> Result<ReceiptId> {
+        if tick.is_some() != ordinal.is_some() {
+            return Err(Error::Invalid("tick and ordinal"));
+        }
+        let id = ReceiptId::new();
+        self.connection.execute("INSERT INTO receipts(id,analysis_run_id,round_id,metric_key,event_tick,ingestion_ordinal,participant_steam_ids_json,raw_payload_json,snapshots_json,parameters_json) VALUES(?,?,?,?,?,?,?,?,?,?)",params![id.as_str(),run.as_str(),round.map(RoundId::as_str),metric_key,tick,ordinal,participants_json,payload_json,snapshots_json,parameters_json])?;
+        Ok(id)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_round_metric(
+        &self,
+        run: &AnalysisRunId,
+        round: &RoundId,
+        steam_id: &str,
+        key: &str,
+        numerator: i64,
+        denominator: i64,
+        receipt: Option<&ReceiptId>,
+    ) -> Result<()> {
+        let changed=self.connection.execute("INSERT OR IGNORE INTO round_player_metrics(analysis_run_id,round_id,steam_id,metric_key,numerator,denominator,receipt_id) VALUES(?,?,?,?,?,?,?)",params![run.as_str(),round.as_str(),steam_id,key,numerator,denominator,receipt.map(ReceiptId::as_str)])?;
+        if changed == 0 {
+            return Err(Error::Conflict("round metric"));
+        }
+        Ok(())
+    }
+    pub fn enqueue_import(&self, demo_sha256: &str) -> Result<ImportJobId> {
+        let id = ImportJobId::new();
+        let changed=self.connection.execute("INSERT OR IGNORE INTO import_jobs(id,demo_sha256,status,created_at_ms,updated_at_ms) VALUES(?,?,'queued',?,?)",params![id.as_str(),demo_sha256,now_ms(),now_ms()])?;
+        if changed == 0 {
+            return Err(Error::Conflict("import job"));
+        }
+        Ok(id)
+    }
+    pub fn lease_import(&self, job: &ImportJobId, owner: &str, expires_at_ms: i64) -> Result<()> {
+        let changed=self.connection.execute("UPDATE import_jobs SET status='leased',lease_owner=?,lease_expires_at_ms=?,updated_at_ms=? WHERE id=? AND (status='queued' OR (status='leased' AND lease_expires_at_ms < ?))",params![owner,expires_at_ms,now_ms(),job.as_str(),now_ms()])?;
+        if changed == 0 {
+            return Err(Error::IllegalTransition("import lease"));
+        }
+        Ok(())
+    }
     pub fn reconcile(
         &self,
-        candidate: &str,
+        candidate: &LiveCandidateId,
         run: &AnalysisRunId,
         round: Option<&RoundId>,
         status: ReconciliationStatus,
@@ -397,7 +607,7 @@ impl Storage {
             }
         }
         let id = ReconciliationId::new();
-        self.connection.execute("INSERT INTO candidate_reconciliations(id,candidate_id,analysis_run_id,round_id,status,reason_code,decided_at_ms) VALUES(?,?,?,?,?,?,?)", params![id.as_str(),candidate,run.as_str(),round.map(RoundId::as_str),status.as_str(),reason,now_ms()])?;
+        self.connection.execute("INSERT INTO candidate_reconciliations(id,candidate_id,analysis_run_id,round_id,status,reason_code,decided_at_ms) VALUES(?,?,?,?,?,?,?)", params![id.as_str(),candidate.as_str(),run.as_str(),round.map(RoundId::as_str),status.as_str(),reason,now_ms()])?;
         Ok(id)
     }
 }
@@ -424,6 +634,16 @@ fn now_ms() -> i64 {
 }
 fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+fn apply_migration(connection: &Connection, version: i64, sql: &str, checksum: &str) -> Result<()> {
+    let tx = connection.unchecked_transaction()?;
+    tx.execute_batch(sql)?;
+    tx.execute(
+        "INSERT INTO schema_migrations(version, applied_at_ms, checksum) VALUES(?, ?, ?)",
+        params![version, now_ms(), checksum],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 fn set_private_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
@@ -508,23 +728,27 @@ mod tests {
             evidence_semantics_epoch: "g",
         };
         let run = storage.begin_analysis(&m, &i).unwrap();
-        let round = storage.add_round(&run, 1, 42, Some("T")).unwrap();
+        storage.add_round(&run, 1, 42, Some("T")).unwrap();
+        let session = storage.create_capture_session("765").unwrap();
+        let candidate = storage
+            .create_candidate(&session, "rule", "kill", None, Some(1), 1, 2, 1, 2)
+            .unwrap();
         storage
             .reconcile(
-                "candidate",
+                &candidate,
                 &run,
-                Some(&round),
-                ReconciliationStatus::Confirmed,
+                None,
+                ReconciliationStatus::Unconfirmed,
                 "matched",
             )
             .unwrap();
         assert!(
             storage
                 .reconcile(
-                    "candidate",
+                    &candidate,
                     &run,
-                    Some(&round),
-                    ReconciliationStatus::Confirmed,
+                    None,
+                    ReconciliationStatus::Unconfirmed,
                     "again"
                 )
                 .is_err()
