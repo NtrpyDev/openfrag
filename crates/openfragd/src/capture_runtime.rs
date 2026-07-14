@@ -2,10 +2,12 @@ use openfrag_capture::{
     Clock, Config, Error as SupervisorError, Filesystem, MediaProbe, RecorderInstall, ReplayConfig,
     SaveAcknowledgement, SaveDisposition, SaveProvenance, Supervisor, replay_launch,
 };
-use serde::Deserialize;
-use std::{ffi::OsString, fs, path::Path, path::PathBuf};
+use openfrag_setup::{
+    CaptureConfigError, CaptureRecorder, read_capture_configuration,
+};
+use std::{ffi::OsString, path::Path};
 
-const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const FLATPAK_APP_ID: &str = "com.dec05eba.gpu_screen_recorder";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnavailableReason {
@@ -30,22 +32,6 @@ pub enum RuntimeError {
     Supervisor(SupervisorError),
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DiskConfig {
-    enabled: bool,
-    recorder: RecorderConfig,
-    capture_target: String,
-    output_directory: PathBuf,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum RecorderConfig {
-    Native { program: String },
-    Flatpak { app_id: String },
-}
-
 enum Gate<P, F, C, M> {
     Disabled,
     Unavailable(UnavailableReason),
@@ -65,39 +51,42 @@ where
     M: MediaProbe,
 {
     #[must_use]
-    pub fn from_private_config(
-        config_path: &Path,
+    pub fn from_data_directory(
+        data_directory: &Path,
         process: P,
         filesystem: F,
         clock: C,
         probe: M,
     ) -> Self {
-        let disk = match read_private_config(config_path) {
+        let configuration = match read_capture_configuration(data_directory) {
             Ok(config) => config,
-            Err(reason) => {
+            Err(error) => {
                 return Self {
-                    gate: Gate::Unavailable(reason),
+                    gate: Gate::Unavailable(unavailable_reason(error)),
                 };
             }
         };
-        if !disk.enabled {
+        if !configuration.enabled() {
             return Self {
                 gate: Gate::Disabled,
             };
         }
         let replay = ReplayConfig::sixty_second(
-            OsString::from(disk.capture_target),
-            disk.output_directory.clone(),
+            OsString::from(configuration.capture_target()),
+            configuration.output_directory().to_path_buf(),
         );
-        let install = match disk.recorder {
-            RecorderConfig::Native { program } => RecorderInstall::Native {
-                program: OsString::from(program),
+        let install = match configuration.recorder() {
+            CaptureRecorder::Native(program) => RecorderInstall::Native {
+                program: program.as_os_str().to_owned(),
             },
-            RecorderConfig::Flatpak { app_id } => RecorderInstall::Flatpak {
-                app_id: OsString::from(app_id),
+            CaptureRecorder::Flatpak => RecorderInstall::Flatpak {
+                app_id: OsString::from(FLATPAK_APP_ID),
             },
         };
-        let config = Config::new(replay_launch(install, replay), disk.output_directory);
+        let config = Config::new(
+            replay_launch(install, replay),
+            configuration.output_directory().to_path_buf(),
+        );
         Self {
             gate: Gate::Ready(Supervisor::new(process, filesystem, clock, probe, config)),
         }
@@ -171,62 +160,16 @@ where
     }
 }
 
-fn read_private_config(path: &Path) -> Result<DiskConfig, UnavailableReason> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
+fn unavailable_reason(error: CaptureConfigError) -> UnavailableReason {
+    match error {
+        CaptureConfigError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
             UnavailableReason::Missing
-        } else {
-            UnavailableReason::Unsafe(format!("cannot inspect capture config: {error}"))
         }
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(UnavailableReason::Unsafe(
-            "capture config must be a regular file".into(),
-        ));
+        CaptureConfigError::InvalidValue(_)
+        | CaptureConfigError::InvalidPath(_)
+        | CaptureConfigError::InvalidFormat => UnavailableReason::Invalid(format!("{error:?}")),
+        CaptureConfigError::UnsafePath(_)
+        | CaptureConfigError::UnsafeTarget
+        | CaptureConfigError::Io(_) => UnavailableReason::Unsafe(format!("{error:?}")),
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(UnavailableReason::Unsafe(
-                "capture config must not be accessible by group or other users".into(),
-            ));
-        }
-    }
-    if metadata.len() > MAX_CONFIG_BYTES {
-        return Err(UnavailableReason::Unsafe(
-            "capture config exceeds 64 KiB".into(),
-        ));
-    }
-    let bytes = fs::read(path).map_err(|error| {
-        UnavailableReason::Unsafe(format!("cannot read capture config: {error}"))
-    })?;
-    let config: DiskConfig = serde_json::from_slice(&bytes).map_err(|error| {
-        UnavailableReason::Invalid(format!("capture config JSON is invalid: {error}"))
-    })?;
-    validate_config(&config)?;
-    Ok(config)
-}
-
-fn validate_config(config: &DiskConfig) -> Result<(), UnavailableReason> {
-    if config.capture_target.trim().is_empty() {
-        return Err(UnavailableReason::Invalid(
-            "capture_target must not be empty".into(),
-        ));
-    }
-    if !config.output_directory.is_absolute() {
-        return Err(UnavailableReason::Invalid(
-            "output_directory must be absolute".into(),
-        ));
-    }
-    let identifier = match &config.recorder {
-        RecorderConfig::Native { program } => program,
-        RecorderConfig::Flatpak { app_id } => app_id,
-    };
-    if identifier.trim().is_empty() {
-        return Err(UnavailableReason::Invalid(
-            "recorder identifier must not be empty".into(),
-        ));
-    }
-    Ok(())
 }
