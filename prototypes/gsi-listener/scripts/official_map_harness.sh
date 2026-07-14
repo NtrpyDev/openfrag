@@ -75,6 +75,11 @@ if ss -ltn | awk '$4 ~ /:27100$/ {found=1} END {exit !found}'; then
     printf 'Port 27100 is already in use. Stop the existing listener first.\n' >&2
     exit 1
 fi
+desktop_count="$(qdbus6 org.kde.KWin /VirtualDesktopManager org.freedesktop.DBus.Properties.GetAll org.kde.KWin.VirtualDesktopManager | awk '$1=="count:" {print $2}')"
+if [[ ! "$desktop_count" =~ ^[0-9]+$ || "$desktop_count" -lt "$TARGET_DESKTOP" ]]; then
+    printf 'Virtual desktop %s is not available.\n' "$TARGET_DESKTOP" >&2
+    exit 1
+fi
 
 listener_pid=""
 game_pid=""
@@ -124,7 +129,8 @@ function placeOpenfragCs2(window) {
     const index = $((TARGET_DESKTOP - 1));
     if (workspace.desktops.length > index) window.desktops = [workspace.desktops[index]];
 }
-for (const window of workspace.stackingOrder) placeOpenfragCs2(window);
+const windows = workspace.stackingOrder;
+for (let i = 0; i < windows.length; i++) placeOpenfragCs2(windows[i]);
 workspace.windowAdded.connect(placeOpenfragCs2);
 EOF
 qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$KWIN_PLUGIN" >/dev/null 2>&1 || true
@@ -181,6 +187,8 @@ fi
 
 mkdir -p "$PROTOTYPE_DIR/captures"
 chmod 700 "$PROTOTYPE_DIR/captures"
+touch "$CAPTURE_FILE"
+chmod 600 "$CAPTURE_FILE"
 : >"$TERMINAL_LOG"
 chmod 600 "$TERMINAL_LOG"
 baseline_lines="$(wc -l <"$CAPTURE_FILE" 2>/dev/null || printf '0')"
