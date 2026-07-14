@@ -13,6 +13,10 @@ use std::{
     sync::Arc,
 };
 
+mod storage_adapter;
+
+pub use storage_adapter::StorageEvidenceStore;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TimerId(String);
 
@@ -75,6 +79,7 @@ pub struct CaptureRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveDiagnostic {
     Persistence(String),
+    Unsupported(&'static str),
     Recorder(String),
     Scheduler(String),
     MissingCapture(String),
@@ -85,6 +90,9 @@ impl fmt::Display for LiveDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Persistence(message) => write!(formatter, "live evidence persistence: {message}"),
+            Self::Unsupported(message) => {
+                write!(formatter, "unsupported durable live state: {message}")
+            }
             Self::Recorder(message) => write!(formatter, "replay recorder: {message}"),
             Self::Scheduler(message) => write!(formatter, "live scheduler: {message}"),
             Self::MissingCapture(id) => write!(formatter, "missing live capture: {id}"),

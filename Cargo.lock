@@ -985,6 +985,10 @@ dependencies = [
  "openfrag-capture",
  "openfrag-domain",
  "openfrag-gsi",
+ "openfrag-storage",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

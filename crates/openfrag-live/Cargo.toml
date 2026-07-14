@@ -10,6 +10,12 @@ repository.workspace = true
 openfrag-capture = { path = "../openfrag-capture" }
 openfrag-domain = { path = "../openfrag-domain" }
 openfrag-gsi = { path = "../openfrag-gsi" }
+openfrag-storage = { path = "../openfrag-storage" }
+serde_json = "1"
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3.15"
 
 [lints]
 workspace = true
