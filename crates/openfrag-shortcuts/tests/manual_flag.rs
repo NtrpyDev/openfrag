@@ -180,6 +180,11 @@ async fn reconnects_with_the_restore_token_after_portal_or_session_loss() {
     assert_eq!(service.poll().await, Ok(PollOutcome::Reconnected));
     assert_eq!(portal.opens().len(), 2);
     assert_eq!(portal.opens()[1].0, Some(RestoreToken::new("restore-1")));
+
+    portal.push_signal(PortalSignal::SessionLost);
+    assert_eq!(service.poll().await, Ok(PollOutcome::Reconnected));
+    assert_eq!(portal.opens().len(), 3);
+    assert_eq!(portal.opens()[2].0, Some(RestoreToken::new("restore-1")));
 }
 
 #[tokio::test]

@@ -3,6 +3,8 @@
 use async_trait::async_trait;
 use std::{fmt, sync::Arc};
 
+pub mod linux_portal;
+
 pub const MANUAL_FLAG_ID: &str = "openfrag.manual-flag";
 const MANUAL_FLAG_DESCRIPTION: &str = "Save the preceding play";
 

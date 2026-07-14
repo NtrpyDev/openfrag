@@ -20,12 +20,12 @@ use ashpd::{
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream::BoxStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use tokio::{sync::Mutex, task::JoinHandle};
 
 struct ActiveSession {
     handle: SessionHandle,
-    portal_session: Session<GlobalShortcuts>,
+    portal_session: Arc<Session<GlobalShortcuts>>,
     signals: tokio::sync::mpsc::Receiver<PortalSignal>,
     signal_task: JoinHandle<()>,
 }
@@ -86,10 +86,12 @@ impl PortalBackend for LinuxPortalBackend {
             .receive_deactivated()
             .await
             .map_err(map_open_error)?;
-        let portal_session = portal
-            .create_session(CreateSessionOptions::default())
-            .await
-            .map_err(map_open_error)?;
+        let portal_session = Arc::new(
+            portal
+                .create_session(CreateSessionOptions::default())
+                .await
+                .map_err(map_open_error)?,
+        );
 
         let listed = portal
             .list_shortcuts(&portal_session, ListShortcutsOptions::default())
@@ -130,7 +132,12 @@ impl PortalBackend for LinuxPortalBackend {
             .cloned()
             .unwrap_or_else(|| self.generated_restore_token());
         let (sender, signals) = tokio::sync::mpsc::channel(16);
-        let signal_task = tokio::spawn(forward_signals(activated.boxed(), deactivated.boxed(), sender));
+        let signal_task = tokio::spawn(forward_signals(
+            portal_session.clone(),
+            activated.boxed(),
+            deactivated.boxed(),
+            sender,
+        ));
         *self.active.lock().await = Some(ActiveSession {
             handle: handle.clone(),
             portal_session,
@@ -179,16 +186,25 @@ impl PortalBackend for LinuxPortalBackend {
 }
 
 async fn forward_signals(
+    portal_session: Arc<Session<GlobalShortcuts>>,
     mut activated: BoxStream<'static, Activated>,
     mut deactivated: BoxStream<'static, Deactivated>,
     sender: tokio::sync::mpsc::Sender<PortalSignal>,
 ) {
+    let Ok(mut closed) = portal_session.receive_closed().await else {
+        let _ = sender.send(PortalSignal::PortalLost).await;
+        return;
+    };
     loop {
         let signal = tokio::select! {
             activation = activated.next() => activation
                 .map(|activation| PortalSignal::Activated(activation.shortcut_id().into())),
             deactivation = deactivated.next() => deactivation
                 .map(|deactivation| PortalSignal::Deactivated(deactivation.shortcut_id().into())),
+            session_closed = closed.next() => {
+                let _ = session_closed;
+                Some(PortalSignal::SessionLost)
+            },
         };
         let Some(signal) = signal else {
             let _ = sender.send(PortalSignal::PortalLost).await;
