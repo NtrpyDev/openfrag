@@ -4,6 +4,10 @@ use openfrag_import::{
 };
 use openfrag_pipeline::{
     ImportOutcome, ImportRequest, ImportService, ParserBackend, PipelineError,
+    reconcile::{
+        CandidateOrigin, ReconciliationCandidate, ReconciliationDecision,
+        ReconciliationDisposition, ReconciliationPersistence, UnavailableEvidence,
+    },
 };
 use openfrag_storage::{Layout, Storage};
 use serde_json::json;
@@ -16,6 +20,58 @@ struct FixtureParser(ParsedOutput);
 impl ParserBackend for FixtureParser {
     fn parse(&self, _: &Path) -> Result<ParsedOutput, String> {
         Ok(self.0.clone())
+    }
+}
+
+#[derive(Default)]
+struct MemoryReconciliation(Vec<ReconciliationDecision>);
+
+impl ReconciliationPersistence for MemoryReconciliation {
+    type Error = &'static str;
+
+    fn persist_reconciliation(
+        &mut self,
+        decision: &ReconciliationDecision,
+    ) -> Result<(), Self::Error> {
+        self.0.push(decision.clone());
+        Ok(())
+    }
+}
+
+struct PostAnalysisPersistence {
+    database: std::path::PathBuf,
+    decisions: Vec<ReconciliationDecision>,
+}
+
+impl ReconciliationPersistence for PostAnalysisPersistence {
+    type Error = &'static str;
+
+    fn persist_reconciliation(
+        &mut self,
+        decision: &ReconciliationDecision,
+    ) -> Result<(), Self::Error> {
+        let connection = rusqlite::Connection::open(&self.database).map_err(|_| "open")?;
+        let completed = connection
+            .query_row(
+                "SELECT count(*) FROM analysis_runs WHERE status='succeeded'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| "query")?;
+        if completed == 0 {
+            return Err("reconciliation ran before analysis commit");
+        }
+        self.decisions.push(decision.clone());
+        Ok(())
+    }
+}
+
+fn auto_candidate(id: &str, round: Option<u64>) -> ReconciliationCandidate {
+    ReconciliationCandidate {
+        candidate_id: id.into(),
+        clip_id: format!("clip-{id}"),
+        demo_round_number: round,
+        origin: CandidateOrigin::ProvisionalAutoRound,
     }
 }
 
@@ -228,6 +284,88 @@ fn unavailable_rating_still_commits_a_nonempty_match_and_receipt() {
         .unwrap(),
         1
     );
+}
+
+#[test]
+fn post_analysis_reconciliation_persists_in_deterministic_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("reconcile.dem");
+    fs::write(&source, b"PBDEMS2\0reconcile").unwrap();
+    let mut storage = Storage::open(Layout::at(dir.path().join("store"))).unwrap();
+    let mut persistence = PostAnalysisPersistence {
+        database: dir.path().join("store/openfrag.sqlite3"),
+        decisions: Vec::new(),
+    };
+    let outcome = ImportService::new(&mut storage, FixtureParser(available_output()))
+        .import_and_reconcile(
+            ImportRequest {
+                source: &source,
+                local_steam_id: 76_561_197_964_020_430,
+                worker: "reconcile-worker",
+                lease_expires_at_ms: i64::MAX,
+            },
+            &[auto_candidate("z", Some(1)), auto_candidate("a", Some(1))],
+            &mut persistence,
+        )
+        .unwrap();
+    assert!(matches!(outcome.import, ImportOutcome::Ready { .. }));
+    assert_eq!(
+        outcome
+            .reconciliation
+            .iter()
+            .map(|decision| decision.candidate_id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "z"]
+    );
+    assert_eq!(persistence.decisions, outcome.reconciliation);
+    assert!(persistence.decisions.iter().all(|decision| matches!(
+        decision.disposition,
+        ReconciliationDisposition::RejectOrdinary
+    )));
+    drop(storage);
+    let database = rusqlite::Connection::open(dir.path().join("store/openfrag.sqlite3")).unwrap();
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT count(*) FROM analysis_runs WHERE status='succeeded'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn post_analysis_missing_demo_evidence_persists_conservative_decision() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("missing-evidence.dem");
+    fs::write(&source, b"PBDEMS2\0missing-evidence").unwrap();
+    let mut storage = Storage::open(Layout::at(dir.path().join("store"))).unwrap();
+    let mut persistence = MemoryReconciliation::default();
+    let outcome = ImportService::new(&mut storage, FixtureParser(fixture_output()))
+        .import_and_reconcile(
+            ImportRequest {
+                source: &source,
+                local_steam_id: 76_561_197_964_020_430,
+                worker: "missing-evidence-worker",
+                lease_expires_at_ms: i64::MAX,
+            },
+            &[auto_candidate("unknown", Some(1))],
+            &mut persistence,
+        )
+        .unwrap();
+    assert!(matches!(
+        outcome.import,
+        ImportOutcome::RatingUnavailable { .. }
+    ));
+    assert_eq!(persistence.0, outcome.reconciliation);
+    assert!(matches!(
+        persistence.0[0].disposition,
+        ReconciliationDisposition::EvidenceUnavailable(
+            UnavailableEvidence::RoundMissingOrAmbiguous
+        )
+    ));
 }
 
 #[test]

@@ -5,7 +5,11 @@ pub mod reconcile;
 use openfrag_analysis::{AnalysisReceipt, AnalysisUnavailable, analyze};
 use openfrag_import::{MAX_DEMO_BYTES, ParsedOutput};
 use openfrag_storage::{AnalysisIdentity, ImportJobId, ImportPhase, Layout, Storage};
-use std::{fs, io::Read, path::Path};
+use reconcile::{
+    ReconciliationCandidate, ReconciliationDecision, ReconciliationPersistence,
+    reconcile_demo_candidates,
+};
+use std::{fmt::Debug, fs, io::Read, path::Path};
 
 const DEMO_STAMP: &[u8] = b"PBDEMS2\0";
 
@@ -34,6 +38,41 @@ pub enum PipelineError {
     SourceChanged,
     Parser(String),
     Storage(String),
+    Reconciliation(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciledImportOutcome {
+    pub import: ImportOutcome,
+    pub reconciliation: Vec<ReconciliationDecision>,
+}
+
+trait PostAnalysisHook {
+    fn reconcile(
+        &mut self,
+        parsed: &ParsedOutput,
+        local_steam_id: u64,
+    ) -> Result<Vec<ReconciliationDecision>, PipelineError>;
+}
+
+struct PersistenceHook<'a, P> {
+    candidates: &'a [ReconciliationCandidate],
+    persistence: &'a mut P,
+}
+
+impl<P> PostAnalysisHook for PersistenceHook<'_, P>
+where
+    P: ReconciliationPersistence,
+    P::Error: Debug,
+{
+    fn reconcile(
+        &mut self,
+        parsed: &ParsedOutput,
+        local_steam_id: u64,
+    ) -> Result<Vec<ReconciliationDecision>, PipelineError> {
+        reconcile_demo_candidates(parsed, local_steam_id, self.candidates, self.persistence)
+            .map_err(|error| PipelineError::Reconciliation(format!("{error:?}")))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,6 +108,36 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
     /// # Errors
     /// Returns typed validation, parser, or persistence failures. Failed leased jobs are marked failed.
     pub fn import(&mut self, request: ImportRequest<'_>) -> Result<ImportOutcome, PipelineError> {
+        self.import_inner(request, None)
+            .map(|outcome| outcome.import)
+    }
+
+    /// Runs import and persists Demo-backed reconciliation after durable analysis succeeds.
+    ///
+    /// # Errors
+    /// Returns import failures or the injected reconciliation persistence error.
+    pub fn import_and_reconcile<P>(
+        &mut self,
+        request: ImportRequest<'_>,
+        candidates: &[ReconciliationCandidate],
+        persistence: &mut P,
+    ) -> Result<ReconciledImportOutcome, PipelineError>
+    where
+        P: ReconciliationPersistence,
+        P::Error: Debug,
+    {
+        let mut hook = PersistenceHook {
+            candidates,
+            persistence,
+        };
+        self.import_inner(request, Some(&mut hook))
+    }
+
+    fn import_inner(
+        &mut self,
+        request: ImportRequest<'_>,
+        hook: Option<&mut dyn PostAnalysisHook>,
+    ) -> Result<ReconciledImportOutcome, PipelineError> {
         let metadata = validate_source(request.source, self.storage.layout())?;
         let before_modified = metadata.modified().ok();
         let mut source =
@@ -102,7 +171,7 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
                 now_ms(),
             )
             .map_err(storage_error)?;
-        match self.run_leased(&job, &demo_sha256, request) {
+        match self.run_leased(&job, &demo_sha256, request, hook) {
             Ok(outcome) => Ok(outcome),
             Err(error) => {
                 let _ = self.storage.finish_import(
@@ -124,7 +193,8 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
         job: &ImportJobId,
         demo_sha256: &str,
         request: ImportRequest<'_>,
-    ) -> Result<ImportOutcome, PipelineError> {
+        hook: Option<&mut dyn PostAnalysisHook>,
+    ) -> Result<ReconciledImportOutcome, PipelineError> {
         let artifact = self.storage.artifact(demo_sha256).map_err(storage_error)?;
         let relative = artifact
             .relative_path
@@ -171,6 +241,10 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
                 .completed_analysis_for_identity(match_id, &identity)
                 .map_err(storage_error)?
             {
+                let reconciliation = match hook {
+                    Some(hook) => hook.reconcile(&parsed, request.local_steam_id)?,
+                    None => Vec::new(),
+                };
                 self.storage
                     .finish_import(
                         job,
@@ -181,9 +255,12 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
                         None,
                     )
                     .map_err(storage_error)?;
-                return Ok(ImportOutcome::Deduplicated {
-                    job_id: job.clone(),
-                    demo_sha256: demo_sha256.into(),
+                return Ok(ReconciledImportOutcome {
+                    import: ImportOutcome::Deduplicated {
+                        job_id: job.clone(),
+                        demo_sha256: demo_sha256.into(),
+                    },
+                    reconciliation,
                 });
             }
         }
@@ -231,6 +308,10 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
         self.storage
             .complete_analysis(&run)
             .map_err(storage_error)?;
+        let reconciliation = match hook {
+            Some(hook) => hook.reconcile(&parsed, request.local_steam_id)?,
+            None => Vec::new(),
+        };
         self.storage
             .update_import_progress(job, request.worker, None, None, 10_000, now_ms())
             .map_err(storage_error)?;
@@ -244,7 +325,10 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
                 None,
             )
             .map_err(storage_error)?;
-        Ok(outcome)
+        Ok(ReconciledImportOutcome {
+            import: outcome,
+            reconciliation,
+        })
     }
 
     fn persist_unavailable(
@@ -494,6 +578,7 @@ impl PipelineError {
             Self::SourceChanged => "source_changed",
             Self::Parser(_) => "parser",
             Self::Storage(_) => "storage",
+            Self::Reconciliation(_) => "reconciliation",
         }
     }
 }
