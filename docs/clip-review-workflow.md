@@ -24,7 +24,8 @@ and labels on the existing Clip.
    local text, not inferred claims about skill.
 4. **Keep or delete.** Keep removes the Inbox state. Delete requires a
    confirmation showing the exact original and derivatives. The Clip record
-   and each unshared file are removed only after successful file deletion. If a
+   is marked deleted and each unshared file is removed only after successful
+   file deletion. Preserve only the minimal provenance tombstone. If a
    file is referenced by another Clip, show that dependency and require a
    separate detach confirmation; never delete the shared artifact implicitly.
    The original is not recoverable in v1 after confirmed deletion.
