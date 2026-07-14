@@ -1,4 +1,4 @@
-use csgoproto::{EBaseGameEvents, EBaseUserMessages, ECstrike15UserMessages, NetMessages, SvcMessages, ECsgoGameEvents};
+use csgoproto::{EBaseGameEvents, EBaseUserMessages, ECsgoGameEvents, ECstrike15UserMessages, NetMessages, SvcMessages};
 use parser::JsonValue::{self, *};
 use parser::{GameItems, Translation};
 use std::collections::{BTreeMap, HashMap};

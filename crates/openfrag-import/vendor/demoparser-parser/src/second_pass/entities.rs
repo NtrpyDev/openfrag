@@ -1,5 +1,5 @@
-use crate::first_pass::prop_controller::ITEM_PURCHASE_DEF_IDX;
 use crate::first_pass::prop_controller::is_grenade_or_weapon;
+use crate::first_pass::prop_controller::ITEM_PURCHASE_DEF_IDX;
 use crate::first_pass::read_bits::Bitreader;
 use crate::first_pass::read_bits::DemoParserError;
 use crate::first_pass::sendtables::find_field;
@@ -259,7 +259,16 @@ impl<'a> SecondPassParser<'a> {
             }
             // Custom events
             if !is_baseline {
-                SecondPassParser::listen_for_events(entity, &result, field, field_info, &self.prop_controller, &self.prop_controller.special_ids, is_fullpacket, events_to_emit);
+                SecondPassParser::listen_for_events(
+                    entity,
+                    &result,
+                    field,
+                    field_info,
+                    &self.prop_controller,
+                    &self.prop_controller.special_ids,
+                    is_fullpacket,
+                    events_to_emit,
+                );
             }
             // Debug
             if self.is_debug_mode {

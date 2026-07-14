@@ -129,11 +129,7 @@ impl<'a> SecondPassParser<'a> {
             let coll = PROF_COLLECT_NS.with(|c| c.get());
             let paths = PROF_PATHS_NS.with(|c| c.get());
             let dec = PROF_DECODE_NS.with(|c| c.get());
-            eprintln!(
-                "[prof] parse_packet_ents: {:.3}s | collect_*: {:.3}s",
-                ents as f64 / 1e9,
-                coll as f64 / 1e9
-            );
+            eprintln!("[prof] parse_packet_ents: {:.3}s | collect_*: {:.3}s", ents as f64 / 1e9, coll as f64 / 1e9);
             eprintln!(
                 "[prof]   within ents: parse_paths {:.3}s | decode_entity_update {:.3}s",
                 paths as f64 / 1e9,
@@ -247,11 +243,15 @@ impl<'a> SecondPassParser<'a> {
                     if should_parse_entities {
                         let _pt = prof_on().then(std::time::Instant::now);
                         self.parse_packet_ents(msg_bytes, is_fullpacket)?;
-                        if let Some(t) = _pt { PROF_ENTS_NS.with(|c| c.set(c.get() + t.elapsed().as_nanos() as u64)); }
+                        if let Some(t) = _pt {
+                            PROF_ENTS_NS.with(|c| c.set(c.get() + t.elapsed().as_nanos() as u64));
+                        }
                         if !is_fullpacket {
                             let _ct = prof_on().then(std::time::Instant::now);
                             self.collect_entities();
-                            if let Some(t) = _ct { PROF_COLLECT_NS.with(|c| c.set(c.get() + t.elapsed().as_nanos() as u64)); }
+                            if let Some(t) = _ct {
+                                PROF_COLLECT_NS.with(|c| c.set(c.get() + t.elapsed().as_nanos() as u64));
+                            }
                         }
                     }
                     Ok(())

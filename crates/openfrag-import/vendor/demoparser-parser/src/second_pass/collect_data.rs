@@ -105,10 +105,7 @@ impl<'a> SecondPassParser<'a> {
             } else {
                 for prop_info in &self.prop_controller.prop_infos {
                     let val = self.find_prop_with_collect_cache(prop_info, entity_id, player, &mut velocity_indicies, &mut button_mask);
-                    self.output
-                        .entry(prop_info.id)
-                        .or_insert_with(PropColumn::new)
-                        .push(val);
+                    self.output.entry(prop_info.id).or_insert_with(PropColumn::new).push(val);
                 }
             }
         }
@@ -218,9 +215,7 @@ impl<'a> SecondPassParser<'a> {
     }
     pub fn get_controller_prop(&self, prop_id: &u32, player: &PlayerMetaData) -> Result<Variant, PropCollectionError> {
         match player.controller_entid {
-            Some(entid) => {
-                return self.get_prop_from_ent(prop_id, &entid)
-            },
+            Some(entid) => return self.get_prop_from_ent(prop_id, &entid),
             None => return Err(PropCollectionError::ControllerEntityIdNotSet),
         }
     }
@@ -270,8 +265,14 @@ impl<'a> SecondPassParser<'a> {
 
     pub fn collect_projectiles(&mut self) {
         for projectile_entid in &self.projectiles {
-            let grenade_type = match self.find_grenade_type(projectile_entid) {              
-                Some(t) => {if !t.contains("Projectile") && !self.parse_grenades{continue}else{t}},
+            let grenade_type = match self.find_grenade_type(projectile_entid) {
+                Some(t) => {
+                    if !t.contains("Projectile") && !self.parse_grenades {
+                        continue;
+                    } else {
+                        t
+                    }
+                }
                 None => continue,
             };
             let steamid = match self.find_thrower_steamid(projectile_entid) {
@@ -637,11 +638,7 @@ impl<'a> SecondPassParser<'a> {
         let indicies = self.cached_velocity_indicies(player, indicies_cache)?;
         self.velocity_from_indicies(indicies, axis)
     }
-    fn cached_velocity_indicies<'b>(
-        &self,
-        player: &PlayerMetaData,
-        indicies_cache: &'b mut Option<Vec<usize>>,
-    ) -> Result<&'b [usize], PropCollectionError> {
+    fn cached_velocity_indicies<'b>(&self, player: &PlayerMetaData, indicies_cache: &'b mut Option<Vec<usize>>) -> Result<&'b [usize], PropCollectionError> {
         if indicies_cache.is_none() {
             let steamid = player.steamid.ok_or(PropCollectionError::PlayerNotFound)?;
             *indicies_cache = Some(self.find_wanted_indicies(self.output.get(&STEAMID_ID), steamid));

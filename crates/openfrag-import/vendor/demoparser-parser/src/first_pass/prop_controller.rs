@@ -486,7 +486,7 @@ impl PropController {
         if full_name.starts_with("CCSPlayerPawn") && prop_name.contains("CEconItemAttribute.m_iRawValue32") {
             f.prop_id = GLOVE_PAINT_ID as u32;
         }
-        if full_name == "CCSPlayerPawn.CCSPlayer_WeaponServices.m_iAmmo"{
+        if full_name == "CCSPlayerPawn.CCSPlayer_WeaponServices.m_iAmmo" {
             f.prop_id = GRENADE_AMMO_ID;
         }
         self.id += 1;
