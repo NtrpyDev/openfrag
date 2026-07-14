@@ -149,6 +149,7 @@ pub enum ArtifactAvailability {
     Present,
     Missing,
     Deleted,
+    Quarantined,
 }
 impl ArtifactAvailability {
     fn parse(value: &str) -> Result<Self> {
@@ -443,15 +444,69 @@ impl Storage {
     }
     #[allow(clippy::type_complexity)]
     pub fn artifact(&self, sha256: &str) -> Result<ArtifactInfo> {
-        let row:Option<(String,String,Option<String>,i64)>=self.connection.query_row("SELECT sha256,availability,relative_path,byte_length FROM artifacts WHERE sha256=?",[sha256],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-        let (sha256, availability, relative_path, byte_length) =
+        let row:Option<(String,String,Option<String>,i64,Option<String>)>=self.connection.query_row("SELECT sha256,availability,relative_path,byte_length,missing_reason FROM artifacts WHERE sha256=?",[sha256],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let (sha256, availability, relative_path, byte_length, reason) =
             row.ok_or(Error::NotFound("artifact"))?;
         Ok(ArtifactInfo {
             sha256,
-            availability: ArtifactAvailability::parse(&availability)?,
+            availability: if availability == "missing"
+                && reason
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("quarantined:"))
+            {
+                ArtifactAvailability::Quarantined
+            } else {
+                ArtifactAvailability::parse(&availability)?
+            },
             relative_path,
             byte_length,
         })
+    }
+    pub fn quarantine_artifact(&mut self, sha256: &str, reason: &str) -> Result<PathBuf> {
+        if reason.is_empty() {
+            return Err(Error::Invalid("quarantine reason"));
+        }
+        let artifact = self.artifact(sha256)?;
+        if artifact.availability != ArtifactAvailability::Present {
+            return Err(Error::Invalid("artifact is not present"));
+        }
+        let referenced: bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM clips WHERE artifact_sha256=? UNION ALL SELECT 1 FROM matches WHERE demo_sha256=? UNION ALL SELECT 1 FROM recorder_save_attempts WHERE verified_artifact_sha256=? UNION ALL SELECT 1 FROM gsi_snapshots WHERE sha256=?)", params![sha256, sha256, sha256, sha256], |row| row.get(0))?;
+        if referenced {
+            return Err(Error::Conflict("referenced artifact quarantine"));
+        }
+        let relative = artifact
+            .relative_path
+            .ok_or(Error::Invalid("artifact path"))?;
+        let source = self.layout.root.join(&relative);
+        let metadata = fs::symlink_metadata(&source)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(Error::Invalid("artifact symlink"));
+        }
+        let destination = self
+            .layout
+            .quarantine
+            .join(format!("{sha256}-{}.dem", Uuid::now_v7()));
+        fs::rename(&source, &destination)?;
+        let relative_destination = destination
+            .strip_prefix(&self.layout.root)
+            .map_err(|_| Error::Invalid("quarantine path"))?
+            .to_string_lossy()
+            .into_owned();
+        let result = self.connection.execute("UPDATE artifacts SET availability='missing',relative_path=?,missing_reason=? WHERE sha256=? AND availability='present'", params![relative_destination, format!("quarantined:{reason}"), sha256]);
+        match result {
+            Ok(1) => {
+                sync_parent(&destination)?;
+                Ok(destination)
+            }
+            Ok(_) => {
+                let _ = fs::rename(&destination, &source);
+                Err(Error::Conflict("artifact quarantine"))
+            }
+            Err(error) => {
+                let _ = fs::rename(&destination, &source);
+                Err(Error::Database(error))
+            }
+        }
     }
     pub fn expect_artifact(
         &self,
@@ -1326,6 +1381,66 @@ mod tests {
             .persist_unavailable_rating(&run, "765", "ofr-1.0.0", "missing_tick_rate", &receipt)
             .unwrap();
         storage.complete_analysis(&run).unwrap();
+    }
+    #[test]
+    fn quarantine_moves_unreferenced_artifact_and_records_reasoned_state() {
+        let (_dir, mut storage) = store();
+        let hash = storage
+            .commit_artifact(
+                storage.stage_artifact(b"corrupt-demo").unwrap(),
+                "dem",
+                None,
+            )
+            .unwrap();
+        let destination = storage
+            .quarantine_artifact(&hash, "parser_corrupt")
+            .unwrap();
+        assert!(destination.is_file());
+        assert_eq!(
+            storage.artifact(&hash).unwrap().availability,
+            ArtifactAvailability::Quarantined
+        );
+    }
+    #[test]
+    fn quarantine_rejects_referenced_artifact_without_moving_it() {
+        let (_dir, mut storage) = store();
+        let hash = storage
+            .commit_artifact(
+                storage.stage_artifact(b"referenced-demo").unwrap(),
+                "dem",
+                None,
+            )
+            .unwrap();
+        storage.import_match(&hash, "765", None).unwrap();
+        assert!(matches!(
+            storage.quarantine_artifact(&hash, "bad"),
+            Err(Error::Conflict(_))
+        ));
+        assert_eq!(
+            storage.artifact(&hash).unwrap().availability,
+            ArtifactAvailability::Present
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_rejects_artifact_symlink() {
+        use std::os::unix::fs::symlink;
+        let (dir, mut storage) = store();
+        let hash = storage
+            .commit_artifact(
+                storage.stage_artifact(b"symlink-demo").unwrap(),
+                "dem",
+                None,
+            )
+            .unwrap();
+        let relative = storage.artifact(&hash).unwrap().relative_path.unwrap();
+        let path = storage.layout.root.join(relative);
+        fs::remove_file(&path).unwrap();
+        symlink(dir.path().join("outside"), &path).unwrap();
+        assert!(matches!(
+            storage.quarantine_artifact(&hash, "bad"),
+            Err(Error::Invalid("artifact symlink"))
+        ));
     }
     #[test]
     fn import_lease_has_one_public_owner() {
