@@ -71,7 +71,7 @@ impl ClipDirectories {
     }
 }
 
-struct Dependencies<R, F, T, P, S, C> {
+pub struct ClipMutationDependencies<R, F, T, P, S, C> {
     repository: R,
     file_system: F,
     transcoder: T,
@@ -80,14 +80,7 @@ struct Dependencies<R, F, T, P, S, C> {
     clock: C,
 }
 
-/// `MutationPorts` adapter whose side effects are all injected and locally scoped.
-pub struct ClipMutationPorts<R, F, T, P, S, C> {
-    dependencies: Mutex<Dependencies<R, F, T, P, S, C>>,
-    directories: ClipDirectories,
-    cancellation: CancellationToken,
-}
-
-impl<R, F, T, P, S, C> ClipMutationPorts<R, F, T, P, S, C> {
+impl<R, F, T, P, S, C> ClipMutationDependencies<R, F, T, P, S, C> {
     #[must_use]
     pub fn new(
         repository: R,
@@ -96,18 +89,37 @@ impl<R, F, T, P, S, C> ClipMutationPorts<R, F, T, P, S, C> {
         probe: P,
         trim_selection: S,
         clock: C,
+    ) -> Self {
+        Self {
+            repository,
+            file_system,
+            transcoder,
+            probe,
+            trim_selection,
+            clock,
+        }
+    }
+}
+
+type DependenciesGuard<'a, R, F, T, P, S, C> =
+    std::sync::MutexGuard<'a, ClipMutationDependencies<R, F, T, P, S, C>>;
+
+/// `MutationPorts` adapter whose side effects are all injected and locally scoped.
+pub struct ClipMutationPorts<R, F, T, P, S, C> {
+    dependencies: Mutex<ClipMutationDependencies<R, F, T, P, S, C>>,
+    directories: ClipDirectories,
+    cancellation: CancellationToken,
+}
+
+impl<R, F, T, P, S, C> ClipMutationPorts<R, F, T, P, S, C> {
+    #[must_use]
+    pub fn new(
+        dependencies: ClipMutationDependencies<R, F, T, P, S, C>,
         directories: ClipDirectories,
         cancellation: CancellationToken,
     ) -> Self {
         Self {
-            dependencies: Mutex::new(Dependencies {
-                repository,
-                file_system,
-                transcoder,
-                probe,
-                trim_selection,
-                clock,
-            }),
+            dependencies: Mutex::new(dependencies),
             directories,
             cancellation,
         }
@@ -181,7 +193,7 @@ where
             },
             reviewed_at_ms,
         };
-        let Dependencies {
+        let ClipMutationDependencies {
             repository,
             transcoder,
             probe,
@@ -226,7 +238,7 @@ where
 }
 
 impl<R, F, T, P, S, C> ClipMutationPorts<R, F, T, P, S, C> {
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Dependencies<R, F, T, P, S, C>>, ApiError> {
+    fn lock(&self) -> Result<DependenciesGuard<'_, R, F, T, P, S, C>, ApiError> {
         self.dependencies
             .lock()
             .map_err(|_| ApiError::Unavailable("clip mutation lock is unavailable".into()))
@@ -281,11 +293,11 @@ fn derivative_error(error: DerivativeReviewError) -> ApiError {
     match error {
         DerivativeReviewError::TrimOutsideSource
         | DerivativeReviewError::Model(_)
-        | DerivativeReviewError::Review(ReviewError::TrimOutsideSource)
-        | DerivativeReviewError::Review(ReviewError::DerivativeHasWrongSource)
-        | DerivativeReviewError::Review(ReviewError::InvalidTransition) => {
-            ApiError::Invalid(format!("invalid clip trim: {error:?}"))
-        }
+        | DerivativeReviewError::Review(
+            ReviewError::TrimOutsideSource
+            | ReviewError::DerivativeHasWrongSource
+            | ReviewError::InvalidTransition,
+        ) => ApiError::Invalid(format!("invalid clip trim: {error:?}")),
         other => ApiError::Unavailable(format!("local clip trim failed: {other:?}")),
     }
 }

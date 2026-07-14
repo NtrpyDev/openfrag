@@ -4,7 +4,8 @@ pub use openfragd::{api, service};
 mod clip_ports;
 
 use clip_ports::{
-    ClipClock, ClipDirectories, ClipMutationPorts, ClipPortError, ClipStore, TrimSelection,
+    ClipClock, ClipDirectories, ClipMutationDependencies, ClipMutationPorts, ClipPortError,
+    ClipStore, TrimSelection,
 };
 use openfrag_clips::{
     ArtifactProvenance, CancellationToken, Clip, ClipId, ClipOrigin, ClipRepository,
@@ -173,15 +174,17 @@ fn keep_and_reject_use_evidence_preserving_review_transitions() {
     let clip = provisional(root.path().join("captures/source.mp4"));
     let state = Arc::new(Mutex::new(clip));
     let ports = ClipMutationPorts::new(
-        MemoryRepository(Arc::clone(&state)),
-        MemoryFileSystem::default(),
-        FakeTranscoder {
-            calls: Arc::default(),
-            failure_after_write: false,
-        },
-        FakeProbe,
-        SelectedTrim(TrimRange::new(5_000, 35_000).unwrap()),
-        FixedClock(50_000),
+        ClipMutationDependencies::new(
+            MemoryRepository(Arc::clone(&state)),
+            MemoryFileSystem::default(),
+            FakeTranscoder {
+                calls: Arc::default(),
+                failure_after_write: false,
+            },
+            FakeProbe,
+            SelectedTrim(TrimRange::new(5_000, 35_000).unwrap()),
+            FixedClock(50_000),
+        ),
         directories(root.path()),
         CancellationToken::new(),
     );
@@ -217,15 +220,17 @@ fn trim_passes_a_bounded_direct_request_and_commits_the_derivative() {
     let state = Arc::new(Mutex::new(provisional(source.clone())));
     let calls = Arc::new(Mutex::new(Vec::new()));
     let ports = ClipMutationPorts::new(
-        MemoryRepository(Arc::clone(&state)),
-        MemoryFileSystem::default(),
-        FakeTranscoder {
-            calls: Arc::clone(&calls),
-            failure_after_write: false,
-        },
-        FakeProbe,
-        SelectedTrim(TrimRange::new(5_000, 35_000).unwrap()),
-        FixedClock(60_000),
+        ClipMutationDependencies::new(
+            MemoryRepository(Arc::clone(&state)),
+            MemoryFileSystem::default(),
+            FakeTranscoder {
+                calls: Arc::clone(&calls),
+                failure_after_write: false,
+            },
+            FakeProbe,
+            SelectedTrim(TrimRange::new(5_000, 35_000).unwrap()),
+            FixedClock(60_000),
+        ),
         directories(root.path()),
         CancellationToken::new(),
     );
@@ -261,15 +266,17 @@ fn export_uses_the_deterministic_local_name_and_collision_fallback() {
         failure: None,
     };
     let ports = ClipMutationPorts::new(
-        MemoryRepository(Arc::clone(&state)),
-        file_system,
-        FakeTranscoder {
-            calls: Arc::default(),
-            failure_after_write: false,
-        },
-        FakeProbe,
-        SelectedTrim(TrimRange::new(5_000, 35_000).unwrap()),
-        FixedClock(70_000),
+        ClipMutationDependencies::new(
+            MemoryRepository(Arc::clone(&state)),
+            file_system,
+            FakeTranscoder {
+                calls: Arc::default(),
+                failure_after_write: false,
+            },
+            FakeProbe,
+            SelectedTrim(TrimRange::new(5_000, 35_000).unwrap()),
+            FixedClock(70_000),
+        ),
         directories(root.path()),
         CancellationToken::new(),
     );
@@ -296,15 +303,17 @@ fn failed_trim_removes_staging_output_and_leaves_repository_unchanged() {
     let original = provisional(root.path().join("captures/source.mp4"));
     let state = Arc::new(Mutex::new(original.clone()));
     let ports = ClipMutationPorts::new(
-        MemoryRepository(Arc::clone(&state)),
-        MemoryFileSystem::default(),
-        FakeTranscoder {
-            calls: Arc::default(),
-            failure_after_write: true,
-        },
-        FakeProbe,
-        SelectedTrim(TrimRange::new(5_000, 35_000).unwrap()),
-        FixedClock(80_000),
+        ClipMutationDependencies::new(
+            MemoryRepository(Arc::clone(&state)),
+            MemoryFileSystem::default(),
+            FakeTranscoder {
+                calls: Arc::default(),
+                failure_after_write: true,
+            },
+            FakeProbe,
+            SelectedTrim(TrimRange::new(5_000, 35_000).unwrap()),
+            FixedClock(80_000),
+        ),
         directories(root.path()),
         CancellationToken::new(),
     );
@@ -314,4 +323,8 @@ fn failed_trim_removes_staging_output_and_leaves_repository_unchanged() {
     assert_eq!(*state.lock().unwrap(), original);
     let derivative_directory = root.path().join("derivatives");
     assert_eq!(std::fs::read_dir(derivative_directory).unwrap().count(), 0);
+    assert!(matches!(
+        ClipPortError::Unavailable("offline".into()),
+        ClipPortError::Unavailable(message) if message == "offline"
+    ));
 }
