@@ -8,6 +8,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod derivative;
+
+pub use derivative::{
+    CancellationToken, DerivativeProfile, DerivativeReviewError, DerivativeReviewRequest,
+    DiscordEncodeProfile, FfmpegTranscoder, FfprobeMediaProbe, MAX_CAPTURED_PROCESS_BYTES,
+    MediaInfo, MediaProbe, MediaProbeError, ReviewMetadata, TranscodeError, TranscodeRequest,
+    Transcoder, prepare_derivative_and_review,
+};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModelError {
     EmptyIdentifier,
@@ -139,6 +148,10 @@ impl DerivativeProvenance {
 
     pub fn artifact(&self) -> &ArtifactProvenance {
         &self.artifact
+    }
+
+    pub fn source_artifact_id(&self) -> &str {
+        &self.source_artifact_id
     }
 
     pub const fn trim(&self) -> TrimRange {
