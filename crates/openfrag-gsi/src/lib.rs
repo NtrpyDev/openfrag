@@ -1,7 +1,15 @@
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::time::Instant;
 
 pub const MAX_BODY_BYTES: usize = 128 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct IngestConfig {
+    pub auth_token: String,
+    pub local_steamid: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestError {
@@ -56,12 +64,69 @@ pub struct Receipt {
     pub payload: Payload,
     pub redacted: String,
     pub evidence: Evidence,
+    pub payload_hash: String,
+    pub arrival_ordinal: u64,
+    pub receive_elapsed_ms: u128,
 }
 #[derive(Debug, Default)]
 pub struct IngestState {
     seen: HashSet<String>,
     next: u64,
     pub seed: Option<Receipt>,
+    hashes: HashSet<String>,
+    started: Option<Instant>,
+}
+
+pub fn ingest_configured(
+    state: &mut IngestState,
+    config: &IngestConfig,
+    body: &[u8],
+) -> Result<Option<Receipt>, IngestError> {
+    if body.len() > MAX_BODY_BYTES {
+        return Err(IngestError::TooLarge);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(body);
+    let hash = format!("{:x}", hasher.finalize());
+    let now = Instant::now();
+    let start = *state.started.get_or_insert(now);
+    let payload: Payload = serde_json::from_slice(body).map_err(|_| IngestError::InvalidJson)?;
+    if payload.provider.as_ref().and_then(|p| p.appid) != Some(730) {
+        return Err(IngestError::WrongApp);
+    }
+    if payload.provider.as_ref().and_then(|p| p.steamid.as_deref())
+        != Some(config.local_steamid.as_str())
+    {
+        return Err(IngestError::WrongApp);
+    }
+    if payload.auth.as_ref().and_then(|a| a.token.as_deref()) != Some(config.auth_token.as_str()) {
+        return Err(IngestError::WrongApp);
+    }
+    if !state.hashes.insert(hash.clone()) {
+        return Ok(None);
+    }
+    state.next += 1;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| IngestError::InvalidJson)?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("auth");
+        if let Some(p) = obj.get_mut("provider").and_then(|v| v.as_object_mut()) {
+            p.remove("steamid");
+        }
+    }
+    let receipt = Receipt {
+        sequence: state.next,
+        payload,
+        redacted: value.to_string(),
+        evidence: Evidence::Provisional,
+        payload_hash: hash,
+        arrival_ordinal: state.next,
+        receive_elapsed_ms: start.elapsed().as_millis(),
+    };
+    if state.seed.is_none() {
+        state.seed = Some(receipt.clone());
+    }
+    Ok(Some(receipt))
 }
 
 pub fn ingest(state: &mut IngestState, body: &[u8]) -> Result<Option<Receipt>, IngestError> {
@@ -94,6 +159,9 @@ pub fn ingest(state: &mut IngestState, body: &[u8]) -> Result<Option<Receipt>, I
         payload,
         redacted: value.to_string(),
         evidence: Evidence::Provisional,
+        payload_hash: String::new(),
+        arrival_ordinal: state.next,
+        receive_elapsed_ms: 0,
     };
     if state.seed.is_none() {
         state.seed = Some(receipt.clone());
