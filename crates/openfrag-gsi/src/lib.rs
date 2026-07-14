@@ -55,6 +55,18 @@ pub enum StateOutput {
     SessionReset,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollOutcome {
+    NoChange,
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceDiagnostic {
+    StateUnavailable,
+    SinkFailure,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransitionFact {
     Kill { previous: i64, current: i64 },
@@ -102,6 +114,50 @@ impl GsiService {
             engine: Arc::new(Mutex::new(EngineState::default())),
         }
     }
+
+    /// Polls the deterministic clock and emits a single stale receipt per outage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an explicit diagnostic if state cannot be locked or evidence cannot be emitted.
+    pub fn poll_stale(&self) -> Result<PollOutcome, ServiceDiagnostic> {
+        let now = self.clock.now();
+        let mut guard = self
+            .engine
+            .lock()
+            .map_err(|_| ServiceDiagnostic::StateUnavailable)?;
+        let Some(last_received_at) = guard.last_received_at else {
+            return Ok(PollOutcome::NoChange);
+        };
+        if guard.stale || now.saturating_sub(last_received_at) < stale_after(self.config.heartbeat)
+        {
+            return Ok(PollOutcome::NoChange);
+        }
+        let (Some(payload_hash), Some(presence)) =
+            (guard.last_hash.clone(), guard.last_presence)
+        else {
+            return Ok(PollOutcome::NoChange);
+        };
+        let receipt = EvidenceReceipt {
+            sequence: guard.sequence + 1,
+            received_at: now,
+            payload_hash,
+            presence,
+            output: StateOutput::Stale,
+            facts: Vec::new(),
+        };
+        self.sink
+            .emit(receipt.clone())
+            .map_err(|_| ServiceDiagnostic::SinkFailure)?;
+        guard.sequence = receipt.sequence;
+        guard.stale = true;
+        Ok(PollOutcome::Stale)
+    }
+}
+
+#[must_use]
+pub fn stale_after(heartbeat: Duration) -> Duration {
+    heartbeat.saturating_mul(3).min(Duration::from_secs(90))
 }
 
 #[must_use]
@@ -159,15 +215,22 @@ async fn route_post(
     }
 
     let snapshot = TrustedSnapshot::from(&payload);
-    let (output, facts) = guard.snapshot.as_ref().map_or(
-        (StateOutput::Seeded, Vec::new()),
-        |previous| derive_transition(previous, &snapshot),
-    );
+    let (output, facts) = if guard.snapshot.is_none() {
+        (StateOutput::Seeded, Vec::new())
+    } else if guard.stale {
+        (StateOutput::Recovered, Vec::new())
+    } else {
+        derive_transition(
+            guard.snapshot.as_ref().expect("snapshot checked above"),
+            &snapshot,
+        )
+    };
+    let presence = PresenceBits::from(&payload);
     let receipt = EvidenceReceipt {
         sequence: guard.sequence + 1,
         received_at,
         payload_hash: hash.clone(),
-        presence: PresenceBits::from(&payload),
+        presence,
         output,
         facts,
     };
@@ -176,9 +239,10 @@ async fn route_post(
     }
     guard.sequence = receipt.sequence;
     guard.last_hash = Some(hash);
+    guard.last_presence = Some(presence);
     guard.last_received_at = Some(received_at);
     guard.snapshot = Some(snapshot);
-    let _ = service.config.heartbeat;
+    guard.stale = false;
     (StatusCode::OK, "seeded")
 }
 
@@ -261,7 +325,9 @@ struct EngineState {
     sequence: u64,
     snapshot: Option<TrustedSnapshot>,
     last_hash: Option<String>,
+    last_presence: Option<PresenceBits>,
     last_received_at: Option<Duration>,
+    stale: bool,
 }
 
 #[derive(Debug, Clone)]
