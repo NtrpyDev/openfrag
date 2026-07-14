@@ -1,10 +1,13 @@
 mod live_runtime {
-    use openfrag_capture::{SaveDisposition, SaveProvenance};
+    use openfrag_capture::{SaveAcknowledgement, SaveDisposition, SaveProvenance};
 
     pub trait CaptureRuntimePort: Send {
         fn readiness(&self) -> Result<(), String>;
         fn available_from_ms(&self) -> u64;
         fn request_save(&mut self, provenance: SaveProvenance) -> Result<SaveDisposition, String>;
+        fn poll(&mut self) -> Result<Option<i32>, String>;
+        fn discover_save(&mut self) -> Result<Option<SaveAcknowledgement>, String>;
+        fn shutdown(&mut self) -> Result<(), String>;
     }
 }
 
@@ -203,14 +206,16 @@ fn enabled_runtime_delegates_lifecycle_to_fakes_only() {
             .expect("fake save"),
         SaveDisposition::Signalled
     );
-    let acknowledgement = runtime
-        .discover_save()
+    let acknowledgement = live_runtime::CaptureRuntimePort::discover_save(&mut runtime)
         .expect("discover fake save")
         .expect("acknowledgement");
     assert_eq!(acknowledgement.path, output);
     assert_eq!(acknowledgement.provenance, SaveProvenance::ManualFlag);
-    assert_eq!(runtime.poll(), Ok(None));
-    runtime.shutdown().expect("shutdown fake supervisor");
+    assert_eq!(
+        live_runtime::CaptureRuntimePort::poll(&mut runtime),
+        Ok(None)
+    );
+    live_runtime::CaptureRuntimePort::shutdown(&mut runtime).expect("shutdown fake supervisor");
     assert!(runtime.stderr_tail().expect("stderr tail").is_empty());
 
     let log = log.lock().expect("process log");

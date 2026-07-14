@@ -189,6 +189,18 @@ where
     fn request_save(&mut self, provenance: SaveProvenance) -> Result<SaveDisposition, String> {
         CaptureRuntime::request_save(self, provenance).map_err(|error| format!("{error:?}"))
     }
+
+    fn poll(&mut self) -> Result<Option<i32>, String> {
+        CaptureRuntime::poll(self).map_err(|error| format!("{error:?}"))
+    }
+
+    fn discover_save(&mut self) -> Result<Option<SaveAcknowledgement>, String> {
+        CaptureRuntime::discover_save(self).map_err(|error| format!("{error:?}"))
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        CaptureRuntime::shutdown(self).map_err(|error| format!("{error:?}"))
+    }
 }
 
 fn unavailable_reason(error: CaptureConfigError) -> UnavailableReason {

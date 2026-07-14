@@ -1,4 +1,4 @@
-use openfrag_capture::{SaveDisposition, SaveProvenance};
+use openfrag_capture::{SaveAcknowledgement, SaveDisposition, SaveProvenance};
 use openfrag_gsi::{EventSink, EvidenceReceipt};
 use openfrag_live::{
     Clock, Coordinator, EvidenceStore, IngestOutcome, LiveDiagnostic, Recorder, Scheduler,
@@ -201,6 +201,15 @@ pub trait CaptureRuntimePort: Send {
     fn readiness(&self) -> Result<(), String>;
     fn available_from_ms(&self) -> u64;
     fn request_save(&mut self, provenance: SaveProvenance) -> Result<SaveDisposition, String>;
+    fn poll(&mut self) -> Result<Option<i32>, String> {
+        Ok(None)
+    }
+    fn discover_save(&mut self) -> Result<Option<SaveAcknowledgement>, String> {
+        Ok(None)
+    }
+    fn shutdown(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -259,6 +268,7 @@ enum Gate<E, R, C, S> {
 /// Thread-safe daemon facade for live evidence and replay capture coordination.
 pub struct LiveRuntime<E, R, C, S> {
     gate: Gate<E, R, C, S>,
+    capture: Option<Arc<Mutex<R>>>,
     diagnostics: Mutex<VecDeque<DiagnosticRecord>>,
 }
 
@@ -307,7 +317,7 @@ where
         let available_from_ms = capture.available_from_ms();
         let capture = Arc::new(Mutex::new(capture));
         let recorder = Arc::new(RecorderFacade {
-            capture,
+            capture: capture.clone(),
             available_from_ms,
         });
         let coordinator = Coordinator::new(
@@ -319,6 +329,7 @@ where
         );
         Self {
             gate: Gate::Ready(Box::new(Mutex::new(coordinator))),
+            capture: Some(capture),
             diagnostics: Mutex::new(VecDeque::new()),
         }
     }
@@ -353,6 +364,18 @@ where
         })
     }
 
+    pub fn poll_capture(&self) -> Result<Option<i32>, LiveRuntimeError> {
+        self.with_capture("capture_poll", CaptureRuntimePort::poll)
+    }
+
+    pub fn discover_save(&self) -> Result<Option<SaveAcknowledgement>, LiveRuntimeError> {
+        self.with_capture("save_discovery", CaptureRuntimePort::discover_save)
+    }
+
+    pub fn shutdown_capture(&self) -> Result<(), LiveRuntimeError> {
+        self.with_capture("capture_shutdown", CaptureRuntimePort::shutdown)
+    }
+
     #[must_use]
     pub fn diagnostics(&self) -> Vec<DiagnosticRecord> {
         self.diagnostics
@@ -363,8 +386,32 @@ where
     fn unavailable(reason: UnavailableReason) -> Self {
         Self {
             gate: Gate::Unavailable(reason),
+            capture: None,
             diagnostics: Mutex::new(VecDeque::new()),
         }
+    }
+
+    fn with_capture<T>(
+        &self,
+        operation: &'static str,
+        action: impl FnOnce(&mut R) -> Result<T, String>,
+    ) -> Result<T, LiveRuntimeError> {
+        let capture = self.capture.as_ref().ok_or_else(|| match &self.gate {
+            Gate::Unavailable(reason) => LiveRuntimeError::Unavailable(reason.clone()),
+            Gate::Ready(_) => LiveRuntimeError::State("capture runtime is unavailable".into()),
+        })?;
+        let result = capture
+            .lock()
+            .map_err(|_| LiveRuntimeError::State("capture runtime lock poisoned".into()))
+            .and_then(|mut capture| {
+                action(&mut capture).map_err(|message| {
+                    LiveRuntimeError::Diagnostic(LiveDiagnostic::Recorder(message))
+                })
+            });
+        if let Err(error) = &result {
+            self.record_diagnostic(operation, format!("{error:?}"));
+        }
+        result
     }
 
     fn run<T>(

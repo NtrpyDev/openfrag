@@ -242,6 +242,9 @@ fn event_sink_timer_and_manual_flag_share_one_coordinator() {
         saves.lock().expect("saves").as_slice(),
         &[SaveProvenance::AutoRoundEnd, SaveProvenance::ManualFlag]
     );
+    assert_eq!(runtime.poll_capture(), Ok(None));
+    assert_eq!(runtime.discover_save(), Ok(None));
+    assert_eq!(runtime.shutdown_capture(), Ok(()));
 }
 
 #[test]
