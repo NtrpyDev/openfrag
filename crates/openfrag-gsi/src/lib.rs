@@ -263,7 +263,7 @@ pub fn post_gsi(
     }
 }
 
-pub fn ingest(state: &mut IngestState, body: &[u8]) -> Result<Option<Receipt>, IngestError> {
+fn ingest(state: &mut IngestState, body: &[u8]) -> Result<Option<Receipt>, IngestError> {
     if body.len() > MAX_BODY_BYTES {
         return Err(IngestError::TooLarge);
     }
