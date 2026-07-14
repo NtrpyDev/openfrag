@@ -201,6 +201,7 @@ pub struct Layout {
     pub database: PathBuf,
     pub artifacts: PathBuf,
     pub staging: PathBuf,
+    pub quarantine: PathBuf,
 }
 impl Layout {
     pub fn at(root: impl Into<PathBuf>) -> Self {
@@ -209,6 +210,7 @@ impl Layout {
             database: root.join("openfrag.sqlite3"),
             artifacts: root.join("artifacts/sha256"),
             staging: root.join("staging"),
+            quarantine: root.join("quarantine"),
             root,
         }
     }
@@ -241,8 +243,10 @@ impl Storage {
     pub fn open(layout: Layout) -> Result<Self> {
         fs::create_dir_all(&layout.artifacts)?;
         fs::create_dir_all(&layout.staging)?;
+        fs::create_dir_all(&layout.quarantine)?;
         set_private_permissions(&layout.root)?;
         set_private_permissions(&layout.staging)?;
+        set_private_permissions(&layout.quarantine)?;
         let connection = Connection::open(&layout.database)?;
         set_file_private_permissions(&layout.database)?;
         connection.execute_batch(
@@ -470,10 +474,65 @@ impl Storage {
                 removed += 1;
             }
         }
+        for prefix in fs::read_dir(&self.layout.artifacts)? {
+            let prefix = prefix?;
+            if prefix.file_type()?.is_symlink() {
+                continue;
+            }
+            if !prefix.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(prefix.path())? {
+                let entry = entry?;
+                if entry.file_type()?.is_symlink() {
+                    continue;
+                }
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                let Some((sha, _extension)) = name.split_once('.') else {
+                    self.quarantine_orphan(&entry.path())?;
+                    continue;
+                };
+                if sha.len() != 64 || sha != hex_sha256(&fs::read(entry.path())?) {
+                    self.quarantine_orphan(&entry.path())?;
+                    continue;
+                }
+                let exists: Option<String> = self
+                    .connection
+                    .query_row("SELECT sha256 FROM artifacts WHERE sha256=?", [sha], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                if exists.is_none() {
+                    let relative = entry
+                        .path()
+                        .strip_prefix(&self.layout.root)
+                        .map_err(|_| Error::Invalid("orphan path"))?
+                        .to_string_lossy()
+                        .to_string();
+                    let byte_length = i64::try_from(fs::metadata(entry.path())?.len())
+                        .map_err(|_| Error::Invalid("orphan too large"))?;
+                    self.connection.execute("INSERT INTO artifacts(sha256,relative_path,byte_length,availability,created_at_ms) VALUES(?,?,?,'present',?)",params![sha,relative,byte_length,now_ms()])?;
+                }
+            }
+        }
         Ok(RecoveryResult {
             removed_staging_files: removed,
             marked_missing: missing,
         })
+    }
+    fn quarantine_orphan(&self, path: &Path) -> Result<()> {
+        let target = self.layout.quarantine.join(format!(
+            "{}-{}",
+            Uuid::now_v7(),
+            path.file_name()
+                .ok_or(Error::Invalid("orphan name"))?
+                .to_string_lossy()
+        ));
+        fs::rename(path, target)?;
+        Ok(())
     }
     pub fn delete_clip(&self, clip: &ClipId) -> Result<DeleteResult> {
         let artifact: Option<String> = self
@@ -1180,6 +1239,39 @@ mod tests {
         assert_eq!(
             reopened.artifact(&hash).unwrap().availability,
             ArtifactAvailability::Missing
+        );
+    }
+    #[test]
+    fn reopen_repairs_verified_rename_before_catalog_commit() {
+        let (dir, storage) = store();
+        let staged = storage.stage_artifact(b"crash-window").unwrap();
+        let hash = staged.sha256.clone();
+        let target = storage
+            .layout()
+            .artifacts
+            .join(&hash[..2])
+            .join(format!("{hash}.dem"));
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::rename(staged.path, target).unwrap();
+        drop(storage);
+        let reopened = Storage::open(Layout::at(dir.path())).unwrap();
+        assert_eq!(
+            reopened.artifact(&hash).unwrap().availability,
+            ArtifactAvailability::Present
+        );
+    }
+    #[test]
+    fn reopen_quarantines_unrecognized_orphan_without_cataloging() {
+        let (dir, storage) = store();
+        let path = storage.layout().artifacts.join("aa/orphan.dem");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"untrusted").unwrap();
+        drop(storage);
+        let reopened = Storage::open(Layout::at(dir.path())).unwrap();
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_dir(&reopened.layout().quarantine).unwrap().count(),
+            1
         );
     }
 }
