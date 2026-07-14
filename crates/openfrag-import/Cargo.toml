@@ -8,11 +8,15 @@ sha2 = "0.10"
 
 [features]
 default = []
-demoparser = ["dep:demoparser-parser", "dep:ahash"]
+demoparser = ["dep:demoparser-parser", "dep:ahash", "dep:serde_json"]
 
 [dependencies.demoparser-parser]
 package = "parser"
 path = "vendor/demoparser-parser"
+optional = true
+
+[dependencies.serde_json]
+version = "1"
 optional = true
 
 [dependencies.ahash]

@@ -114,6 +114,7 @@ pub struct ParsedEvent {
     pub tick: i32,
     pub ingestion_ordinal: u64,
     pub fields: BTreeMap<String, String>,
+    pub raw_fields: BTreeMap<String, String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventReceipt {
@@ -121,6 +122,7 @@ pub struct EventReceipt {
     pub event_name: String,
     pub tick: i32,
     pub fields: BTreeMap<String, String>,
+    pub raw_fields: BTreeMap<String, String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedRound {
@@ -136,6 +138,7 @@ pub struct ParsedOutput {
     pub events: Vec<ParsedEvent>,
     pub receipts: Vec<EventReceipt>,
     pub suspicious_empty: bool,
+    pub identity: CalculationIdentity,
 }
 impl ParsedOutput {
     pub fn round_count(&self) -> usize {
@@ -149,7 +152,29 @@ impl ParsedOutput {
 pub const DEMOPARSER_COMMIT: &str = "ba39cc44cd5abfd7f34df2b3c0a7dd3630048311";
 pub const DEMOPARSER_BUILD: &str = "parser-0.1.1/csgoproto-0.1.5";
 pub const QUERY_PLAN_VERSION: &str = "openfrag-v1-events-1";
-pub const QUERY_PLAN: &[&str] = &["player_death", "round_end"];
+pub const QUERY_PLAN: &[&str] = &[
+    "round_freeze_end",
+    "round_end",
+    "player_hurt",
+    "player_death",
+    "player_disconnect",
+    "player_steamid",
+    "team_num",
+    "is_alive",
+    "health",
+    "total_rounds_played",
+    "tick_rate",
+    "weapon",
+    "attacker",
+    "victim",
+    "assister",
+    "assistedflash",
+    "dmg_health",
+    "winner",
+    "warmup_period",
+];
+pub const EVIDENCE_SEMANTICS_EPOCH: &str = "openfrag-evidence-1";
+pub const GENERATED_PROTO_BUILD: &str = "csgoproto-0.1.5";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParserError {
@@ -196,7 +221,7 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
         wanted_other_props: vec!["total_rounds_played".into()],
         wanted_prop_states: AHashMap::new(),
         wanted_ticks: vec![],
-        wanted_events: vec!["player_death".into(), "round_end".into()],
+        wanted_events: QUERY_PLAN.iter().map(|s| (*s).into()).collect(),
         parse_ents: true,
         parse_projectiles: false,
         parse_grenades: false,
@@ -233,11 +258,24 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
             .iter()
             .map(|f| (f.name.clone(), format!("{:?}", f.data)))
             .collect();
+        let raw_fields: BTreeMap<String, String> = event
+            .fields
+            .iter()
+            .filter_map(|f| {
+                f.data.as_ref().map(|v| {
+                    (
+                        f.name.clone(),
+                        serde_json::to_string(v).unwrap_or_else(|_| "null".into()),
+                    )
+                })
+            })
+            .collect();
         let parsed = ParsedEvent {
             name: event.name.clone(),
             tick: event.tick,
             ingestion_ordinal: ordinal as u64,
             fields: fields.clone(),
+            raw_fields: raw_fields.clone(),
         };
         if event.name == "round_end" {
             round_no += 1;
@@ -252,6 +290,7 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
             event_name: event.name.clone(),
             tick: event.tick,
             fields: fields.clone(),
+            raw_fields,
         });
         events.push(parsed);
     }
@@ -273,6 +312,7 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
             reason: "no requested player_death events",
         });
     }
+    let query_hash = format!("{:x}", Sha256::digest(QUERY_PLAN.join("\n").as_bytes()));
     Ok(ParsedOutput {
         metadata: DemoMetadata {
             map: header.get("map_name").cloned(),
@@ -286,6 +326,16 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
         events,
         receipts,
         suspicious_empty,
+        identity: CalculationIdentity {
+            source_sha256: String::new(),
+            parser_commit: DEMOPARSER_COMMIT.into(),
+            parser_build: DEMOPARSER_BUILD.into(),
+            generated_proto_build: GENERATED_PROTO_BUILD.into(),
+            requested_schema_hash: query_hash,
+            metric_definition_version: "openfrag-rating-1".into(),
+            formula_version: "openfrag-rating-1".into(),
+            evidence_semantics_epoch: EVIDENCE_SEMANTICS_EPOCH.into(),
+        },
     })
 }
 
