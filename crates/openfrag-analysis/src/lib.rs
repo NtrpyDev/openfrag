@@ -1,8 +1,8 @@
 //! Deterministic evidence conversion between parsed demos and the rating domain.
 
 use openfrag_domain::{
-    calculate_rating, CalculationIdentity, MatchIrregularities, RatingEvidenceBundle, RatingInput,
-    RatingInputError, RatingMetrics, RatingReceipt, ReceiptEvidenceSet,
+    CalculationIdentity, MatchIrregularities, RatingEvidenceBundle, RatingInput, RatingInputError,
+    RatingMetrics, RatingReceipt, ReceiptEvidenceSet, calculate_rating,
 };
 use openfrag_import::{ParsedEvent, ParsedOutput, PlayerSnapshot};
 

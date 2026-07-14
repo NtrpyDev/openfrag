@@ -1,7 +1,7 @@
 //! Durable application service for local Demo import, parsing, and rating analysis.
 
-use openfrag_analysis::{analyze, AnalysisReceipt, AnalysisUnavailable};
-use openfrag_import::{ParsedOutput, MAX_DEMO_BYTES};
+use openfrag_analysis::{AnalysisReceipt, AnalysisUnavailable, analyze};
+use openfrag_import::{MAX_DEMO_BYTES, ParsedOutput};
 use openfrag_storage::{AnalysisIdentity, ImportJobId, ImportPhase, Layout, Storage};
 use std::{fs, io::Read, path::Path};
 

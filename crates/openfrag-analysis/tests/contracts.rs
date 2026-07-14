@@ -1,4 +1,4 @@
-use openfrag_analysis::{analyze, rate_verified_input, AnalysisUnavailable};
+use openfrag_analysis::{AnalysisUnavailable, analyze, rate_verified_input};
 use openfrag_domain::{
     CalculationIdentity, MatchIrregularities, RatingEvidenceBundle, RatingInput, RatingMetrics,
     RatingStatus, ReceiptEvidenceSet,
@@ -7,7 +7,7 @@ use openfrag_import::{
     CalculationIdentity as ImportIdentity, DemoMetadata, EventReceipt, ParsedEvent, ParsedOutput,
     ParsedRound, Participant, PlayerSnapshot,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 fn evidence() -> RatingEvidenceBundle {

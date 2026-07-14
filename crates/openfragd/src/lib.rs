@@ -1,6 +1,8 @@
 //! Loopback HTTP application for the openfrag daemon and local dashboard.
 #![allow(clippy::missing_errors_doc)]
 
+pub mod api;
+
 use axum::{
     Json, Router,
     extract::State,
@@ -254,8 +256,8 @@ mod tests {
             .expect("dashboard body");
         let html = String::from_utf8(body.to_vec()).expect("UTF-8 dashboard");
         assert!(html.contains("Tonight"));
-        assert!(html.contains("Import local Demo"));
-        assert!(html.contains("No account. No telemetry. No uploads."));
+        assert!(html.contains("Import a local Demo"));
+        assert!(html.contains("Local match evidence and clip review."));
         assert!(!html.contains("https://"));
         assert!(!html.contains("http://"));
     }
