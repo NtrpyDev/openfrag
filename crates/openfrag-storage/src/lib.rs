@@ -477,7 +477,7 @@ impl Storage {
         for prefix in fs::read_dir(&self.layout.artifacts)? {
             let prefix = prefix?;
             if prefix.file_type()?.is_symlink() {
-                continue;
+                return Err(Error::Invalid("artifact tree symlink"));
             }
             if !prefix.file_type()?.is_dir() {
                 continue;
@@ -534,6 +534,28 @@ impl Storage {
                 .to_string_lossy()
         ));
         fs::rename(path, target)?;
+        Ok(())
+    }
+    pub fn integrity_check(&self) -> Result<bool> {
+        Ok(self
+            .connection
+            .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))?
+            == "ok")
+    }
+    #[cfg(test)]
+    pub fn hold_write_lock_for_test(
+        &mut self,
+        ready: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> Result<()> {
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        ready
+            .send(())
+            .map_err(|_| Error::Invalid("test lock receiver"))?;
+        release
+            .recv()
+            .map_err(|_| Error::Invalid("test lock sender"))?;
+        self.connection.execute_batch("COMMIT")?;
         Ok(())
     }
     pub fn delete_clip(&self, clip: &ClipId) -> Result<DeleteResult> {
@@ -1323,5 +1345,43 @@ mod tests {
         drop(second);
         let reopened = Storage::open(Layout::at(dir.path())).unwrap();
         assert!(reopened.create_capture_session("three").is_ok());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn artifact_tree_symlink_is_rejected_without_following_it() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        fs::create_dir_all(&layout.artifacts).unwrap();
+        symlink("/etc", layout.artifacts.join("aa")).unwrap();
+        assert!(matches!(
+            Storage::open(layout),
+            Err(Error::Invalid("artifact tree symlink"))
+        ));
+    }
+    #[test]
+    fn independent_connections_wait_for_real_write_lock_and_reopen_cleanly() {
+        use std::sync::mpsc;
+        use std::thread;
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        let mut locked = Storage::open(layout.clone()).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = thread::spawn(move || locked.hold_write_lock_for_test(ready_tx, release_rx));
+        ready_rx.recv().unwrap();
+        let writer_layout = layout.clone();
+        let writer = thread::spawn(move || {
+            let storage = Storage::open(writer_layout).unwrap();
+            storage.create_capture_session("contender")
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap().unwrap();
+        let id = writer.join().unwrap().unwrap();
+        assert!(!id.as_str().is_empty());
+        let reopened = Storage::open(layout).unwrap();
+        assert!(reopened.integrity_check().unwrap());
+        assert!(reopened.create_capture_session("after").is_ok());
     }
 }
