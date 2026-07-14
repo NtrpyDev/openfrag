@@ -102,4 +102,35 @@ mod tests {
         assert_eq!(health["upload_path"], false);
         assert_eq!(health["database"], "ready");
     }
+
+    #[tokio::test]
+    async fn dashboard_is_embedded_and_has_no_remote_assets() {
+        let directory = tempfile::tempdir().expect("temporary data directory");
+        let response = app(AppConfig::for_test(directory.path()))
+            .await
+            .expect("application starts")
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("dashboard response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/html; charset=utf-8"
+        );
+        let body = to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .expect("dashboard body");
+        let html = String::from_utf8(body.to_vec()).expect("UTF-8 dashboard");
+        assert!(html.contains("Tonight"));
+        assert!(html.contains("Import local Demo"));
+        assert!(html.contains("No account. No telemetry. No uploads."));
+        assert!(!html.contains("https://"));
+        assert!(!html.contains("http://"));
+    }
 }
