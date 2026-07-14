@@ -78,6 +78,23 @@ pub enum ClipDecision {
     Reject,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+pub struct ClipTrimRequest {
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+impl ClipTrimRequest {
+    fn validate(self) -> Result<Self, ApiError> {
+        if self.start_ms >= self.end_ms {
+            return Err(ApiError::Invalid(
+                "trim end must be greater than trim start".into(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportedFile {
     pub filename: String,
@@ -115,7 +132,7 @@ pub trait LocalApi: Send + Sync + 'static {
     fn receipt(&self, id: &str) -> Result<Value, ApiError>;
     fn clips(&self) -> Result<Vec<Clip>, ApiError>;
     fn update_clip(&self, id: &str, update: ClipUpdate) -> Result<Clip, ApiError>;
-    fn trim_clip(&self, id: &str) -> Result<Value, ApiError>;
+    fn trim_clip(&self, id: &str, request: ClipTrimRequest) -> Result<Value, ApiError>;
     fn export_clip(&self, id: &str) -> Result<Value, ApiError>;
     fn manual_flag(&self) -> Result<Value, ApiError>;
     fn diagnostics(&self) -> Result<Value, ApiError>;
@@ -255,10 +272,12 @@ async fn update_clip(
 async fn trim_clip(
     State(state): State<ApiState>,
     Path(id): Path<String>,
+    Json(request): Json<ClipTrimRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let request = request.validate().map_err(|error| error.response())?;
     state
         .service
-        .trim_clip(&id)
+        .trim_clip(&id, request)
         .map(Json)
         .map_err(|error| error.response())
 }
@@ -309,7 +328,7 @@ impl LocalApi for EmptyLocalApi {
     fn update_clip(&self, _: &str, _: ClipUpdate) -> Result<Clip, ApiError> {
         Err(ApiError::NotFound)
     }
-    fn trim_clip(&self, _: &str) -> Result<Value, ApiError> {
+    fn trim_clip(&self, _: &str, _: ClipTrimRequest) -> Result<Value, ApiError> {
         Err(ApiError::NotFound)
     }
     fn export_clip(&self, _: &str) -> Result<Value, ApiError> {

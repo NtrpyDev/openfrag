@@ -36,3 +36,24 @@ async fn empty_local_api_is_honest_about_unavailable_work() {
         .unwrap();
     assert_eq!(flag.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
+
+#[tokio::test]
+async fn trim_route_rejects_an_empty_range_before_clip_lookup() {
+    let response = router(Arc::new(EmptyLocalApi))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/clips/clip-7/trim")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"start_ms":5000,"end_ms":5000}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        to_bytes(response.into_body(), 4096).await.unwrap(),
+        r#"{"message":"trim end must be greater than trim start"}"#
+    );
+}

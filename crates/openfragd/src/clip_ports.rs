@@ -2,7 +2,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 use crate::{
-    api::{ApiError, Clip as ApiClip, ClipDecision, ClipUpdate},
+    api::{ApiError, Clip as ApiClip, ClipDecision, ClipTrimRequest, ClipUpdate},
     service::MutationPorts,
 };
 use openfrag_clips::{
@@ -20,11 +20,6 @@ use std::{
 /// Persistence seam used by the local mutation adapter.
 pub trait ClipStore: ClipRepository {
     fn load(&mut self, clip_id: &str) -> Result<Clip, ClipPortError>;
-}
-
-/// Supplies the user's pending trim selection without coupling the adapter to HTTP input.
-pub trait TrimSelection {
-    fn selected_range(&mut self, clip: &Clip) -> Result<TrimRange, ClipPortError>;
 }
 
 /// Supplies timestamps while keeping review transitions deterministic in tests.
@@ -71,50 +66,41 @@ impl ClipDirectories {
     }
 }
 
-pub struct ClipMutationDependencies<R, F, T, P, S, C> {
+pub struct ClipMutationDependencies<R, F, T, P, C> {
     repository: R,
     file_system: F,
     transcoder: T,
     probe: P,
-    trim_selection: S,
     clock: C,
 }
 
-impl<R, F, T, P, S, C> ClipMutationDependencies<R, F, T, P, S, C> {
+impl<R, F, T, P, C> ClipMutationDependencies<R, F, T, P, C> {
     #[must_use]
-    pub fn new(
-        repository: R,
-        file_system: F,
-        transcoder: T,
-        probe: P,
-        trim_selection: S,
-        clock: C,
-    ) -> Self {
+    pub fn new(repository: R, file_system: F, transcoder: T, probe: P, clock: C) -> Self {
         Self {
             repository,
             file_system,
             transcoder,
             probe,
-            trim_selection,
             clock,
         }
     }
 }
 
-type DependenciesGuard<'a, R, F, T, P, S, C> =
-    std::sync::MutexGuard<'a, ClipMutationDependencies<R, F, T, P, S, C>>;
+type DependenciesGuard<'a, R, F, T, P, C> =
+    std::sync::MutexGuard<'a, ClipMutationDependencies<R, F, T, P, C>>;
 
 /// `MutationPorts` adapter whose side effects are all injected and locally scoped.
-pub struct ClipMutationPorts<R, F, T, P, S, C> {
-    dependencies: Mutex<ClipMutationDependencies<R, F, T, P, S, C>>,
+pub struct ClipMutationPorts<R, F, T, P, C> {
+    dependencies: Mutex<ClipMutationDependencies<R, F, T, P, C>>,
     directories: ClipDirectories,
     cancellation: CancellationToken,
 }
 
-impl<R, F, T, P, S, C> ClipMutationPorts<R, F, T, P, S, C> {
+impl<R, F, T, P, C> ClipMutationPorts<R, F, T, P, C> {
     #[must_use]
     pub fn new(
-        dependencies: ClipMutationDependencies<R, F, T, P, S, C>,
+        dependencies: ClipMutationDependencies<R, F, T, P, C>,
         directories: ClipDirectories,
         cancellation: CancellationToken,
     ) -> Self {
@@ -126,13 +112,12 @@ impl<R, F, T, P, S, C> ClipMutationPorts<R, F, T, P, S, C> {
     }
 }
 
-impl<R, F, T, P, S, C> MutationPorts for ClipMutationPorts<R, F, T, P, S, C>
+impl<R, F, T, P, C> MutationPorts for ClipMutationPorts<R, F, T, P, C>
 where
     R: ClipStore + Send + 'static,
     F: LocalFileSystem + Send + 'static,
     T: Transcoder + Send + 'static,
     P: MediaProbe + Send + 'static,
-    S: TrimSelection + Send + 'static,
     C: ClipClock + Send + 'static,
 {
     fn update_clip(&self, id: &str, update: ClipUpdate) -> Result<ApiClip, ApiError> {
@@ -167,14 +152,12 @@ where
         Ok(api_clip(&updated))
     }
 
-    fn trim(&self, id: &str) -> Result<Value, ApiError> {
+    fn trim(&self, id: &str, request: ClipTrimRequest) -> Result<Value, ApiError> {
         let mut dependencies = self.lock()?;
         let clip = dependencies.repository.load(id).map_err(api_error)?;
         ensure_capture_path(&clip, &self.directories.capture)?;
-        let trim = dependencies
-            .trim_selection
-            .selected_range(&clip)
-            .map_err(api_error)?;
+        let trim = TrimRange::new(request.start_ms, request.end_ms)
+            .map_err(|_| ApiError::Invalid("trim end must be greater than trim start".into()))?;
         if trim.end_ms() > clip.source_capture().duration_ms() {
             return Err(ApiError::Invalid("trim exceeds the source clip".into()));
         }
@@ -237,8 +220,8 @@ where
     }
 }
 
-impl<R, F, T, P, S, C> ClipMutationPorts<R, F, T, P, S, C> {
-    fn lock(&self) -> Result<DependenciesGuard<'_, R, F, T, P, S, C>, ApiError> {
+impl<R, F, T, P, C> ClipMutationPorts<R, F, T, P, C> {
+    fn lock(&self) -> Result<DependenciesGuard<'_, R, F, T, P, C>, ApiError> {
         self.dependencies
             .lock()
             .map_err(|_| ApiError::Unavailable("clip mutation lock is unavailable".into()))

@@ -34,7 +34,7 @@
       <section data-panel="setup" class="hidden"><h1>Setup status</h1><ul id="setup-output" class="panel list" aria-live="polite"><li>Select Setup to load local checks.</li></ul></section>
     </main>
   </div>
-  <dialog id="clip-editor" aria-labelledby="clip-editor-title"><form id="clip-form" method="dialog"><h2 id="clip-editor-title">Review clip</h2><input id="clip-id" type="hidden"><label for="clip-title">Title<input id="clip-title" required></label><label for="clip-note">Note<textarea id="clip-note"></textarea></label><label for="clip-tags">Tags (comma separated)<input id="clip-tags"></label><label for="clip-decision">Review decision<select id="clip-decision"><option value="keep">Keep</option><option value="reject">Reject</option></select></label><div class="row"><button class="button" value="cancel">Cancel</button><button id="clip-save" class="button primary" value="default">Save review</button><button id="clip-trim" class="button" type="button">Trim local clip</button><button id="clip-export" class="button" type="button">Export local file</button></div></form></dialog>
+  <dialog id="clip-editor" aria-labelledby="clip-editor-title"><form id="clip-form" method="dialog"><h2 id="clip-editor-title">Review clip</h2><input id="clip-id" type="hidden"><label for="clip-title">Title<input id="clip-title" required></label><label for="clip-note">Note<textarea id="clip-note"></textarea></label><label for="clip-tags">Tags (comma separated)<input id="clip-tags"></label><label for="clip-decision">Review decision<select id="clip-decision"><option value="keep">Keep</option><option value="reject">Reject</option></select></label><label for="clip-trim-start">Trim start in milliseconds<input id="clip-trim-start" type="number" min="0" step="1" value="0" required></label><label for="clip-trim-end">Trim end in milliseconds<input id="clip-trim-end" type="number" min="1" step="1" required></label><p class="muted">The local service validates the requested range against the source clip duration.</p><div class="row"><button class="button" value="cancel">Cancel</button><button id="clip-save" class="button primary" value="default">Save review</button><button id="clip-trim" class="button" type="button">Trim local clip</button><button id="clip-export" class="button" type="button">Export local file</button></div></form></dialog>
   <script>
     const $ = selector => document.querySelector(selector);
     const announce = message => { $('#announcements').textContent = message; };
@@ -176,6 +176,8 @@
       $('#clip-title').value = clip.title ?? '';
       $('#clip-note').value = clip.note ?? '';
       $('#clip-tags').value = (clip.tags ?? []).join(', ');
+      $('#clip-trim-start').value = '0';
+      $('#clip-trim-end').value = '';
       $('#clip-editor').showModal();
     }
 
@@ -245,7 +247,29 @@
       } catch (error) { unavailable(null, label, error); }
     }
 
-    $('#clip-trim').onclick = () => void clipAction('trim', 'Trim');
+    async function trimClip() {
+      if (!selectedClip) { announce('Select a clip first.'); return; }
+      const start_ms = Number($('#clip-trim-start').value);
+      const end_ms = Number($('#clip-trim-end').value);
+      if (!Number.isSafeInteger(start_ms) || !Number.isSafeInteger(end_ms) || start_ms < 0 || end_ms <= start_ms) {
+        announce('Trim end must be greater than trim start, using whole milliseconds.');
+        return;
+      }
+      const button = $('#clip-trim');
+      button.disabled = true;
+      try {
+        await api(`/api/clips/${encodeURIComponent(selectedClip.id)}/trim`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ start_ms, end_ms })
+        });
+        announce('Trim saved for the local clip.');
+        await loadClips();
+      } catch (error) { unavailable(null, 'Trim', error); }
+      finally { button.disabled = false; }
+    }
+
+    $('#clip-trim').onclick = () => void trimClip();
     $('#clip-export').onclick = () => void clipAction('export', 'Export');
     document.querySelectorAll('[data-view]').forEach(button => { button.onclick = () => show(button.dataset.view); });
     void Promise.all([loadHealth(), loadRecentMatches()]);

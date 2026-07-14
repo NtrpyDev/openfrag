@@ -5,7 +5,7 @@ mod clip_ports;
 
 use clip_ports::{
     ClipClock, ClipDirectories, ClipMutationDependencies, ClipMutationPorts, ClipPortError,
-    ClipStore, TrimSelection,
+    ClipStore,
 };
 use openfrag_clips::{
     ArtifactProvenance, CancellationToken, Clip, ClipId, ClipOrigin, ClipRepository,
@@ -13,7 +13,7 @@ use openfrag_clips::{
     TranscodeError, TranscodeRequest, Transcoder, TrimRange,
 };
 use openfragd::{
-    api::{ClipDecision, ClipUpdate},
+    api::{ClipDecision, ClipTrimRequest, ClipUpdate},
     service::MutationPorts,
 };
 use std::{
@@ -73,14 +73,6 @@ impl LocalFileSystem for MemoryFileSystem {
             return Err(FileOperationError::DestinationExists);
         }
         Ok(321)
-    }
-}
-
-struct SelectedTrim(TrimRange);
-
-impl TrimSelection for SelectedTrim {
-    fn selected_range(&mut self, _: &Clip) -> Result<TrimRange, ClipPortError> {
-        Ok(self.0)
     }
 }
 
@@ -182,7 +174,6 @@ fn keep_and_reject_use_evidence_preserving_review_transitions() {
                 failure_after_write: false,
             },
             FakeProbe,
-            SelectedTrim(TrimRange::new(5_000, 35_000).unwrap()),
             FixedClock(50_000),
         ),
         directories(root.path()),
@@ -228,14 +219,21 @@ fn trim_passes_a_bounded_direct_request_and_commits_the_derivative() {
                 failure_after_write: false,
             },
             FakeProbe,
-            SelectedTrim(TrimRange::new(5_000, 35_000).unwrap()),
             FixedClock(60_000),
         ),
         directories(root.path()),
         CancellationToken::new(),
     );
 
-    let receipt = ports.trim("clip-42").unwrap();
+    let receipt = ports
+        .trim(
+            "clip-42",
+            ClipTrimRequest {
+                start_ms: 5_000,
+                end_ms: 35_000,
+            },
+        )
+        .unwrap();
 
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
@@ -249,6 +247,46 @@ fn trim_passes_a_bounded_direct_request_and_commits_the_derivative() {
         std::fs::read(current.source_capture().path()).unwrap(),
         b"immutable source"
     );
+}
+
+#[test]
+fn trim_rejects_a_range_past_the_source_duration_before_transcoding() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("captures")).unwrap();
+    let state = Arc::new(Mutex::new(provisional(
+        root.path().join("captures/source.mp4"),
+    )));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let ports = ClipMutationPorts::new(
+        ClipMutationDependencies::new(
+            MemoryRepository(Arc::clone(&state)),
+            MemoryFileSystem::default(),
+            FakeTranscoder {
+                calls: Arc::clone(&calls),
+                failure_after_write: false,
+            },
+            FakeProbe,
+            FixedClock(65_000),
+        ),
+        directories(root.path()),
+        CancellationToken::new(),
+    );
+
+    let error = ports
+        .trim(
+            "clip-42",
+            ClipTrimRequest {
+                start_ms: 5_000,
+                end_ms: 42_001,
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        openfragd::api::ApiError::Invalid("trim exceeds the source clip".into())
+    );
+    assert!(calls.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -274,7 +312,6 @@ fn export_uses_the_deterministic_local_name_and_collision_fallback() {
                 failure_after_write: false,
             },
             FakeProbe,
-            SelectedTrim(TrimRange::new(5_000, 35_000).unwrap()),
             FixedClock(70_000),
         ),
         directories(root.path()),
@@ -311,14 +348,23 @@ fn failed_trim_removes_staging_output_and_leaves_repository_unchanged() {
                 failure_after_write: true,
             },
             FakeProbe,
-            SelectedTrim(TrimRange::new(5_000, 35_000).unwrap()),
             FixedClock(80_000),
         ),
         directories(root.path()),
         CancellationToken::new(),
     );
 
-    assert!(ports.trim("clip-42").is_err());
+    assert!(
+        ports
+            .trim(
+                "clip-42",
+                ClipTrimRequest {
+                    start_ms: 5_000,
+                    end_ms: 35_000,
+                },
+            )
+            .is_err()
+    );
 
     assert_eq!(*state.lock().unwrap(), original);
     let derivative_directory = root.path().join("derivatives");
