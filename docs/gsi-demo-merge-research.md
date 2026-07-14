@@ -1,6 +1,6 @@
 # GSI and Demo merge research
 
-Issue: [#22](https://github.com/NtrpyDev/openfrag/issues/22)  
+Issue: [GSI and Demo merge: does live data add reliable analytics facts](https://github.com/NtrpyDev/openfrag/issues/22)
 Decision: **do not merge GSI into canonical v1 analytics facts or Receipts.**
 The Demo remains the sole post-match authority. GSI may retain a separate,
 provisional live-candidate receipt that points to a Demo receipt only after
