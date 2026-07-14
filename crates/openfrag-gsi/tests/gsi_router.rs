@@ -3,7 +3,8 @@ use axum::{
     http::{Request, StatusCode},
 };
 use openfrag_gsi::{
-    Clock, EventSink, EvidenceReceipt, GsiConfig, GsiService, StateOutput, router,
+    Clock, EventSink, EvidenceReceipt, GsiConfig, GsiService, StateOutput, TransitionFact,
+    router,
 };
 use std::sync::{
     Arc, Mutex,
@@ -73,8 +74,20 @@ fn harness() -> (GsiService, Arc<ManualClock>, Arc<RecordingSink>) {
 }
 
 fn payload(token: &str, steam_id: &str) -> String {
+    snapshot(token, steam_id, "de_dust2", 3, 4, 2, 100)
+}
+
+fn snapshot(
+    token: &str,
+    steam_id: &str,
+    map: &str,
+    round: u64,
+    kills: i64,
+    deaths: i64,
+    health: i64,
+) -> String {
     format!(
-        r#"{{"provider":{{"appid":730,"timestamp":1}},"map":{{"name":"de_dust2","mode":"competitive","phase":"live","round":3}},"player":{{"steamid":"{steam_id}","activity":"playing","state":{{"health":100,"armor":50}},"match_stats":{{"kills":4,"deaths":2,"round_kills":1}}}},"auth":{{"token":"{token}"}}}}"#
+        r#"{{"provider":{{"appid":730,"timestamp":1}},"map":{{"name":"{map}","mode":"competitive","phase":"live","round":{round}}},"player":{{"steamid":"{steam_id}","activity":"playing","state":{{"health":{health},"armor":50}},"match_stats":{{"kills":{kills},"deaths":{deaths},"round_kills":1}}}},"auth":{{"token":"{token}"}}}}"#
     )
 }
 
@@ -195,4 +208,76 @@ async fn treats_a_repeated_snapshot_as_idempotent() {
     assert_eq!(first.status(), StatusCode::OK);
     assert_eq!(repeated.status(), StatusCode::OK);
     assert_eq!(sink.receipts().len(), 1);
+}
+
+#[tokio::test]
+async fn derives_a_trusted_kill_fact_from_consecutive_snapshots() {
+    let (service, _clock, sink) = harness();
+    post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
+
+    let response = post(
+        &service,
+        "application/json",
+        snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 5, 2, 100),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipts = sink.receipts();
+    assert_eq!(receipts[1].output, StateOutput::Healthy);
+    assert_eq!(
+        receipts[1].facts,
+        vec![TransitionFact::Kill {
+            previous: 4,
+            current: 5
+        }]
+    );
+}
+
+#[tokio::test]
+async fn derives_a_trusted_death_fact_from_consecutive_snapshots() {
+    let (service, _clock, sink) = harness();
+    post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
+
+    let response = post(
+        &service,
+        "application/json",
+        snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 4, 3, 0),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipts = sink.receipts();
+    assert_eq!(receipts[1].output, StateOutput::Healthy);
+    assert_eq!(
+        receipts[1].facts,
+        vec![TransitionFact::Death {
+            previous: 2,
+            current: 3
+        }]
+    );
+}
+
+#[tokio::test]
+async fn derives_a_trusted_round_end_fact_from_consecutive_snapshots() {
+    let (service, _clock, sink) = harness();
+    post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
+
+    let response = post(
+        &service,
+        "application/json",
+        snapshot(TOKEN, STEAM_ID, "de_dust2", 4, 4, 2, 100),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipts = sink.receipts();
+    assert_eq!(receipts[1].output, StateOutput::Healthy);
+    assert_eq!(
+        receipts[1].facts,
+        vec![TransitionFact::RoundEnd {
+            completed: 3,
+            next: 4
+        }]
+    );
 }
