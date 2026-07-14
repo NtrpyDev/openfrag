@@ -684,4 +684,16 @@ mod tests {
         assert!(legal_transition(&State::AwaitingImport, &State::Validating));
         assert!(!legal_transition(&State::AwaitingImport, &State::Ready));
     }
+
+    #[cfg(feature = "demoparser")]
+    #[test]
+    fn pinned_fixture_adapter_smoke_when_requested() {
+        let Ok(path) = std::env::var("OPENFRAG_DEMOPARSER_FIXTURE") else { return; };
+        let start = std::time::Instant::now();
+        let parsed = parse_with_pinned_demoparser(Path::new(&path)).expect("pinned fixture must parse");
+        assert!(!parsed.suspicious_empty && parsed.participants.len() >= 2 && parsed.rounds > 0 && parsed.events > 0);
+        let ordinals: Vec<usize> = parsed.receipts.iter().enumerate().map(|(i, _)| i).collect();
+        assert!(ordinals.windows(2).all(|w| w[0] < w[1]));
+        eprintln!("fixture={} participants={} rounds={} events={} elapsed_ms={} metadata={}", path, parsed.participants.len(), parsed.rounds, parsed.events, start.elapsed().as_millis(), parsed.demo_metadata);
+    }
 }
