@@ -138,4 +138,60 @@ mod tests {
         assert!(!html.contains("https://"));
         assert!(!html.contains("http://"));
     }
+
+    #[tokio::test]
+    async fn configured_gsi_route_persists_only_sanitized_local_evidence() {
+        let directory = tempfile::tempdir().expect("temporary data directory");
+        std::fs::write(directory.path().join("gsi-token"), "private-test-token\n")
+            .expect("test token");
+        std::fs::write(
+            directory.path().join("local-steam-id"),
+            "76561198000000001\n",
+        )
+        .expect("test Steam ID");
+        let router = app(AppConfig::for_test(directory.path())).expect("application starts");
+        let payload = r#"{"provider":{"appid":730,"timestamp":1},"map":{"name":"de_mirage","mode":"competitive","round":1},"player":{"steamid":"76561198000000001","state":{"health":100},"match_stats":{"kills":0,"deaths":0}},"auth":{"token":"private-test-token"}}"#;
+
+        let response = router
+            .oneshot(
+                Request::post("/gsi/router")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .expect("GSI request"),
+            )
+            .await
+            .expect("GSI response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let artifacts = directory.path().join("artifacts/sha256");
+        let retained = std::fs::read_dir(artifacts)
+            .expect("artifact directory")
+            .filter_map(Result::ok)
+            .filter_map(|prefix| std::fs::read_dir(prefix.path()).ok())
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read(entry.path()).ok())
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(!retained.is_empty());
+        assert!(!String::from_utf8_lossy(&retained).contains("private-test-token"));
+        assert!(!String::from_utf8_lossy(&retained).contains("76561198000000001"));
+    }
+
+    #[tokio::test]
+    async fn unconfigured_gsi_route_is_explicitly_unavailable() {
+        let directory = tempfile::tempdir().expect("temporary data directory");
+        let response = app(AppConfig::for_test(directory.path()))
+            .expect("application starts")
+            .oneshot(
+                Request::post("/gsi/router")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("GSI request"),
+            )
+            .await
+            .expect("GSI response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
