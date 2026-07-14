@@ -228,6 +228,33 @@ pub struct Clip {
     derivative: Option<DerivativeProvenance>,
 }
 
+/// Complete trusted-storage projection of a Clip's private state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableClipSnapshot {
+    pub id: ClipId,
+    pub revision: u64,
+    pub source_capture: ArtifactProvenance,
+    pub capture_session_id: String,
+    pub origin: ClipOrigin,
+    pub review_state: ReviewState,
+    pub title: String,
+    pub note: String,
+    pub tags: BTreeSet<String>,
+    pub favorite: bool,
+    pub derivative: Option<DerivativeProvenance>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClipRehydrationError {
+    EmptyCaptureSession,
+    EmptyOriginEvidence,
+    InconsistentRevision,
+    ProvisionalStateHasReviewData,
+    DerivativeHasWrongSource,
+    DerivativeReusesSourceArtifact,
+    TrimOutsideSource,
+}
+
 impl Clip {
     pub fn provisional(
         id: ClipId,
@@ -252,6 +279,26 @@ impl Clip {
             tags: BTreeSet::new(),
             favorite: false,
             derivative: None,
+        })
+    }
+
+    /// Reconstructs a Clip without replaying transitions after validating durable invariants.
+    pub fn from_durable_snapshot(
+        snapshot: DurableClipSnapshot,
+    ) -> Result<Self, ClipRehydrationError> {
+        validate_durable_snapshot(&snapshot)?;
+        Ok(Self {
+            id: snapshot.id,
+            revision: snapshot.revision,
+            source_capture: snapshot.source_capture,
+            capture_session_id: snapshot.capture_session_id,
+            origin: snapshot.origin,
+            review_state: snapshot.review_state,
+            title: snapshot.title,
+            note: snapshot.note,
+            tags: snapshot.tags,
+            favorite: snapshot.favorite,
+            derivative: snapshot.derivative,
         })
     }
 
@@ -298,6 +345,67 @@ impl Clip {
     pub fn derivative(&self) -> Option<&DerivativeProvenance> {
         self.derivative.as_ref()
     }
+}
+
+fn validate_durable_snapshot(snapshot: &DurableClipSnapshot) -> Result<(), ClipRehydrationError> {
+    if snapshot.capture_session_id.is_empty() {
+        return Err(ClipRehydrationError::EmptyCaptureSession);
+    }
+    let evidence_valid = match &snapshot.origin {
+        ClipOrigin::AutoHighlight {
+            trigger_receipts,
+            evidence_receipts,
+        } => {
+            !trigger_receipts.is_empty()
+                && !evidence_receipts.is_empty()
+                && trigger_receipts.iter().all(|receipt| !receipt.is_empty())
+                && evidence_receipts.iter().all(|receipt| !receipt.is_empty())
+        }
+        ClipOrigin::ManualFlag {
+            flag_receipt_id,
+            overlapping_auto_receipts,
+            ..
+        } => {
+            !flag_receipt_id.is_empty()
+                && overlapping_auto_receipts
+                    .iter()
+                    .all(|receipt| !receipt.is_empty())
+        }
+    };
+    if !evidence_valid {
+        return Err(ClipRehydrationError::EmptyOriginEvidence);
+    }
+    match snapshot.review_state {
+        ReviewState::Provisional => {
+            if snapshot.revision != 0 {
+                return Err(ClipRehydrationError::InconsistentRevision);
+            }
+            if !snapshot.note.is_empty()
+                || !snapshot.tags.is_empty()
+                || snapshot.favorite
+                || snapshot.derivative.is_some()
+            {
+                return Err(ClipRehydrationError::ProvisionalStateHasReviewData);
+            }
+        }
+        ReviewState::Reviewed { .. } | ReviewState::Rejected { .. } => {
+            if snapshot.revision == 0 {
+                return Err(ClipRehydrationError::InconsistentRevision);
+            }
+        }
+    }
+    if let Some(derivative) = &snapshot.derivative {
+        if derivative.source_artifact_id != snapshot.source_capture.artifact_id {
+            return Err(ClipRehydrationError::DerivativeHasWrongSource);
+        }
+        if derivative.artifact.artifact_id == snapshot.source_capture.artifact_id {
+            return Err(ClipRehydrationError::DerivativeReusesSourceArtifact);
+        }
+        if derivative.trim.end_ms > snapshot.source_capture.duration_ms {
+            return Err(ClipRehydrationError::TrimOutsideSource);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
