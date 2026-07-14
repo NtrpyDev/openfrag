@@ -3,8 +3,8 @@ use axum::{
     http::{Request, StatusCode},
 };
 use openfrag_gsi::{
-    Clock, EventSink, EvidenceReceipt, GsiConfig, GsiService, StateOutput, TransitionFact,
-    router,
+    Clock, EventSink, EvidenceReceipt, GsiConfig, GsiService, PollOutcome, StateOutput,
+    TransitionFact, router,
 };
 use std::sync::{
     Arc, Mutex,
@@ -43,6 +43,10 @@ struct RecordingSink {
 impl RecordingSink {
     fn receipts(&self) -> Vec<EvidenceReceipt> {
         self.receipts.lock().expect("receipts lock").clone()
+    }
+
+    fn fail_next(&self) {
+        self.failures_remaining.store(1, Ordering::SeqCst);
     }
 }
 
@@ -278,6 +282,79 @@ async fn derives_a_trusted_round_end_fact_from_consecutive_snapshots() {
         vec![TransitionFact::RoundEnd {
             completed: 3,
             next: 4
+        }]
+    );
+}
+
+#[tokio::test]
+async fn stale_polling_emits_once_and_the_next_snapshot_recovers() {
+        let (service, clock, sink) = harness();
+        post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
+
+        clock.advance(Duration::from_secs(29));
+        assert_eq!(service.poll_stale(), Ok(PollOutcome::NoChange));
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(service.poll_stale(), Ok(PollOutcome::Stale));
+        assert_eq!(service.poll_stale(), Ok(PollOutcome::NoChange));
+        assert_eq!(sink.receipts()[1].output, StateOutput::Stale);
+
+        clock.advance(Duration::from_secs(1));
+        let response = post(
+            &service,
+            "application/json",
+            snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 5, 2, 80),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let receipts = sink.receipts();
+        assert_eq!(receipts[2].output, StateOutput::Recovered);
+        assert!(receipts[2].facts.is_empty());
+}
+
+#[tokio::test]
+async fn reports_a_session_reset_without_cross_session_transition_facts() {
+    let (service, _clock, sink) = harness();
+    post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
+
+    let response = post(
+        &service,
+        "application/json",
+        snapshot(TOKEN, STEAM_ID, "de_inferno", 1, 0, 0, 100),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipts = sink.receipts();
+    assert_eq!(receipts[1].output, StateOutput::SessionReset);
+    assert!(receipts[1].facts.is_empty());
+}
+
+#[tokio::test]
+async fn sink_failure_is_diagnostic_transactional_and_does_not_stop_the_listener() {
+    let (service, _clock, sink) = harness();
+    post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
+    sink.fail_next();
+    let changed = snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 5, 2, 100);
+
+    let failed = post(&service, "application/json", changed.clone()).await;
+    let failed_body = axum::body::to_bytes(failed.into_body(), 1024)
+        .await
+        .expect("diagnostic body");
+    assert_eq!(&failed_body[..], b"sink-failure");
+    assert_eq!(sink.receipts().len(), 1);
+
+    let retried = post(&service, "application/json", changed).await;
+
+    assert_eq!(retried.status(), StatusCode::OK);
+    let receipts = sink.receipts();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[1].sequence, 2);
+    assert_eq!(
+        receipts[1].facts,
+        vec![TransitionFact::Kill {
+            previous: 4,
+            current: 5
         }]
     );
 }
