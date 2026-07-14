@@ -80,13 +80,7 @@ fn gsi_install_is_private_loopback_only_and_rerunnable() {
     fs::create_dir_all(&cfg).unwrap();
     fs::create_dir_all(&data).unwrap();
 
-    let first = install_gsi(
-        &cfg,
-        &data,
-        "safe-token_123",
-        "76561198000000001",
-    )
-    .unwrap();
+    let first = install_gsi(&cfg, &data, "safe-token_123", "76561198000000001").unwrap();
     let config = fs::read_to_string(&first.config_path).unwrap();
     assert!(config.contains("http://127.0.0.1:7130/gsi/router"));
     assert!(config.contains("\"token\" \"safe-token_123\""));
@@ -113,13 +107,7 @@ fn gsi_install_is_private_loopback_only_and_rerunnable() {
         "76561198000000001\n"
     );
 
-    let second = install_gsi(
-        &cfg,
-        &data,
-        "replacement-token",
-        "76561198000000001",
-    )
-    .unwrap();
+    let second = install_gsi(&cfg, &data, "replacement-token", "76561198000000001").unwrap();
     assert_eq!(first, second);
     assert!(
         fs::read_to_string(second.config_path)

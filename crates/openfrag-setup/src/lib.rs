@@ -13,6 +13,7 @@ use std::{
 
 const GSI_FILE: &str = "gamestate_integration_openfrag.cfg";
 const TOKEN_FILE: &str = "gsi-token";
+const LOCAL_STEAM_ID_FILE: &str = "local-steam-id";
 const GSI_URI: &str = "http://127.0.0.1:7130/gsi/router";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -210,11 +211,13 @@ fn blocked(id: CheckId, summary: &str, action: &str) -> Check {
 pub struct GsiInstallation {
     pub config_path: PathBuf,
     pub token_path: PathBuf,
+    pub local_steam_id_path: PathBuf,
 }
 
 #[derive(Debug)]
 pub enum InstallError {
     InvalidToken,
+    InvalidSteamId,
     InvalidDirectory(&'static str),
     UnsafeTarget(&'static str),
     Io(std::io::Error),
@@ -230,6 +233,7 @@ pub fn install_gsi(
     cs2_cfg_directory: &Path,
     data_directory: &Path,
     token: &str,
+    local_steam_id: &str,
 ) -> Result<GsiInstallation, InstallError> {
     if token.len() < 8
         || token.len() > 256
@@ -239,19 +243,32 @@ pub fn install_gsi(
     {
         return Err(InstallError::InvalidToken);
     }
+    if local_steam_id.len() != 17
+        || !local_steam_id.bytes().all(|byte| byte.is_ascii_digit())
+        || local_steam_id.parse::<u64>().is_err()
+    {
+        return Err(InstallError::InvalidSteamId);
+    }
     require_real_directory(cs2_cfg_directory, "CS2 cfg directory")?;
     require_real_directory(data_directory, "data directory")?;
     let config_path = cs2_cfg_directory.join(GSI_FILE);
     let token_path = data_directory.join(TOKEN_FILE);
+    let local_steam_id_path = data_directory.join(LOCAL_STEAM_ID_FILE);
     require_safe_target(&config_path, "GSI config")?;
     require_safe_target(&token_path, "GSI token")?;
+    require_safe_target(&local_steam_id_path, "local Steam ID")?;
 
     let config = gsi_config(token);
     atomic_write_private(&token_path, format!("{token}\n").as_bytes())?;
+    atomic_write_private(
+        &local_steam_id_path,
+        format!("{local_steam_id}\n").as_bytes(),
+    )?;
     atomic_write_private(&config_path, config.as_bytes())?;
     Ok(GsiInstallation {
         config_path,
         token_path,
+        local_steam_id_path,
     })
 }
 
