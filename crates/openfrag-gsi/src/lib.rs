@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::post,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     sync::{Arc, Mutex},
@@ -24,7 +24,7 @@ pub trait EventSink: Send + Sync {
     fn emit(&self, receipt: EvidenceReceipt) -> Result<(), String>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EvidenceReceipt {
     pub sequence: u64,
     pub received_at: Duration,
@@ -34,7 +34,7 @@ pub struct EvidenceReceipt {
     pub facts: Vec<TransitionFact>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct PresenceBits {
     pub provider: bool,
     pub provider_timestamp: bool,
@@ -48,7 +48,7 @@ pub struct PresenceBits {
     pub player_steamid: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum StateOutput {
     Seeded,
     Healthy,
@@ -69,7 +69,7 @@ pub enum ServiceDiagnostic {
     SinkFailure,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum TransitionFact {
     Kill { previous: i64, current: i64 },
     Death { previous: i64, current: i64 },
