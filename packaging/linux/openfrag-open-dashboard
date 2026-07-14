@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Installed as /usr/libexec/openfrag/openfrag-open-dashboard by a distro package.
+set -eu
+
+host=127.0.0.1
+port=9680
+url="http://${host}:${port}/"
+
+if ! (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send --app-name=OpenFrag 'OpenFrag is not running' 'Start the openfragd user service, then try again.'
+    else
+        printf '%s\n' 'OpenFrag is not running; start the openfragd user service first.' >&2
+    fi
+    exit 1
+fi
+exec 3>&-
+exec xdg-open "${url}"
