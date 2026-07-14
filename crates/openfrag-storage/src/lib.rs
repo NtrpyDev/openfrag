@@ -1,7 +1,7 @@
 //! Local, transactional persistence for openfrag artifacts and analysis runs.
 #![allow(clippy::missing_errors_doc)]
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -13,6 +13,8 @@ const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
 const CONTRACT_MIGRATION: &str = include_str!("../migrations/0002_contract.sql");
 const ENFORCEMENT_MIGRATION: &str = include_str!("../migrations/0003_enforcement.sql");
 const IMPORT_LIFECYCLE_MIGRATION: &str = include_str!("../migrations/0004_import_lifecycle.sql");
+const RATING_AVAILABILITY_MIGRATION: &str =
+    include_str!("../migrations/0005_rating_availability.sql");
 
 #[derive(Debug)]
 pub enum Error {
@@ -68,6 +70,7 @@ typed_id!(ManualFlagId);
 typed_id!(ReceiptId);
 typed_id!(ExportId);
 typed_id!(ImportJobId);
+typed_id!(RatingVectorId);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SaveAttemptStatus {
@@ -337,6 +340,27 @@ impl Storage {
             }
         } else {
             apply_migration(&self.connection, 4, IMPORT_LIFECYCLE_MIGRATION, &checksum)?;
+        }
+        let checksum = hex_sha256(RATING_AVAILABILITY_MIGRATION.as_bytes());
+        let exists: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version=5",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(found) = exists {
+            if found != checksum {
+                return Err(Error::Invalid("migration checksum mismatch"));
+            }
+        } else {
+            apply_migration(
+                &self.connection,
+                5,
+                RATING_AVAILABILITY_MIGRATION,
+                &checksum,
+            )?;
         }
         Ok(())
     }
@@ -782,6 +806,24 @@ impl Storage {
         self.connection.execute("INSERT INTO matches(id,demo_sha256,local_steam_id,map_name,imported_at_ms,status) VALUES(?,?,?,?,?,'imported')", params![id.as_str(), demo_sha256, local_steam_id, map, now_ms()])?;
         Ok(id)
     }
+    pub fn match_for_demo(&self, demo_sha256: &str) -> Result<Option<MatchId>> {
+        self.connection
+            .query_row(
+                "SELECT id FROM matches WHERE demo_sha256=?",
+                [demo_sha256],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map(|value| value.map(MatchId))
+            .map_err(Error::from)
+    }
+    pub fn completed_analysis_for_identity(
+        &self,
+        match_id: &MatchId,
+        identity: &AnalysisIdentity,
+    ) -> Result<bool> {
+        self.connection.query_row("SELECT EXISTS(SELECT 1 FROM analysis_runs WHERE match_id=? AND parser_commit=? AND parser_build=? AND generated_proto_build=? AND requested_schema_hash=? AND metric_definition_version=? AND formula_id=? AND evidence_semantics_epoch=? AND status='succeeded')", params![match_id.as_str(), identity.parser_commit, identity.parser_build, identity.generated_proto_build, identity.requested_schema_hash, identity.metric_definition_version, identity.formula_id, identity.evidence_semantics_epoch], |row| row.get(0)).map_err(Error::from)
+    }
     pub fn begin_analysis(
         &self,
         match_id: &MatchId,
@@ -874,6 +916,43 @@ impl Storage {
         if changed == 0 {
             return Err(Error::Conflict("round metric"));
         }
+        Ok(())
+    }
+    pub fn persist_available_rating(
+        &self,
+        run: &AnalysisRunId,
+        steam_id: &str,
+        formula_id: &str,
+        rating_bp: i64,
+        receipt: &ReceiptId,
+    ) -> Result<RatingVectorId> {
+        let id = RatingVectorId::new();
+        self.connection.execute("INSERT INTO player_rating_vectors(id,analysis_run_id,steam_id,formula_id,rating_bp,receipt_id) VALUES(?,?,?,?,?,?)", params![id.as_str(), run.as_str(), steam_id, formula_id, rating_bp, receipt.as_str()])?;
+        Ok(id)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn persist_rating_component(
+        &self,
+        vector: &RatingVectorId,
+        key: &str,
+        numerator: i64,
+        denominator: i64,
+        value_bp: i64,
+        weight_bp: i64,
+        receipt: &ReceiptId,
+    ) -> Result<()> {
+        self.connection.execute("INSERT INTO player_rating_components(rating_vector_id,component_key,numerator,denominator,value_bp,weight_bp,receipt_id) VALUES(?,?,?,?,?,?,?)", params![vector.as_str(), key, numerator, denominator, value_bp, weight_bp, receipt.as_str()])?;
+        Ok(())
+    }
+    pub fn persist_unavailable_rating(
+        &self,
+        run: &AnalysisRunId,
+        steam_id: &str,
+        formula_id: &str,
+        reason_code: &str,
+        receipt: &ReceiptId,
+    ) -> Result<()> {
+        self.connection.execute("INSERT INTO unavailable_rating_results(analysis_run_id,steam_id,formula_id,reason_code,receipt_id) VALUES(?,?,?,?,?)", params![run.as_str(), steam_id, formula_id, reason_code, receipt.as_str()])?;
         Ok(())
     }
     pub fn enqueue_import(&self, demo_sha256: &str) -> Result<ImportJobId> {
@@ -1127,17 +1206,15 @@ mod tests {
                 "matched",
             )
             .unwrap();
-        assert!(
-            storage
-                .reconcile(
-                    &candidate,
-                    &run,
-                    None,
-                    ReconciliationStatus::Unconfirmed,
-                    "again"
-                )
-                .is_err()
-        );
+        assert!(storage
+            .reconcile(
+                &candidate,
+                &run,
+                None,
+                ReconciliationStatus::Unconfirmed,
+                "again"
+            )
+            .is_err());
     }
     #[test]
     fn import_lifecycle_persists_public_state() {
@@ -1164,6 +1241,91 @@ mod tests {
         assert_eq!(storage.import_job(&job).unwrap().phase, ImportPhase::Failed);
         storage.reset_import_retry(&job).unwrap();
         assert_eq!(storage.import_job(&job).unwrap().phase, ImportPhase::Queued);
+    }
+    #[test]
+    fn available_rating_public_seam_satisfies_canonical_invariant() {
+        let (_dir, mut storage) = store();
+        let demo = storage
+            .commit_artifact(storage.stage_artifact(b"rated-demo").unwrap(), "dem", None)
+            .unwrap();
+        storage.upsert_player("765", None).unwrap();
+        let match_id = storage.import_match(&demo, "765", None).unwrap();
+        storage
+            .add_match_participant(&match_id, "765", "full")
+            .unwrap();
+        let identity = AnalysisIdentity {
+            parser_commit: "a",
+            parser_build: "b",
+            generated_proto_build: "c",
+            requested_schema_hash: "d",
+            metric_definition_version: "e",
+            formula_id: "ofr-1.0.0",
+            evidence_semantics_epoch: "g",
+        };
+        let run = storage.begin_analysis(&match_id, &identity).unwrap();
+        let receipt = storage
+            .add_receipt(
+                &run,
+                None,
+                "ofr-1.0.0",
+                None,
+                None,
+                "[\"765\"]",
+                "{}",
+                "[]",
+                "{}",
+            )
+            .unwrap();
+        let vector = storage
+            .persist_available_rating(&run, "765", "ofr-1.0.0", 10_220, &receipt)
+            .unwrap();
+        storage
+            .persist_rating_component(&vector, "direct_damage", 1, 2, 5_000, 3_000, &receipt)
+            .unwrap();
+        storage.complete_analysis(&run).unwrap();
+    }
+    #[test]
+    fn unavailable_rating_public_seam_satisfies_canonical_invariant_without_zero() {
+        let (_dir, mut storage) = store();
+        let demo = storage
+            .commit_artifact(
+                storage.stage_artifact(b"unavailable-demo").unwrap(),
+                "dem",
+                None,
+            )
+            .unwrap();
+        storage.upsert_player("765", None).unwrap();
+        let match_id = storage.import_match(&demo, "765", None).unwrap();
+        storage
+            .add_match_participant(&match_id, "765", "full")
+            .unwrap();
+        let identity = AnalysisIdentity {
+            parser_commit: "a",
+            parser_build: "b",
+            generated_proto_build: "c",
+            requested_schema_hash: "d",
+            metric_definition_version: "e",
+            formula_id: "ofr-1.0.0",
+            evidence_semantics_epoch: "g",
+        };
+        let run = storage.begin_analysis(&match_id, &identity).unwrap();
+        let receipt = storage
+            .add_receipt(
+                &run,
+                None,
+                "rating_unavailable",
+                None,
+                None,
+                "[\"765\"]",
+                "{}",
+                "[]",
+                "{}",
+            )
+            .unwrap();
+        storage
+            .persist_unavailable_rating(&run, "765", "ofr-1.0.0", "missing_tick_rate", &receipt)
+            .unwrap();
+        storage.complete_analysis(&run).unwrap();
     }
     #[test]
     fn import_lease_has_one_public_owner() {
