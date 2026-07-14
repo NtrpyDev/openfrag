@@ -30,30 +30,225 @@
       </section>
       <section data-panel="matches" class="hidden"><h1>Matches</h1><ul id="match-list" class="list" aria-live="polite"></ul><article id="match-detail" class="panel" aria-live="polite"><p class="muted">Select a local match.</p></article></section>
       <section data-panel="clips" class="hidden"><h1>Clip review</h1><ul id="clip-list" class="list" aria-live="polite"></ul></section>
-      <section data-panel="diagnostics" class="hidden"><h1>Capture and GSI diagnostics</h1><pre id="diagnostics-output" class="panel" aria-live="polite">Loading diagnostics…</pre></section>
-      <section data-panel="setup" class="hidden"><h1>Setup status</h1><div id="setup-output" class="panel" aria-live="polite">Loading setup status…</div></section>
+      <section data-panel="diagnostics" class="hidden"><h1>Capture and GSI diagnostics</h1><pre id="diagnostics-output" class="panel" aria-live="polite">Select Diagnostics to load local status.</pre></section>
+      <section data-panel="setup" class="hidden"><h1>Setup status</h1><ul id="setup-output" class="panel list" aria-live="polite"><li>Select Setup to load local checks.</li></ul></section>
     </main>
   </div>
   <dialog id="clip-editor" aria-labelledby="clip-editor-title"><form id="clip-form" method="dialog"><h2 id="clip-editor-title">Review clip</h2><input id="clip-id" type="hidden"><label for="clip-title">Title<input id="clip-title" required></label><label for="clip-note">Note<textarea id="clip-note"></textarea></label><label for="clip-tags">Tags (comma separated)<input id="clip-tags"></label><label for="clip-decision">Review decision<select id="clip-decision"><option value="keep">Keep</option><option value="reject">Reject</option></select></label><div class="row"><button class="button" value="cancel">Cancel</button><button id="clip-save" class="button primary" value="default">Save review</button><button id="clip-trim" class="button" type="button">Trim local clip</button><button id="clip-export" class="button" type="button">Export local file</button></div></form></dialog>
   <script>
-    const $ = (selector) => document.querySelector(selector); const api = (path, options) => fetch(path, options).then(async response => { const body = await response.json().catch(() => ({})); if (!response.ok) throw new Error(body.message || `Request failed (${response.status})`); return body; });
-    const announce = (text) => $('#announcements').textContent = text; let selectedClip;
-    function show(view) { document.querySelectorAll('[data-panel]').forEach(panel => panel.classList.toggle('hidden', panel.dataset.panel !== view)); document.querySelectorAll('[data-view]').forEach(button => button.setAttribute('aria-current', String(button.dataset.view === view))); if (view === 'matches') loadMatches(); if (view === 'clips') loadClips(); if (view === 'diagnostics') loadDiagnostics(); if (view === 'setup') loadSetup(); }
-    function text(node, value) { node.textContent = value ?? 'Unavailable'; }
-    async function loadHealth() { const health = await api('/api/health'); text($('#rating-state'), health.rating_state === 'rated' ? `Rated: ${health.rating}` : health.rating_state === 'preview' ? 'Preview rating' : 'Rating unavailable'); }
-    async function loadSetup() { const setup = await api('/api/setup'); $('#setup-output').textContent = setup.checks.map(check => `${check.id}: ${check.status} — ${check.summary}`).join('\n'); }
-    async function loadMatches() { const matches = await api('/api/matches'); const list = $('#match-list'); list.replaceChildren(...matches.map(match => { const button = document.createElement('button'); button.className='button'; button.textContent=`${match.map ?? 'Match'} — ${match.rating_state}`; button.onclick=() => loadMatch(match.id); const item=document.createElement('li'); item.append(button); return item; })); }
-    async function loadMatch(id) { const match = await api(`/api/matches/${encodeURIComponent(id)}`); const detail=$('#match-detail'); detail.replaceChildren(); const heading=document.createElement('h2'); heading.textContent=match.map ?? 'Match'; const rating=document.createElement('p'); rating.textContent=match.rating_state === 'rated' ? `Rating: ${match.rating}` : match.rating_state === 'preview' ? 'Rating: preview' : 'Rating unavailable'; detail.append(heading,rating); for (const receipt of match.receipts ?? []) { const button=document.createElement('button'); button.className='button'; button.textContent=`Receipt ${receipt.id}`; button.onclick=async()=>{ const data=await api(`/api/receipts/${encodeURIComponent(receipt.id)}`); announce(JSON.stringify(data)); }; detail.append(button); } }
-    async function loadClips() { const clips=await api('/api/clips'); const list=$('#clip-list'); list.replaceChildren(...clips.map(clip=>{ const button=document.createElement('button'); button.className='button'; button.textContent=clip.title ?? `Clip ${clip.id}`; button.onclick=()=>editClip(clip); const item=document.createElement('li'); item.append(button); return item; })); }
-    function editClip(clip) { selectedClip=clip; $('#clip-id').value=clip.id; $('#clip-title').value=clip.title ?? ''; $('#clip-note').value=clip.note ?? ''; $('#clip-tags').value=(clip.tags ?? []).join(', '); $('#clip-editor').showModal(); }
-    async function loadDiagnostics() { $('#diagnostics-output').textContent=JSON.stringify(await api('/api/diagnostics'), null, 2); }
-    $('#import-form').onsubmit=async event=>{ event.preventDefault(); const data=new FormData(event.currentTarget); $('#import-progress').textContent='Submitting local Demo…'; const job=await api('/api/imports',{method:'POST',body:data}); const poll=async()=>{ const state=await api(`/api/imports/${encodeURIComponent(job.id)}`); $('#import-progress').textContent=state.progress ?? state.status; if (!['completed','failed'].includes(state.status)) setTimeout(poll,1000); else announce(`Import ${state.status}`); }; poll(); };
-    $('#manual-flag').onclick=async()=>{ await api('/api/manual-flag',{method:'POST'}); announce('Manual Flag requested.'); };
-    $('#clip-form').onsubmit=async event=>{ if (event.submitter?.value==='cancel') return; event.preventDefault(); const id=$('#clip-id').value; await api(`/api/clips/${encodeURIComponent(id)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:$('#clip-title').value,note:$('#clip-note').value,tags:$('#clip-tags').value.split(',').map(tag=>tag.trim()).filter(Boolean),decision:$('#clip-decision').value})}); $('#clip-editor').close(); loadClips(); };
-    $('#clip-trim').onclick=async()=>{ await api(`/api/clips/${encodeURIComponent(selectedClip.id)}/trim`,{method:'POST'}); announce('Local trim requested.'); };
-    $('#clip-export').onclick=async()=>{ await api(`/api/clips/${encodeURIComponent(selectedClip.id)}/export`,{method:'POST'}); announce('Local export requested.'); };
-    document.querySelectorAll('[data-view]').forEach(button=>button.onclick=()=>show(button.dataset.view));
-    loadHealth().catch(error=>announce(error.message));
+    const $ = selector => document.querySelector(selector);
+    const announce = message => { $('#announcements').textContent = message; };
+    let selectedClip = null;
+
+    async function api(path, options) {
+      const response = await fetch(path, options);
+      const raw = await response.text();
+      let body = {};
+      if (raw) {
+        try { body = JSON.parse(raw); } catch { body = {}; }
+      }
+      if (!response.ok) throw new Error(body.message || `Local API unavailable (${response.status})`);
+      return body;
+    }
+
+    function unavailable(target, label, error) {
+      const message = `${label} unavailable: ${error.message}`;
+      if (target) target.textContent = message;
+      announce(message);
+    }
+
+    function emptyItem(message) {
+      const item = document.createElement('li');
+      item.className = 'muted';
+      item.textContent = message;
+      return item;
+    }
+
+    function show(view) {
+      document.querySelectorAll('[data-panel]').forEach(panel => panel.classList.toggle('hidden', panel.dataset.panel !== view));
+      document.querySelectorAll('[data-view]').forEach(button => button.setAttribute('aria-current', String(button.dataset.view === view)));
+      if (view === 'matches') void loadMatches();
+      if (view === 'clips') void loadClips();
+      if (view === 'diagnostics') void loadDiagnostics();
+      if (view === 'setup') void loadSetup();
+    }
+
+    async function loadHealth() {
+      const target = $('#rating-state');
+      try {
+        const health = await api('/api/health');
+        target.textContent = health.rating_state === 'rated' && health.rating
+          ? `Rated: ${health.rating}`
+          : health.rating_state === 'preview' ? 'Rating preview is being calculated.' : 'Rating unavailable.';
+      } catch (error) { unavailable(target, 'Rating status', error); }
+    }
+
+    function matchButton(match) {
+      const button = document.createElement('button');
+      button.className = 'button';
+      button.type = 'button';
+      button.textContent = `${match.map ?? 'Match'}: ${match.rating_state}`;
+      button.onclick = () => { show('matches'); void loadMatch(match.id); };
+      const item = document.createElement('li');
+      item.append(button);
+      return item;
+    }
+
+    async function loadRecentMatches() {
+      const list = $('#recent-matches');
+      try {
+        const matches = await api('/api/matches');
+        list.replaceChildren(...(matches.slice(0, 3).map(matchButton)));
+        if (!matches.length) list.replaceChildren(emptyItem('No imported matches yet.'));
+      } catch (error) { list.replaceChildren(emptyItem(`Recent matches unavailable: ${error.message}`)); }
+    }
+
+    async function loadSetup() {
+      const output = $('#setup-output');
+      output.setAttribute('aria-busy', 'true');
+      try {
+        const setup = await api('/api/setup');
+        output.replaceChildren(...setup.checks.map(check => emptyItem(`${check.id}: ${check.status}. ${check.summary}`)));
+        if (!setup.checks.length) output.replaceChildren(emptyItem('No setup checks were returned.'));
+      } catch (error) { output.replaceChildren(emptyItem(`Setup status unavailable: ${error.message}`)); announce(`Setup status unavailable: ${error.message}`); }
+      finally { output.removeAttribute('aria-busy'); }
+    }
+
+    async function loadMatches() {
+      const list = $('#match-list');
+      list.setAttribute('aria-busy', 'true');
+      try {
+        const matches = await api('/api/matches');
+        list.replaceChildren(...matches.map(matchButton));
+        if (!matches.length) list.replaceChildren(emptyItem('No imported matches yet.'));
+      } catch (error) { list.replaceChildren(emptyItem(`Matches unavailable: ${error.message}`)); announce(`Matches unavailable: ${error.message}`); }
+      finally { list.removeAttribute('aria-busy'); }
+    }
+
+    async function loadMatch(id) {
+      const detail = $('#match-detail');
+      detail.setAttribute('aria-busy', 'true');
+      try {
+        const match = await api(`/api/matches/${encodeURIComponent(id)}`);
+        const heading = document.createElement('h2');
+        heading.textContent = match.map ?? 'Match';
+        const rating = document.createElement('p');
+        rating.textContent = match.rating_state === 'rated' && match.rating ? `Rating: ${match.rating}` : match.rating_state === 'preview' ? 'Rating: preview' : 'Rating unavailable.';
+        detail.replaceChildren(heading, rating);
+        for (const receipt of match.receipts ?? []) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'button';
+          button.textContent = `Inspect receipt ${receipt.id}`;
+          button.onclick = async () => {
+            try { announce(JSON.stringify(await api(`/api/receipts/${encodeURIComponent(receipt.id)}`))); }
+            catch (error) { unavailable(null, 'Receipt', error); }
+          };
+          detail.append(button);
+        }
+      } catch (error) { unavailable(detail, 'Match detail', error); }
+      finally { detail.removeAttribute('aria-busy'); }
+    }
+
+    async function loadClips() {
+      const list = $('#clip-list');
+      list.setAttribute('aria-busy', 'true');
+      try {
+        const clips = await api('/api/clips');
+        list.replaceChildren(...clips.map(clip => {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'button';
+          button.textContent = clip.title || `Clip ${clip.id}`;
+          button.onclick = () => editClip(clip);
+          const item = document.createElement('li');
+          item.append(button);
+          return item;
+        }));
+        if (!clips.length) list.replaceChildren(emptyItem('No clips are ready for review.'));
+      } catch (error) { list.replaceChildren(emptyItem(`Clips unavailable: ${error.message}`)); announce(`Clips unavailable: ${error.message}`); }
+      finally { list.removeAttribute('aria-busy'); }
+    }
+
+    function editClip(clip) {
+      selectedClip = clip;
+      $('#clip-id').value = clip.id;
+      $('#clip-title').value = clip.title ?? '';
+      $('#clip-note').value = clip.note ?? '';
+      $('#clip-tags').value = (clip.tags ?? []).join(', ');
+      $('#clip-editor').showModal();
+    }
+
+    async function loadDiagnostics() {
+      const output = $('#diagnostics-output');
+      output.setAttribute('aria-busy', 'true');
+      try { output.textContent = JSON.stringify(await api('/api/diagnostics'), null, 2); }
+      catch (error) { unavailable(output, 'Diagnostics', error); }
+      finally { output.removeAttribute('aria-busy'); }
+    }
+
+    async function pollImport(id) {
+      const output = $('#import-progress');
+      try {
+        const state = await api(`/api/imports/${encodeURIComponent(id)}`);
+        output.textContent = state.progress || `Import status: ${state.status}`;
+        if (['completed', 'failed', 'cancelled'].includes(state.status)) {
+          announce(`Import ${state.status}.`);
+          if (state.status === 'completed') { await Promise.all([loadHealth(), loadRecentMatches()]); }
+          return;
+        }
+        window.setTimeout(() => void pollImport(id), 1000);
+      } catch (error) { unavailable(output, 'Import status', error); }
+    }
+
+    $('#import-form').onsubmit = async event => {
+      event.preventDefault();
+      const output = $('#import-progress');
+      const submit = event.currentTarget.querySelector('button[type="submit"]');
+      submit.disabled = true;
+      output.textContent = 'Submitting local Demo...';
+      try {
+        const job = await api('/api/imports', { method: 'POST', body: new FormData(event.currentTarget) });
+        announce(`Import queued as ${job.id}.`);
+        void pollImport(job.id);
+      } catch (error) { unavailable(output, 'Demo import', error); }
+      finally { submit.disabled = false; }
+    };
+
+    $('#manual-flag').onclick = async event => {
+      event.currentTarget.disabled = true;
+      try { await api('/api/manual-flag', { method: 'POST' }); announce('Manual Flag requested.'); }
+      catch (error) { unavailable(null, 'Manual Flag', error); }
+      finally { event.currentTarget.disabled = false; }
+    };
+
+    $('#clip-form').onsubmit = async event => {
+      if (event.submitter?.value === 'cancel') return;
+      event.preventDefault();
+      const save = $('#clip-save');
+      save.disabled = true;
+      try {
+        const id = $('#clip-id').value;
+        await api(`/api/clips/${encodeURIComponent(id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: $('#clip-title').value, note: $('#clip-note').value, tags: $('#clip-tags').value.split(',').map(tag => tag.trim()).filter(Boolean), decision: $('#clip-decision').value }) });
+        $('#clip-editor').close();
+        announce('Clip review saved.');
+        await loadClips();
+      } catch (error) { unavailable(null, 'Clip review', error); }
+      finally { save.disabled = false; }
+    };
+
+    async function clipAction(action, label) {
+      if (!selectedClip) { announce('Select a clip first.'); return; }
+      try {
+        await api(`/api/clips/${encodeURIComponent(selectedClip.id)}/${action}`, { method: 'POST' });
+        announce(`${label} requested for the local clip.`);
+      } catch (error) { unavailable(null, label, error); }
+    }
+
+    $('#clip-trim').onclick = () => void clipAction('trim', 'Trim');
+    $('#clip-export').onclick = () => void clipAction('export', 'Export');
+    document.querySelectorAll('[data-view]').forEach(button => { button.onclick = () => show(button.dataset.view); });
+    void Promise.all([loadHealth(), loadRecentMatches()]);
   </script>
 </body>
 </html>

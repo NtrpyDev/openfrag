@@ -32,6 +32,11 @@ fn dashboard_wires_local_contracts_accessibly_without_remote_state() {
         "account",
         "upload",
         "fetch('http",
+        "<script src=",
+        "<link rel=",
+        "window.open",
+        "child_process",
+        "\u{2014}",
     ] {
         assert!(
             !page
@@ -41,4 +46,31 @@ fn dashboard_wires_local_contracts_accessibly_without_remote_state() {
         );
     }
     assert!(!page.contains("No local Demo has been imported"));
+}
+
+#[test]
+fn dashboard_exposes_complete_local_flows_and_honest_failure_states() {
+    let page = include_str!("../src/dashboard.html");
+    for required in [
+        "loadRecentMatches()",
+        "loadMatch(match.id)",
+        "loadClips()",
+        "loadDiagnostics()",
+        "loadSetup()",
+        "pollImport(job.id)",
+        "['completed', 'failed', 'cancelled']",
+        "method: 'PATCH'",
+        "clipAction('trim', 'Trim')",
+        "clipAction('export', 'Export')",
+        "method: 'POST'",
+        "Local API unavailable",
+    ] {
+        assert!(page.contains(required), "missing flow marker {required}");
+    }
+    assert!(!page.contains("EvidenceUnavailable"));
+    assert!(page.matches("catch (error)").count() >= 10);
+    assert!(page.contains("aria-busy"));
+    assert!(page.contains("Setup status unavailable"));
+    assert!(page.contains("unavailable(output, 'Import status'"));
+    assert!(page.contains("Select a clip first."));
 }
