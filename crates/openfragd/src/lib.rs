@@ -2,7 +2,11 @@
 #![allow(clippy::missing_errors_doc)]
 
 pub mod api;
+pub mod capture_runtime;
+pub mod clip_ports;
+pub mod live_runtime;
 pub mod service;
+pub mod storage_clip_repository;
 
 use axum::{
     Json, Router,

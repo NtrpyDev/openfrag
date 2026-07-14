@@ -41,6 +41,7 @@ enum Gate<P, F, C, M> {
 /// Gated daemon runtime for one replay-buffer supervisor.
 pub struct CaptureRuntime<P, F, C, M> {
     gate: Gate<P, F, C, M>,
+    available_from_ms: Option<u64>,
 }
 
 impl<P, F, C, M> CaptureRuntime<P, F, C, M>
@@ -63,12 +64,14 @@ where
             Err(error) => {
                 return Self {
                     gate: Gate::Unavailable(unavailable_reason(error)),
+                    available_from_ms: None,
                 };
             }
         };
         if !configuration.enabled() {
             return Self {
                 gate: Gate::Disabled,
+                available_from_ms: None,
             };
         }
         let replay = ReplayConfig::sixty_second(
@@ -89,6 +92,7 @@ where
         );
         Self {
             gate: Gate::Ready(Supervisor::new(process, filesystem, clock, probe, config)),
+            available_from_ms: None,
         }
     }
 
@@ -107,9 +111,15 @@ where
     }
 
     pub fn start(&mut self) -> Result<(), RuntimeError> {
+        self.start_at(0)
+    }
+
+    pub fn start_at(&mut self, available_from_ms: u64) -> Result<(), RuntimeError> {
         self.supervisor_mut()?
             .start()
-            .map_err(RuntimeError::Supervisor)
+            .map_err(RuntimeError::Supervisor)?;
+        self.available_from_ms = Some(available_from_ms);
+        Ok(())
     }
 
     pub fn poll(&mut self) -> Result<Option<i32>, RuntimeError> {
@@ -157,6 +167,29 @@ where
             Gate::Unavailable(reason) => Err(RuntimeError::Unavailable(reason.clone())),
             Gate::Ready(supervisor) => Ok(supervisor),
         }
+    }
+}
+
+impl<P, F, C, M> crate::live_runtime::CaptureRuntimePort for CaptureRuntime<P, F, C, M>
+where
+    P: openfrag_capture::Process + Send,
+    F: Filesystem + Send,
+    C: Clock + Send,
+    M: MediaProbe + Send,
+{
+    fn readiness(&self) -> Result<(), String> {
+        match self.status() {
+            RuntimeStatus::Running if self.available_from_ms.is_some() => Ok(()),
+            status => Err(format!("capture runtime is not running: {status:?}")),
+        }
+    }
+
+    fn available_from_ms(&self) -> u64 {
+        self.available_from_ms.unwrap_or(0)
+    }
+
+    fn request_save(&mut self, provenance: SaveProvenance) -> Result<SaveDisposition, String> {
+        CaptureRuntime::request_save(self, provenance).map_err(|error| format!("{error:?}"))
     }
 }
 

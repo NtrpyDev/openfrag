@@ -1,3 +1,16 @@
+mod live_runtime {
+    use openfrag_capture::{SaveDisposition, SaveProvenance};
+
+    pub trait CaptureRuntimePort: Send {
+        fn readiness(&self) -> Result<(), String>;
+        fn available_from_ms(&self) -> u64;
+        fn request_save(
+            &mut self,
+            provenance: SaveProvenance,
+        ) -> Result<SaveDisposition, String>;
+    }
+}
+
 #[path = "../src/capture_runtime.rs"]
 mod capture_runtime;
 
@@ -97,6 +110,11 @@ fn runtime(
     )
 }
 
+fn assert_live_port_ready(port: &impl live_runtime::CaptureRuntimePort) {
+    assert_eq!(port.readiness(), Ok(()));
+    assert_eq!(port.available_from_ms(), 12_000);
+}
+
 fn make_executable(path: &Path) {
     std::fs::write(path, b"fake executable").expect("write executable");
     #[cfg(unix)]
@@ -183,8 +201,9 @@ fn enabled_runtime_delegates_lifecycle_to_fakes_only() {
     let log = Arc::new(Mutex::new(ProcessLog::default()));
     let mut runtime = runtime(directory.path(), log.clone(), Some(output.clone()));
     assert_eq!(runtime.status(), RuntimeStatus::Ready);
-    runtime.start().expect("start fake supervisor");
+    runtime.start_at(12_000).expect("start fake supervisor");
     assert_eq!(runtime.status(), RuntimeStatus::Running);
+    assert_live_port_ready(&runtime);
     assert_eq!(
         runtime
             .request_save(SaveProvenance::ManualFlag)
