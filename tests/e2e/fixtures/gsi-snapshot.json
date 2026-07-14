@@ -1,0 +1,30 @@
+{
+  "provider": {
+    "appid": 730,
+    "timestamp": 1700000000
+  },
+  "map": {
+    "name": "de_e2e_secret",
+    "mode": "competitive",
+    "round": 1
+  },
+  "player": {
+    "steamid": "__STEAM_ID__",
+    "state": {
+      "health": 100,
+      "round_kills": 0
+    },
+    "weapons": {
+      "weapon_0": {
+        "name": "weapon_e2e_secret"
+      }
+    },
+    "match_stats": {
+      "kills": 0,
+      "deaths": 0
+    }
+  },
+  "auth": {
+    "token": "__TOKEN__"
+  }
+}

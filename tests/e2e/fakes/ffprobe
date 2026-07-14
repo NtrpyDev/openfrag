@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+if [ -n "${OPENFRAG_E2E_FAKE_LOG:-}" ]; then
+  printf '%s\n' "ffprobe $*" >> "$OPENFRAG_E2E_FAKE_LOG"
+fi
+printf '%s\n' '{"streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p","width":1280,"height":720,"avg_frame_rate":"60/1"},{"codec_type":"audio","codec_name":"aac"}],"format":{"duration":"30.000000"}}'
