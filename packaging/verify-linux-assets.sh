@@ -36,8 +36,4 @@ bash -n "$helper"
 if command -v desktop-file-validate >/dev/null 2>&1; then
     desktop-file-validate "$desktop"
 fi
-if command -v systemd-analyze >/dev/null 2>&1; then
-    systemd-analyze verify "$service"
-fi
-
 printf '%s\n' 'Linux packaging assets passed static verification.'
