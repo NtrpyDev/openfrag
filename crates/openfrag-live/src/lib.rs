@@ -80,6 +80,7 @@ pub struct CaptureRecord {
 pub enum LiveDiagnostic {
     Persistence(String),
     Unsupported(&'static str),
+    StorageRequirement(LiveStorageRequirement),
     Recorder(String),
     Scheduler(String),
     MissingCapture(String),
@@ -93,6 +94,11 @@ impl fmt::Display for LiveDiagnostic {
             Self::Unsupported(message) => {
                 write!(formatter, "unsupported durable live state: {message}")
             }
+            Self::StorageRequirement(requirement) => write!(
+                formatter,
+                "missing durable storage API: {}",
+                requirement.required_api
+            ),
             Self::Recorder(message) => write!(formatter, "replay recorder: {message}"),
             Self::Scheduler(message) => write!(formatter, "live scheduler: {message}"),
             Self::MissingCapture(id) => write!(formatter, "missing live capture: {id}"),
@@ -100,6 +106,15 @@ impl fmt::Display for LiveDiagnostic {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveStorageRequirement {
+    pub required_api: &'static str,
+}
+
+pub const MANUAL_FLAG_SAVE_JOIN_REQUIREMENT: LiveStorageRequirement = LiveStorageRequirement {
+    required_api: "Storage::join_manual_flag_save(manual_flag, save_attempt, desired_start_ns, desired_end_ns)",
+};
 
 impl std::error::Error for LiveDiagnostic {}
 

@@ -1,11 +1,12 @@
 use openfrag_capture::{SaveDisposition, SaveProvenance};
 use openfrag_domain::{
     AutoCaptureDecision, CandidateTrigger, HighlightCandidate, TimeRange, auto_capture_window,
+    manual_capture_window, merge_candidates,
 };
 use openfrag_gsi::{EvidenceContext, EvidenceReceipt, PresenceBits, StateOutput, TransitionFact};
 use openfrag_live::{
     CandidateRecord, CaptureKind, CaptureRecord, CaptureStatus, EvidenceStore, LiveDiagnostic,
-    StorageEvidenceStore,
+    MANUAL_FLAG_SAVE_JOIN_REQUIREMENT, StorageEvidenceStore,
 };
 use openfrag_storage::{Layout, Storage};
 use rusqlite::Connection;
@@ -48,6 +49,7 @@ fn receipt() -> EvidenceReceipt {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn receipt_candidate_and_save_metadata_survive_reopen() {
     let directory = tempfile::tempdir().expect("temp directory");
     let layout = Layout::at(directory.path().join("data"));
@@ -76,6 +78,31 @@ fn receipt_candidate_and_save_metadata_survive_reopen() {
             final_labels: BTreeSet::new(),
         })
         .expect("persist candidate");
+    let mut round_end = evidence.clone();
+    round_end.sequence = 8;
+    round_end.received_at = Duration::from_secs(43);
+    round_end.payload_hash = "b".repeat(64);
+    round_end.context.observed_round = Some(5);
+    round_end.context.round_kills = Some(0);
+    round_end.facts = vec![TransitionFact::RoundEnd {
+        completed: 4,
+        next: 5,
+    }];
+    adapter.persist_receipt(&round_end).expect("round end");
+    let official = HighlightCandidate::new(
+        adapter.capture_session_id(),
+        "maphash:4",
+        TimeRange {
+            start_ms: 43_000,
+            end_ms: 43_000,
+        },
+        CandidateTrigger::OfficialRoundEndCapture,
+        format!("{}:{}", round_end.payload_hash, round_end.sequence),
+    )
+    .expect("official candidate");
+    let merged = merge_candidates(vec![candidate.clone(), official])
+        .pop()
+        .expect("merged candidate");
     let AutoCaptureDecision::Save(window) =
         auto_capture_window(candidate.range.start_ms, Some(42_000), 0)
     else {
@@ -87,8 +114,8 @@ fn receipt_candidate_and_save_metadata_survive_reopen() {
             kind: CaptureKind::AutoRoundEnd,
             round_id: Some("maphash:4".into()),
             provenance: SaveProvenance::AutoRoundEnd,
-            source_receipt_ids: candidate.receipt_ids.clone(),
-            candidate: Some(candidate),
+            source_receipt_ids: merged.receipt_ids.clone(),
+            candidate: Some(merged),
             final_labels: BTreeSet::new(),
             round_end_ms: Some(42_000),
             deadline_ms: Some(52_000),
@@ -129,6 +156,14 @@ fn receipt_candidate_and_save_metadata_survive_reopen() {
         )
         .expect("trigger count");
     assert_eq!(triggers, 1);
+    let all_triggers: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM candidate_trigger_receipts",
+            [],
+            |row| row.get(0),
+        )
+        .expect("all trigger count");
+    assert_eq!(all_triggers, 2);
     let save: (String, i64, i64, i64) = connection
         .query_row(
             "SELECT a.status,a.requested_monotonic_ns,j.desired_start_monotonic_ns,j.desired_end_monotonic_ns FROM recorder_save_attempts a JOIN candidate_save_attempts j ON j.save_attempt_id=a.id WHERE a.recorder_request_id='auto:maphash:4'",
@@ -148,7 +183,7 @@ fn receipt_candidate_and_save_metadata_survive_reopen() {
 }
 
 #[test]
-fn rejects_unrepresentable_capture_state_with_typed_diagnostic() {
+fn scheduled_and_cancelled_states_are_idempotent_without_inventing_save_attempts() {
     let directory = tempfile::tempdir().expect("temp directory");
     let adapter = StorageEvidenceStore::new(
         Storage::open(Layout::at(directory.path())).expect("storage"),
@@ -170,8 +205,129 @@ fn rejects_unrepresentable_capture_state_with_typed_diagnostic() {
         raw_coverage: None,
         status: CaptureStatus::Scheduled,
     });
+    assert_eq!(result, Ok(()));
+    let cancelled = CaptureRecord {
+        status: CaptureStatus::Cancelled(openfrag_live::CancelReason::Stale),
+        ..CaptureRecord {
+            id: "scheduled".into(),
+            kind: CaptureKind::AutoRoundEnd,
+            round_id: Some("maphash:4".into()),
+            provenance: SaveProvenance::AutoRoundEnd,
+            source_receipt_ids: BTreeSet::new(),
+            candidate: None,
+            final_labels: BTreeSet::new(),
+            round_end_ms: Some(42_000),
+            deadline_ms: Some(52_000),
+            timer: None,
+            window: None,
+            raw_coverage: None,
+            status: CaptureStatus::Scheduled,
+        }
+    };
+    assert_eq!(adapter.upsert_capture(&cancelled), Ok(()));
+}
+
+#[test]
+fn retry_and_coalesced_transitions_create_a_new_acknowledged_attempt() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let layout = Layout::at(directory.path());
+    let adapter = StorageEvidenceStore::new(
+        Storage::open(layout.clone()).expect("storage"),
+        "76561198000000000",
+    )
+    .expect("adapter");
+    let window = manual_capture_window(42_000, 0);
+    let mut capture = CaptureRecord {
+        id: "auto:retry".into(),
+        kind: CaptureKind::AutoRoundEnd,
+        round_id: Some("maphash:4".into()),
+        provenance: SaveProvenance::AutoRoundEnd,
+        source_receipt_ids: BTreeSet::new(),
+        candidate: None,
+        final_labels: BTreeSet::new(),
+        round_end_ms: Some(42_000),
+        deadline_ms: Some(52_000),
+        timer: None,
+        window: Some(window),
+        raw_coverage: Some(TimeRange {
+            start_ms: 0,
+            end_ms: 42_000,
+        }),
+        status: CaptureStatus::Retryable("recorder_busy".into()),
+    };
+    adapter.upsert_capture(&capture).expect("retryable");
+    capture.status = CaptureStatus::SaveRequested(SaveDisposition::Coalesced);
+    adapter.upsert_capture(&capture).expect("coalesced retry");
+    drop(adapter);
+    let connection = Connection::open(layout.database).expect("database");
+    let statuses = connection
+        .prepare("SELECT status FROM recorder_save_attempts ORDER BY recorder_request_id")
+        .expect("statement")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("statuses");
+    assert_eq!(statuses, ["failed", "acknowledged"]);
+}
+
+#[test]
+fn manual_request_persists_available_rows_and_reports_the_one_missing_join_api() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let layout = Layout::at(directory.path());
+    let adapter = StorageEvidenceStore::new(
+        Storage::open(layout.clone()).expect("storage"),
+        "76561198000000000",
+    )
+    .expect("adapter");
+    let window = manual_capture_window(42_000, 0);
+    let result = adapter.upsert_capture(&CaptureRecord {
+        id: "manual:42000:1".into(),
+        kind: CaptureKind::ManualFlag,
+        round_id: None,
+        provenance: SaveProvenance::ManualFlag,
+        source_receipt_ids: BTreeSet::new(),
+        candidate: None,
+        final_labels: BTreeSet::new(),
+        round_end_ms: None,
+        deadline_ms: None,
+        timer: None,
+        window: Some(window),
+        raw_coverage: Some(TimeRange {
+            start_ms: 0,
+            end_ms: 42_000,
+        }),
+        status: CaptureStatus::Requesting,
+    });
     assert_eq!(
         result,
-        Err(LiveDiagnostic::Unsupported("scheduled capture"))
+        Err(LiveDiagnostic::StorageRequirement(
+            MANUAL_FLAG_SAVE_JOIN_REQUIREMENT
+        ))
+    );
+    drop(adapter);
+    let connection = Connection::open(layout.database).expect("database");
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM manual_flags", [], |row| row
+                .get::<_, i64>(0))
+            .expect("flags"),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM recorder_save_attempts", [], |row| row
+                .get::<_, i64>(0))
+            .expect("attempts"),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM manual_flag_save_attempts",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .expect("joins"),
+        0
     );
 }

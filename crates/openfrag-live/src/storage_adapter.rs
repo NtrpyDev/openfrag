@@ -1,34 +1,48 @@
 use crate::{
     CandidateRecord, CaptureKind, CaptureRecord, CaptureStatus, EvidenceStore, LiveDiagnostic,
+    MANUAL_FLAG_SAVE_JOIN_REQUIREMENT,
 };
 use openfrag_capture::SaveDisposition;
 use openfrag_domain::CandidateTrigger;
 use openfrag_gsi::EvidenceReceipt;
-use openfrag_storage::{CaptureSessionId, LiveCandidateId, SaveAttemptId, Storage};
-use std::{collections::HashMap, sync::Mutex};
+use openfrag_storage::{CaptureSessionId, LiveCandidateId, ManualFlagId, SaveAttemptId, Storage};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 
 #[derive(Clone)]
 struct ReceiptMetadata {
     snapshot_sha256: String,
     sequence: i64,
     received_at_ns: i64,
+    trigger: Option<CandidateTrigger>,
 }
 
 struct CandidateMetadata {
     id: LiveCandidateId,
     record: CandidateRecord,
+    trigger_receipts: HashSet<String>,
+}
+
+struct SaveAttemptMetadata {
+    id: SaveAttemptId,
+    generation: u64,
+    failed: bool,
 }
 
 struct State {
     storage: Storage,
     receipts: HashMap<String, ReceiptMetadata>,
     candidates: HashMap<String, CandidateMetadata>,
-    save_attempts: HashMap<String, SaveAttemptId>,
+    save_attempts: HashMap<String, SaveAttemptMetadata>,
+    manual_flags: HashMap<String, ManualFlagId>,
+    candidate_joins: HashSet<(String, String)>,
 }
 
 /// Conservative adapter from live coordination evidence to the existing `SQLite` contract.
 ///
-/// States without a lossless representation are rejected with [`LiveDiagnostic::Unsupported`].
+/// Live coordinator transitions are projected onto the durable `SQLite` evidence model.
 pub struct StorageEvidenceStore {
     session: CaptureSessionId,
     state: Mutex<State>,
@@ -51,6 +65,8 @@ impl StorageEvidenceStore {
                 receipts: HashMap::new(),
                 candidates: HashMap::new(),
                 save_attempts: HashMap::new(),
+                manual_flags: HashMap::new(),
+                candidate_joins: HashSet::new(),
             }),
         })
     }
@@ -97,6 +113,7 @@ impl EvidenceStore for StorageEvidenceStore {
                 snapshot_sha256,
                 sequence,
                 received_at_ns: millis_to_nanos(received_at_ms)?,
+                trigger: receipt_trigger(receipt),
             },
         );
         Ok(())
@@ -113,56 +130,69 @@ impl EvidenceStore for StorageEvidenceStore {
                 "final highlight labels have no live capture column",
             ));
         }
-        let CaptureStatus::SaveRequested(SaveDisposition::Signalled) = capture.status else {
-            return Err(LiveDiagnostic::Unsupported(match capture.status {
-                CaptureStatus::Scheduled => "scheduled capture",
-                CaptureStatus::Requesting => "transient requesting capture",
-                CaptureStatus::SaveRequested(SaveDisposition::Coalesced) => {
-                    "coalesced recorder request relationship"
-                }
-                CaptureStatus::Retryable(_) => "retryable capture lifecycle",
-                CaptureStatus::Cancelled(_) => "cancelled capture",
-                CaptureStatus::SaveRequested(SaveDisposition::Signalled) => unreachable!(),
-            }));
+        let mut state = self.lock()?;
+        let candidate_id = match &capture.candidate {
+            Some(candidate) => Some(persist_candidate(
+                &mut state,
+                &self.session,
+                &CandidateRecord {
+                    candidate: candidate.clone(),
+                    final_labels: capture.final_labels.clone(),
+                },
+            )?),
+            None => None,
         };
-        if capture.kind != CaptureKind::AutoRoundEnd {
-            return Err(LiveDiagnostic::Unsupported(
-                "manual flag to save-attempt relationship",
+        if capture.status == CaptureStatus::Scheduled {
+            return Ok(());
+        }
+        if matches!(capture.status, CaptureStatus::Cancelled(_))
+            && !state.save_attempts.contains_key(&capture.id)
+        {
+            return Ok(());
+        }
+        let window = capture
+            .window
+            .ok_or(LiveDiagnostic::Unsupported("capture window"))?;
+        let requested_at_ms = capture
+            .raw_coverage
+            .map_or(window.requested_at_ms, |coverage| coverage.end_ms);
+        let attempt = ensure_attempt(&mut state, &self.session, capture, requested_at_ms)?;
+        if let Some(candidate_id) = candidate_id {
+            join_candidate_once(&mut state, &candidate_id, &attempt, window)?;
+        }
+        if capture.kind == CaptureKind::ManualFlag {
+            ensure_manual_flag(&mut state, &self.session, capture, window)?;
+            return Err(LiveDiagnostic::StorageRequirement(
+                MANUAL_FLAG_SAVE_JOIN_REQUIREMENT,
             ));
         }
-        let candidate = capture
-            .candidate
-            .as_ref()
-            .ok_or(LiveDiagnostic::Unsupported(
-                "auto capture without candidate",
-            ))?;
-        let window = capture.window.ok_or(LiveDiagnostic::Unsupported(
-            "save request without capture window",
-        ))?;
-        let requested_at_ms = capture.raw_coverage.map(|coverage| coverage.end_ms).ok_or(
-            LiveDiagnostic::Unsupported("save request without raw coverage"),
-        )?;
-        let record = CandidateRecord {
-            candidate: candidate.clone(),
-            final_labels: capture.final_labels.clone(),
-        };
-        let mut state = self.lock()?;
-        let candidate_id = persist_candidate(&mut state, &self.session, &record)?;
-        let requested_ns = millis_u64_to_nanos(requested_at_ms)?;
-        let attempt = state
-            .storage
-            .request_save(&self.session, &capture.id, requested_ns)
-            .map_err(persistence)?;
-        state
-            .storage
-            .join_candidate_save(
-                &candidate_id,
-                &attempt,
-                millis_u64_to_nanos(window.desired.start_ms)?,
-                millis_u64_to_nanos(window.desired.end_ms)?,
-            )
-            .map_err(persistence)?;
-        state.save_attempts.insert(capture.id.clone(), attempt);
+        match &capture.status {
+            CaptureStatus::Requesting
+            | CaptureStatus::SaveRequested(SaveDisposition::Signalled) => {}
+            CaptureStatus::SaveRequested(SaveDisposition::Coalesced) => state
+                .storage
+                .acknowledge_save(&attempt)
+                .map_err(persistence)?,
+            CaptureStatus::Retryable(message) => {
+                state
+                    .storage
+                    .fail_save(&attempt, message)
+                    .map_err(persistence)?;
+                if let Some(metadata) = state.save_attempts.get_mut(&capture.id) {
+                    metadata.failed = true;
+                }
+            }
+            CaptureStatus::Cancelled(reason) => {
+                state
+                    .storage
+                    .fail_save(&attempt, &format!("cancelled:{reason:?}"))
+                    .map_err(persistence)?;
+                if let Some(metadata) = state.save_attempts.get_mut(&capture.id) {
+                    metadata.failed = true;
+                }
+            }
+            CaptureStatus::Scheduled => unreachable!(),
+        }
         Ok(())
     }
 }
@@ -175,6 +205,7 @@ impl StorageEvidenceStore {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn persist_candidate(
     state: &mut State,
     session: &CaptureSessionId,
@@ -192,17 +223,38 @@ fn persist_candidate(
         ));
     }
     if let Some(existing) = state.candidates.get(&candidate.round_id) {
-        if existing.record == *record {
-            return Ok(existing.id.clone());
+        let id = existing.id.clone();
+        let mut persisted = existing.trigger_receipts.clone();
+        for receipt_id in &candidate.receipt_ids {
+            if persisted.contains(receipt_id) {
+                continue;
+            }
+            let receipt = state
+                .receipts
+                .get(receipt_id)
+                .ok_or(LiveDiagnostic::Unsupported(
+                    "candidate receipt is not hydrated in this adapter",
+                ))?;
+            let trigger = receipt
+                .trigger
+                .ok_or(LiveDiagnostic::Unsupported("candidate receipt trigger"))?;
+            state
+                .storage
+                .add_candidate_trigger(
+                    &id,
+                    &receipt.snapshot_sha256,
+                    receipt.sequence,
+                    trigger_name(trigger),
+                    receipt.received_at_ns,
+                )
+                .map_err(persistence)?;
+            persisted.insert(receipt_id.clone());
         }
-        return Err(LiveDiagnostic::Unsupported(
-            "candidate mutation cannot be represented by the insert-only seam",
-        ));
-    }
-    if candidate.receipt_ids.len() != 1 || candidate.triggers.len() != 1 {
-        return Err(LiveDiagnostic::Unsupported(
-            "candidate receipts and triggers lack a lossless association",
-        ));
+        if let Some(existing) = state.candidates.get_mut(&candidate.round_id) {
+            existing.record = record.clone();
+            existing.trigger_receipts = persisted;
+        }
+        return Ok(id);
     }
     let receipt_id = candidate
         .receipt_ids
@@ -215,9 +267,9 @@ fn persist_candidate(
         .ok_or(LiveDiagnostic::Unsupported(
             "candidate receipt is not hydrated in this adapter",
         ))?;
-    let trigger = *candidate
-        .triggers
-        .first()
+    let trigger = receipt
+        .trigger
+        .or_else(|| candidate.triggers.first().copied())
         .ok_or(LiveDiagnostic::Unsupported("candidate without trigger"))?;
     let (observed_map, observed_round) = parse_round_id(&candidate.round_id)?;
     let id = state
@@ -234,24 +286,127 @@ fn persist_candidate(
             millis_u64_to_nanos(candidate.range.end_ms)?,
         )
         .map_err(persistence)?;
-    state
-        .storage
-        .add_candidate_trigger(
-            &id,
-            &receipt.snapshot_sha256,
-            receipt.sequence,
-            trigger_name(trigger),
-            receipt.received_at_ns,
-        )
-        .map_err(persistence)?;
+    let mut trigger_receipts = HashSet::new();
+    for receipt_id in &candidate.receipt_ids {
+        let receipt = state
+            .receipts
+            .get(receipt_id)
+            .ok_or(LiveDiagnostic::Unsupported(
+                "candidate receipt is not hydrated in this adapter",
+            ))?;
+        let trigger = receipt
+            .trigger
+            .ok_or(LiveDiagnostic::Unsupported("candidate receipt trigger"))?;
+        state
+            .storage
+            .add_candidate_trigger(
+                &id,
+                &receipt.snapshot_sha256,
+                receipt.sequence,
+                trigger_name(trigger),
+                receipt.received_at_ns,
+            )
+            .map_err(persistence)?;
+        trigger_receipts.insert(receipt_id.clone());
+    }
     state.candidates.insert(
         candidate.round_id.clone(),
         CandidateMetadata {
             id: id.clone(),
             record: record.clone(),
+            trigger_receipts,
         },
     );
     Ok(id)
+}
+
+fn ensure_attempt(
+    state: &mut State,
+    session: &CaptureSessionId,
+    capture: &CaptureRecord,
+    requested_at_ms: u64,
+) -> Result<SaveAttemptId, LiveDiagnostic> {
+    if let Some(existing) = state.save_attempts.get(&capture.id)
+        && !existing.failed
+    {
+        return Ok(existing.id.clone());
+    }
+    let generation = state
+        .save_attempts
+        .get(&capture.id)
+        .map_or(0, |existing| existing.generation.saturating_add(1));
+    let request_id = if generation == 0 {
+        capture.id.clone()
+    } else {
+        format!("{}:retry:{generation}", capture.id)
+    };
+    let attempt = state
+        .storage
+        .request_save(session, &request_id, millis_u64_to_nanos(requested_at_ms)?)
+        .map_err(persistence)?;
+    state.save_attempts.insert(
+        capture.id.clone(),
+        SaveAttemptMetadata {
+            id: attempt.clone(),
+            generation,
+            failed: false,
+        },
+    );
+    Ok(attempt)
+}
+
+fn join_candidate_once(
+    state: &mut State,
+    candidate: &LiveCandidateId,
+    attempt: &SaveAttemptId,
+    window: openfrag_domain::CaptureWindow,
+) -> Result<(), LiveDiagnostic> {
+    let key = (candidate.as_str().to_owned(), attempt.as_str().to_owned());
+    if state.candidate_joins.contains(&key) {
+        return Ok(());
+    }
+    state
+        .storage
+        .join_candidate_save(
+            candidate,
+            attempt,
+            millis_u64_to_nanos(window.desired.start_ms)?,
+            millis_u64_to_nanos(window.desired.end_ms)?,
+        )
+        .map_err(persistence)?;
+    state.candidate_joins.insert(key);
+    Ok(())
+}
+
+fn ensure_manual_flag(
+    state: &mut State,
+    session: &CaptureSessionId,
+    capture: &CaptureRecord,
+    window: openfrag_domain::CaptureWindow,
+) -> Result<ManualFlagId, LiveDiagnostic> {
+    if let Some(flag) = state.manual_flags.get(&capture.id) {
+        return Ok(flag.clone());
+    }
+    let flag = state
+        .storage
+        .create_manual_flag(session, millis_u64_to_nanos(window.requested_at_ms)?)
+        .map_err(persistence)?;
+    state.manual_flags.insert(capture.id.clone(), flag.clone());
+    Ok(flag)
+}
+
+fn receipt_trigger(receipt: &EvidenceReceipt) -> Option<CandidateTrigger> {
+    receipt.facts.iter().find_map(|fact| match fact {
+        openfrag_gsi::TransitionFact::RoundKillDelta { current, delta, .. }
+            if *current >= 3 && *delta > 0 =>
+        {
+            Some(CandidateTrigger::KillMilestone)
+        }
+        openfrag_gsi::TransitionFact::RoundEnd { .. } => {
+            Some(CandidateTrigger::OfficialRoundEndCapture)
+        }
+        _ => None,
+    })
 }
 
 fn parse_round_id(round_id: &str) -> Result<(&str, i64), LiveDiagnostic> {
