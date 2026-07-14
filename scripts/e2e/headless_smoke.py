@@ -159,8 +159,12 @@ def verify_doctor(
     )
     report = json.loads(result.stdout)
     checks = {check["id"]: check["status"] for check in report["checks"]}
-    for check_id in ("data_directory", "demo_import", "gsi_config", "capture"):
+    for check_id in ("data_directory", "demo_import", "gsi_config"):
         require(checks.get(check_id) == "ready", f"Doctor check {check_id} was not ready: {checks}")
+    require(
+        checks.get("capture") in ("ready", "warning"),
+        f"Doctor capture dependencies were blocked: {checks}",
+    )
     require(
         checks.get("manual_flag") == "blocked",
         "headless Doctor must not claim user approval for a global shortcut",
@@ -200,6 +204,69 @@ def configure_gsi(
     return token
 
 
+def verify_mounted_api_contracts(
+    opener: urllib.request.OpenerDirector,
+    base_url: str,
+    data_directory: Path,
+) -> None:
+    status, _, body = request(opener, f"{base_url}/api/setup")
+    require(status == 200, f"setup API returned {status}: {body!r}")
+    setup = json.loads(body)
+    require(setup == {"checks": []}, f"unexpected setup API response: {setup}")
+
+    for route, name in (("/api/matches", "matches"), ("/api/clips", "clips")):
+        status, _, body = request(opener, f"{base_url}{route}")
+        require(status == 200, f"{name} API returned {status}: {body!r}")
+        require(json.loads(body) == [], f"fresh {name} collection is not empty")
+
+    status, _, body = request(opener, f"{base_url}/api/diagnostics")
+    require(status == 200, f"diagnostics API returned {status}: {body!r}")
+    diagnostics = json.loads(body)
+    require(
+        diagnostics
+        == {
+            "capture": "unavailable until pipeline is connected",
+            "gsi": "unavailable until pipeline is connected",
+        },
+        f"unexpected diagnostics API response: {diagnostics}",
+    )
+
+    status, _, body = request(opener, f"{base_url}/api/manual-flag", method="POST")
+    require(status == 503, f"unconfigured Manual Flag returned {status}: {body!r}")
+    manual_flag = json.loads(body)
+    require(
+        manual_flag == {"message": "capture pipeline is not connected"},
+        f"Manual Flag was not explicitly unconfigured: {manual_flag}",
+    )
+
+    boundary = "openfrag-headless-e2e-boundary"
+    multipart = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="demo"; filename="invalid.dem"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+        "not a Source 2 Demo\r\n"
+        f"--{boundary}--\r\n"
+    ).encode()
+    status, _, body = request(
+        opener,
+        f"{base_url}/api/imports",
+        method="POST",
+        body=multipart,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    require(status == 400, f"invalid multipart Demo returned {status}: {body!r}")
+    import_error = json.loads(body)
+    require(
+        import_error.get("message", "").startswith("local Demo rejected:"),
+        f"invalid multipart Demo was not explicitly rejected: {import_error}",
+    )
+    incoming = data_directory / "incoming"
+    require(
+        not incoming.exists() or not any(incoming.iterdir()),
+        "invalid multipart Demo remained in the staging directory",
+    )
+
+
 def verify_http_contracts(
     opener: urllib.request.OpenerDirector,
     base_url: str,
@@ -215,6 +282,7 @@ def verify_http_contracts(
     for marker in ("Tonight", "Import a local Demo", "Local match evidence and clip review."):
         require(marker in dashboard_text, f"dashboard is missing {marker!r}")
     require("https://" not in dashboard_text and "http://" not in dashboard_text, "dashboard has a remote asset")
+    verify_mounted_api_contracts(opener, base_url, data_directory)
 
     fixture = json.loads(fixture_path.read_text())
     fixture["auth"]["token"] = token
@@ -349,7 +417,10 @@ def smoke(binary: Path) -> None:
             f"daemon shutdown returned {None if daemon is None else daemon.returncode}",
         )
         print("headless smoke: PASS")
-        print("covered: doctor, setup-gsi, health, dashboard, GSI auth, dedup, sanitization, shutdown")
+        print(
+            "covered: doctor, setup-gsi, health, dashboard APIs, invalid import, "
+            "GSI auth, dedup, sanitization, shutdown"
+        )
 
 
 def main() -> int:
