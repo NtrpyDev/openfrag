@@ -2,6 +2,10 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+mod capture_config;
+
+pub use capture_config::*;
+
 use serde::Serialize;
 use std::{
     ffi::OsString,
