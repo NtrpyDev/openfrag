@@ -340,6 +340,7 @@ pub struct DiscoveredHost {
     pub native_recorder: Discovery,
     pub flatpak_recorder: Discovery,
     pub ffmpeg: Discovery,
+    pub ffprobe: Discovery,
     pub audio: Discovery,
     pub session: SessionKind,
     pub portal_service: Discovery,
@@ -420,6 +421,7 @@ impl<E: ProbeEnvironment, F: ProbeFilesystem, C: ProbeCommands> HostProbe for Sy
         cs2_cfg_candidates.dedup();
         let native_recorder = available_executable(&self.filesystem, "gpu-screen-recorder");
         let ffmpeg = available_executable(&self.filesystem, "ffmpeg");
+        let ffprobe = available_executable(&self.filesystem, "ffprobe");
         let flatpak_recorder = command_discovery(
             &self.commands,
             "flatpak",
@@ -475,6 +477,7 @@ impl<E: ProbeEnvironment, F: ProbeFilesystem, C: ProbeCommands> HostProbe for Sy
             native_recorder,
             flatpak_recorder,
             ffmpeg,
+            ffprobe,
             audio,
             session,
             portal_service,
@@ -683,6 +686,8 @@ mod discovery_tests {
         let discovered = SystemProbe::new(Env, Fs, Commands).discover();
         assert!(discovered.cs2_cfg_candidates.is_empty());
         assert!(matches!(discovered.data_directory, Discovery::Unknown(_)));
+        assert!(matches!(discovered.ffmpeg, Discovery::Missing(_)));
+        assert!(matches!(discovered.ffprobe, Discovery::Missing(_)));
         let facts = HostFacts::from(&discovered);
         assert!(facts.cs2_cfg_directory.is_none());
         assert!(!facts.global_shortcuts_portal);
