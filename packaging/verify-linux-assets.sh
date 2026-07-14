@@ -8,6 +8,8 @@ desktop="$root/linux/openfrag.desktop"
 helper="$root/linux/openfrag-open-dashboard"
 installer="$root/install-user.sh"
 install_verifier="$root/verify-user-install.sh"
+release_builder="$root/build-release-bundle.sh"
+release_verifier="$root/verify-release-bundle.sh"
 
 require_line() {
     grep -Fqx -- "$2" "$1" || { printf 'missing required line: %s\n' "$2" >&2; exit 1; }
@@ -41,8 +43,11 @@ fi
 bash -n "$helper"
 bash -n "$installer"
 bash -n "$install_verifier"
+bash -n "$release_builder"
+bash -n "$release_verifier"
 if command -v desktop-file-validate >/dev/null 2>&1; then
     desktop-file-validate "$desktop"
 fi
 "$install_verifier"
+"$release_verifier"
 printf '%s\n' 'Linux packaging assets passed headless verification.'
