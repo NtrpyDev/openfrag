@@ -17,6 +17,7 @@ const IMPORT_LIFECYCLE_MIGRATION: &str = include_str!("../migrations/0004_import
 const RATING_AVAILABILITY_MIGRATION: &str =
     include_str!("../migrations/0005_rating_availability.sql");
 const CLIP_REVIEW_MIGRATION: &str = include_str!("../migrations/0006_clip_review.sql");
+const CLIP_MODEL_MIGRATION: &str = include_str!("../migrations/0007_clip_model.sql");
 
 #[derive(Debug)]
 pub enum Error {
@@ -26,6 +27,7 @@ pub enum Error {
     NotFound(&'static str),
     IllegalTransition(&'static str),
     Conflict(&'static str),
+    Unavailable(&'static str),
 }
 
 impl From<rusqlite::Error> for Error {
@@ -279,6 +281,82 @@ pub struct ClipArtifactRecord {
     pub media_type: Option<String>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableClipOriginRecord {
+    Auto {
+        trigger_receipts: Vec<String>,
+        evidence_receipts: Vec<String>,
+    },
+    Manual {
+        flag_receipt_id: String,
+        flag_time_ms: u64,
+        overlapping_auto_receipts: Vec<String>,
+    },
+}
+#[derive(Clone, Copy, Debug)]
+pub enum DurableClipOriginInput<'a> {
+    Auto {
+        trigger_receipts: &'a [String],
+        evidence_receipts: &'a [String],
+    },
+    Manual {
+        flag_receipt_id: &'a str,
+        flag_time_ms: u64,
+        overlapping_auto_receipts: &'a [String],
+    },
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableClipModelRecord {
+    pub detail: ClipDetailRecord,
+    pub artifact: ClipArtifactRecord,
+    pub capture_session_id: String,
+    pub duration_ms: u64,
+    pub revision: u64,
+    pub origin: DurableClipOriginRecord,
+}
+#[derive(Debug)]
+pub struct DerivativeClipCommit<'a> {
+    pub source_clip_id: &'a str,
+    pub staged: StagedArtifact,
+    pub extension: &'a str,
+    pub media_type: Option<&'a str>,
+    pub duration_ms: u64,
+    pub trim_start_ms: u64,
+    pub trim_end_ms: u64,
+    pub title: &'a str,
+    pub note: &'a str,
+    pub tags: &'a [String],
+    pub favorite: bool,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipExportStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipExportRecord {
+    pub id: String,
+    pub clip_id: String,
+    pub target_path: String,
+    pub status: ClipExportStatus,
+    pub error_code: Option<String>,
+    pub output_sha256: Option<String>,
+    pub output_byte_length: Option<u64>,
+    pub output_media_profile: Option<String>,
+}
+impl ClipExportStatus {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            _ => Err(Error::Invalid("clip export status")),
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryResult {
     pub removed_staging_files: usize,
     pub marked_missing: usize,
@@ -473,6 +551,7 @@ impl Storage {
             )?;
         }
         ensure_migration(&self.connection, 6, CLIP_REVIEW_MIGRATION)?;
+        ensure_migration(&self.connection, 7, CLIP_MODEL_MIGRATION)?;
         Ok(())
     }
     pub fn stage_artifact(&self, bytes: &[u8]) -> Result<StagedArtifact> {
@@ -886,6 +965,49 @@ impl Storage {
         self.connection.execute("INSERT INTO manual_flags(id,capture_session_id,flagged_monotonic_ns,created_at_ms) VALUES(?,?,?,?)",params![id.as_str(),session.as_str(),monotonic_ns,now_ms()])?;
         Ok(id)
     }
+    pub fn complete_clip_model_metadata(
+        &self,
+        clip_id: &str,
+        duration_ms: u64,
+        origin: DurableClipOriginInput<'_>,
+    ) -> Result<()> {
+        let duration_ms = positive_i64(duration_ms, "clip duration")?;
+        validate_origin(origin)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let artifact: Option<String> = transaction
+            .query_row(
+                "SELECT artifact_sha256 FROM clips WHERE id=? AND disposition<>'deleted'",
+                [clip_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let artifact = artifact.ok_or(Error::NotFound("live clip"))?;
+        let changed = transaction.execute(
+            "UPDATE artifacts SET media_duration_ms=? WHERE sha256=? AND (media_duration_ms IS NULL OR media_duration_ms=?)",
+            params![duration_ms, artifact, duration_ms],
+        )?;
+        if changed == 0 {
+            return Err(Error::Conflict("verified media duration"));
+        }
+        let (kind, flag_time) = match origin {
+            DurableClipOriginInput::Auto { .. } => ("auto", None),
+            DurableClipOriginInput::Manual { flag_time_ms, .. } => (
+                "manual",
+                Some(i64::try_from(flag_time_ms).map_err(|_| Error::Invalid("flag time"))?),
+            ),
+        };
+        transaction.execute(
+            "UPDATE clips SET origin_kind=?,manual_flag_time_ms=?,review_revision=COALESCE(review_revision,0) WHERE id=? AND disposition<>'deleted'",
+            params![kind, flag_time, clip_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM clip_origin_receipts WHERE clip_id=?",
+            [clip_id],
+        )?;
+        insert_origin_receipts(&transaction, clip_id, origin)?;
+        transaction.commit()?;
+        Ok(())
+    }
     pub fn set_clip_review(
         &self,
         clip: &ClipId,
@@ -898,7 +1020,7 @@ impl Storage {
         } else {
             ClipReviewDecision::Pending
         };
-        let changed=self.connection.execute("UPDATE clips SET disposition=?, title=?, favorite=?, review_decision=? WHERE id=? AND disposition <> 'deleted'",params![disposition.as_str(),title,i64::from(favorite),review_decision.as_str(),clip.as_str()])?;
+        let changed=self.connection.execute("UPDATE clips SET disposition=?, title=?, favorite=?, review_decision=?, review_revision=CASE WHEN review_revision IS NULL THEN NULL ELSE review_revision+1 END WHERE id=? AND disposition <> 'deleted'",params![disposition.as_str(),title,i64::from(favorite),review_decision.as_str(),clip.as_str()])?;
         if changed == 0 {
             return Err(Error::IllegalTransition("clip missing or deleted"));
         }
@@ -932,7 +1054,7 @@ impl Storage {
             ClipReviewDecision::Pending | ClipReviewDecision::Reject => ClipDisposition::InReview,
         };
         let changed = transaction.execute(
-            "UPDATE clips SET disposition=?,title=?,note=?,favorite=?,review_decision=? WHERE id=? AND disposition<>'deleted'",
+            "UPDATE clips SET disposition=?,title=?,note=?,favorite=?,review_decision=?,review_revision=CASE WHEN review_revision IS NULL THEN NULL ELSE review_revision+1 END WHERE id=? AND disposition<>'deleted'",
             params![
                 disposition.as_str(),
                 title,
@@ -957,6 +1079,53 @@ impl Storage {
         transaction.commit()?;
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
+    pub fn compare_and_swap_clip_review(
+        &self,
+        clip_id: &str,
+        expected_revision: u64,
+        title: Option<&str>,
+        note: Option<&str>,
+        tags: &[String],
+        decision: ClipReviewDecision,
+        favorite: bool,
+    ) -> Result<u64> {
+        validate_review_metadata(title, note, tags)?;
+        let expected =
+            i64::try_from(expected_revision).map_err(|_| Error::Invalid("clip review revision"))?;
+        let next = expected
+            .checked_add(1)
+            .ok_or(Error::Invalid("clip review revision"))?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let disposition = match decision {
+            ClipReviewDecision::Keep => ClipDisposition::Kept,
+            ClipReviewDecision::Pending | ClipReviewDecision::Reject => ClipDisposition::InReview,
+        };
+        let changed = transaction.execute(
+            "UPDATE clips SET disposition=?,title=?,note=?,favorite=?,review_decision=?,review_revision=? WHERE id=? AND disposition<>'deleted' AND review_revision=?",
+            params![
+                disposition.as_str(), title, note, i64::from(favorite), decision.as_str(), next,
+                clip_id, expected
+            ],
+        )?;
+        if changed == 0 {
+            let revision: Option<Option<i64>> = transaction
+                .query_row(
+                    "SELECT review_revision FROM clips WHERE id=? AND disposition<>'deleted'",
+                    [clip_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            return match revision {
+                None => Err(Error::NotFound("live clip")),
+                Some(None) => Err(Error::Unavailable("clip review revision")),
+                Some(Some(_)) => Err(Error::Conflict("clip review revision")),
+            };
+        }
+        replace_clip_tags(&transaction, clip_id, tags)?;
+        transaction.commit()?;
+        u64::try_from(next).map_err(|_| Error::Invalid("clip review revision"))
+    }
     pub fn derive_clip(
         &self,
         derived: &ClipId,
@@ -971,10 +1140,159 @@ impl Storage {
         }
         Ok(())
     }
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn commit_clip_derivative(&self, request: DerivativeClipCommit<'_>) -> Result<ClipId> {
+        validate_review_metadata(Some(request.title), Some(request.note), request.tags)?;
+        if request.trim_start_ms >= request.trim_end_ms {
+            return Err(Error::Invalid("clip derivative trim"));
+        }
+        let source = self.durable_clip_model(request.source_clip_id)?;
+        if request.trim_end_ms > source.duration_ms {
+            return Err(Error::Invalid("clip derivative trim"));
+        }
+        if self.artifact(&request.staged.sha256).is_ok() {
+            return Err(Error::Conflict("derivative artifact already exists"));
+        }
+        if request.extension.contains('/') || request.extension.contains('\\') {
+            return Err(Error::Invalid("unsafe extension"));
+        }
+        let duration = positive_i64(request.duration_ms, "clip duration")?;
+        let start = i64::try_from(request.trim_start_ms)
+            .map_err(|_| Error::Invalid("clip derivative trim"))?;
+        let end = i64::try_from(request.trim_end_ms)
+            .map_err(|_| Error::Invalid("clip derivative trim"))?;
+        let bytes = i64::try_from(request.staged.byte_length)
+            .map_err(|_| Error::Invalid("artifact too large"))?;
+        let prefix = &request.staged.sha256[..2];
+        let relative = format!(
+            "artifacts/sha256/{prefix}/{}.{}",
+            request.staged.sha256,
+            request.extension.trim_start_matches('.')
+        );
+        let target = self.layout.root.join(&relative);
+        let parent = target.parent().ok_or(Error::Invalid("artifact path"))?;
+        fs::create_dir_all(parent)?;
+        if target.exists() {
+            return Err(Error::Conflict("derivative artifact target"));
+        }
+        fs::rename(&request.staged.path, &target)?;
+        set_file_private_permissions(&target)?;
+        sync_parent(&target)?;
+        let result = (|| -> Result<ClipId> {
+            let transaction = self.connection.unchecked_transaction()?;
+            transaction.execute(
+                "INSERT INTO artifacts(sha256,relative_path,byte_length,media_type,availability,created_at_ms,media_duration_ms) VALUES(?,?,?,?, 'present', ?, ?)",
+                params![request.staged.sha256, relative, bytes, request.media_type, now_ms(), duration],
+            )?;
+            let derived = ClipId::new();
+            let (origin_kind, flag_time) = match &source.origin {
+                DurableClipOriginRecord::Auto { .. } => ("auto", None),
+                DurableClipOriginRecord::Manual { flag_time_ms, .. } => (
+                    "manual",
+                    Some(i64::try_from(*flag_time_ms).map_err(|_| Error::Invalid("flag time"))?),
+                ),
+            };
+            transaction.execute(
+                "INSERT INTO clips(id,artifact_sha256,capture_session_id,disposition,title,favorite,provenance,created_at_ms,recorded_at_ms,pre_roll_truncated,retention_class,note,review_decision,review_revision,origin_kind,manual_flag_time_ms) VALUES(?,?,?,'kept',?,?,'trim_derivative',?,?,?,?,?,'keep',0,?,?)",
+                params![
+                    derived.as_str(), request.staged.sha256, source.capture_session_id,
+                    request.title, i64::from(request.favorite), now_ms(),
+                    source.detail.summary.recorded_at_ms, i64::from(source.detail.pre_roll_truncated),
+                    source.detail.retention_class, request.note, origin_kind, flag_time
+                ],
+            )?;
+            replace_clip_tags(&transaction, derived.as_str(), request.tags)?;
+            transaction.execute(
+                "INSERT INTO clip_origin_receipts(clip_id,kind,position,receipt_id) SELECT ?,kind,position,receipt_id FROM clip_origin_receipts WHERE clip_id=?",
+                params![derived.as_str(), request.source_clip_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO clip_derivations(derived_clip_id,source_clip_id,operation,trim_start_ms,trim_end_ms,created_at_ms) VALUES(?,?,'trim',?,?,?)",
+                params![derived.as_str(), request.source_clip_id, start, end, now_ms()],
+            )?;
+            transaction.commit()?;
+            Ok(derived)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&target);
+            let _ = sync_parent(&target);
+        }
+        result
+    }
     pub fn enqueue_export(&self, clip: &ClipId, target: &str) -> Result<ExportId> {
+        if target.is_empty() {
+            return Err(Error::Invalid("clip export target"));
+        }
         let id = ExportId::new();
         self.connection.execute("INSERT INTO clip_exports(id,clip_id,target_path,requested_at_ms,status) VALUES(?,?,?,?, 'queued')",params![id.as_str(),clip.as_str(),target,now_ms()])?;
         Ok(id)
+    }
+    pub fn begin_clip_export(&self, export: &ExportId) -> Result<()> {
+        let changed = self.connection.execute(
+            "UPDATE clip_exports SET status='running' WHERE id=? AND status='queued'",
+            [export.as_str()],
+        )?;
+        if changed == 0 {
+            return Err(Error::IllegalTransition("clip export begin"));
+        }
+        Ok(())
+    }
+    pub fn succeed_clip_export(
+        &self,
+        export: &ExportId,
+        output_sha256: &str,
+        output_byte_length: u64,
+        output_media_profile: &str,
+    ) -> Result<()> {
+        if output_sha256.len() != 64 || output_media_profile.is_empty() {
+            return Err(Error::Invalid("clip export output"));
+        }
+        let output_byte_length =
+            i64::try_from(output_byte_length).map_err(|_| Error::Invalid("clip export output"))?;
+        let changed = self.connection.execute(
+            "UPDATE clip_exports SET status='succeeded',completed_at_ms=?,error_code=NULL,output_sha256=?,output_byte_length=?,output_media_profile=? WHERE id=? AND status='running'",
+            params![now_ms(), output_sha256, output_byte_length, output_media_profile, export.as_str()],
+        )?;
+        if changed == 0 {
+            return Err(Error::IllegalTransition("clip export succeed"));
+        }
+        Ok(())
+    }
+    pub fn fail_clip_export(&self, export: &ExportId, error_code: &str) -> Result<()> {
+        if error_code.is_empty() {
+            return Err(Error::Invalid("clip export error"));
+        }
+        let changed = self.connection.execute(
+            "UPDATE clip_exports SET status='failed',completed_at_ms=?,error_code=? WHERE id=? AND status IN ('queued','running')",
+            params![now_ms(), error_code, export.as_str()],
+        )?;
+        if changed == 0 {
+            return Err(Error::IllegalTransition("clip export fail"));
+        }
+        Ok(())
+    }
+    #[allow(clippy::type_complexity)]
+    pub fn clip_export(&self, export: &ExportId) -> Result<ClipExportRecord> {
+        let row: Option<(String,String,String,String,Option<String>,Option<String>,Option<i64>,Option<String>)> = self.connection.query_row(
+            "SELECT id,clip_id,target_path,status,error_code,output_sha256,output_byte_length,output_media_profile FROM clip_exports WHERE id=?",
+            [export.as_str()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
+        ).optional()?;
+        let (id, clip_id, target_path, status, error_code, output_sha256, bytes, profile) =
+            row.ok_or(Error::NotFound("clip export"))?;
+        Ok(ClipExportRecord {
+            id,
+            clip_id,
+            target_path,
+            status: ClipExportStatus::parse(&status)?,
+            error_code,
+            output_sha256,
+            output_byte_length: bytes
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| Error::Invalid("clip export output"))?,
+            output_media_profile: profile,
+        })
     }
     pub fn request_save(
         &self,
@@ -1400,6 +1718,77 @@ impl Storage {
         })
     }
 
+    #[allow(clippy::type_complexity)]
+    pub fn durable_clip_model(&self, id: &str) -> Result<DurableClipModelRecord> {
+        let detail = self.clip_detail(id)?;
+        let artifact = self.clip_artifact_file(id)?;
+        let row: Option<(String, Option<i64>, Option<i64>, Option<String>)> = self
+            .connection
+            .query_row(
+                "SELECT c.capture_session_id,c.review_revision,a.media_duration_ms,c.origin_kind FROM clips c JOIN artifacts a ON a.sha256=c.artifact_sha256 WHERE c.id=? AND c.disposition<>'deleted'",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let (capture_session_id, revision, duration, origin_kind) =
+            row.ok_or(Error::NotFound("live clip"))?;
+        let revision = revision.ok_or(Error::Unavailable("clip review revision"))?;
+        let duration = duration.ok_or(Error::Unavailable("verified media duration"))?;
+        let origin_kind = origin_kind.ok_or(Error::Unavailable("clip origin evidence"))?;
+        let origin = match origin_kind.as_str() {
+            "auto" => {
+                let trigger_receipts = self.origin_receipts(id, "trigger")?;
+                let evidence_receipts = self.origin_receipts(id, "evidence")?;
+                if trigger_receipts.is_empty() || evidence_receipts.is_empty() {
+                    return Err(Error::Unavailable("clip origin evidence"));
+                }
+                DurableClipOriginRecord::Auto {
+                    trigger_receipts,
+                    evidence_receipts,
+                }
+            }
+            "manual" => {
+                let manual = self.origin_receipts(id, "manual_flag")?;
+                let [flag_receipt_id] = manual.as_slice() else {
+                    return Err(Error::Unavailable("clip origin evidence"));
+                };
+                let flag_time_ms: Option<i64> = self.connection.query_row(
+                    "SELECT manual_flag_time_ms FROM clips WHERE id=?",
+                    [id],
+                    |row| row.get(0),
+                )?;
+                let flag_time_ms = flag_time_ms.ok_or(Error::Unavailable("clip flag time"))?;
+                DurableClipOriginRecord::Manual {
+                    flag_receipt_id: flag_receipt_id.clone(),
+                    flag_time_ms: u64::try_from(flag_time_ms)
+                        .map_err(|_| Error::Invalid("clip flag time"))?,
+                    overlapping_auto_receipts: self.origin_receipts(id, "overlapping_auto")?,
+                }
+            }
+            _ => return Err(Error::Invalid("clip origin kind")),
+        };
+        Ok(DurableClipModelRecord {
+            detail,
+            artifact,
+            capture_session_id,
+            duration_ms: u64::try_from(duration)
+                .map_err(|_| Error::Invalid("verified media duration"))?,
+            revision: u64::try_from(revision)
+                .map_err(|_| Error::Invalid("clip review revision"))?,
+            origin,
+        })
+    }
+
+    fn origin_receipts(&self, clip_id: &str, kind: &str) -> Result<Vec<String>> {
+        Ok(self
+            .connection
+            .prepare(
+                "SELECT receipt_id FROM clip_origin_receipts WHERE clip_id=? AND kind=? ORDER BY position",
+            )?
+            .query_map(params![clip_id, kind], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     fn safe_artifact_path(
         &self,
         sha256: &str,
@@ -1560,6 +1949,134 @@ pub struct AnalysisIdentity<'a> {
     pub metric_definition_version: &'a str,
     pub formula_id: &'a str,
     pub evidence_semantics_epoch: &'a str,
+}
+
+fn positive_i64(value: u64, field: &'static str) -> Result<i64> {
+    if value == 0 {
+        return Err(Error::Invalid(field));
+    }
+    i64::try_from(value).map_err(|_| Error::Invalid(field))
+}
+
+fn validate_review_metadata(
+    title: Option<&str>,
+    note: Option<&str>,
+    tags: &[String],
+) -> Result<()> {
+    if title.is_some_and(|value| value.len() > 200)
+        || note.is_some_and(|value| value.len() > 4_000)
+        || tags.len() > 32
+    {
+        return Err(Error::Invalid("clip review metadata limits"));
+    }
+    let mut unique = HashSet::with_capacity(tags.len());
+    if tags
+        .iter()
+        .any(|tag| tag.trim().is_empty() || tag.len() > 64 || !unique.insert(tag.as_str()))
+    {
+        return Err(Error::Invalid("clip tags"));
+    }
+    Ok(())
+}
+
+fn replace_clip_tags(
+    transaction: &rusqlite::Transaction<'_>,
+    clip_id: &str,
+    tags: &[String],
+) -> Result<()> {
+    transaction.execute("DELETE FROM clip_tags WHERE clip_id=?", [clip_id])?;
+    for (position, tag) in tags.iter().enumerate() {
+        let position = i64::try_from(position).map_err(|_| Error::Invalid("clip tag position"))?;
+        transaction.execute(
+            "INSERT INTO clip_tags(clip_id,position,tag) VALUES(?,?,?)",
+            params![clip_id, position, tag],
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_origin(origin: DurableClipOriginInput<'_>) -> Result<()> {
+    let validate_group = |receipts: &[String], required: bool| -> Result<()> {
+        if required && receipts.is_empty() {
+            return Err(Error::Invalid("clip origin evidence"));
+        }
+        let mut unique = HashSet::with_capacity(receipts.len());
+        if receipts
+            .iter()
+            .any(|receipt| receipt.trim().is_empty() || !unique.insert(receipt.as_str()))
+        {
+            return Err(Error::Invalid("clip origin evidence"));
+        }
+        Ok(())
+    };
+    match origin {
+        DurableClipOriginInput::Auto {
+            trigger_receipts,
+            evidence_receipts,
+        } => {
+            validate_group(trigger_receipts, true)?;
+            validate_group(evidence_receipts, true)
+        }
+        DurableClipOriginInput::Manual {
+            flag_receipt_id,
+            overlapping_auto_receipts,
+            ..
+        } => {
+            if flag_receipt_id.trim().is_empty() {
+                return Err(Error::Invalid("clip origin evidence"));
+            }
+            validate_group(overlapping_auto_receipts, false)
+        }
+    }
+}
+
+fn insert_receipt_group(
+    transaction: &rusqlite::Transaction<'_>,
+    clip_id: &str,
+    kind: &str,
+    receipts: &[String],
+) -> Result<()> {
+    for (position, receipt) in receipts.iter().enumerate() {
+        let position =
+            i64::try_from(position).map_err(|_| Error::Invalid("clip receipt position"))?;
+        transaction.execute(
+            "INSERT INTO clip_origin_receipts(clip_id,kind,position,receipt_id) VALUES(?,?,?,?)",
+            params![clip_id, kind, position, receipt],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_origin_receipts(
+    transaction: &rusqlite::Transaction<'_>,
+    clip_id: &str,
+    origin: DurableClipOriginInput<'_>,
+) -> Result<()> {
+    match origin {
+        DurableClipOriginInput::Auto {
+            trigger_receipts,
+            evidence_receipts,
+        } => {
+            insert_receipt_group(transaction, clip_id, "trigger", trigger_receipts)?;
+            insert_receipt_group(transaction, clip_id, "evidence", evidence_receipts)
+        }
+        DurableClipOriginInput::Manual {
+            flag_receipt_id,
+            overlapping_auto_receipts,
+            ..
+        } => {
+            transaction.execute(
+                "INSERT INTO clip_origin_receipts(clip_id,kind,position,receipt_id) VALUES(?,'manual_flag',0,?)",
+                params![clip_id, flag_receipt_id],
+            )?;
+            insert_receipt_group(
+                transaction,
+                clip_id,
+                "overlapping_auto",
+                overlapping_auto_receipts,
+            )
+        }
+    }
 }
 
 fn now_ms() -> i64 {
@@ -2300,5 +2817,223 @@ mod tests {
         let reopened = Storage::open(layout).unwrap();
         assert!(reopened.integrity_check().unwrap());
         assert!(reopened.create_capture_session("after").is_ok());
+    }
+
+    #[test]
+    fn legacy_clip_stays_unavailable_until_verified_model_metadata_is_supplied() {
+        let (dir, storage) = store();
+        let (clip, _) = stored_clip(&storage, "legacy-model", b"legacy media");
+        assert!(matches!(
+            storage.durable_clip_model(clip.as_str()),
+            Err(Error::Unavailable(_))
+        ));
+        storage
+            .complete_clip_model_metadata(
+                clip.as_str(),
+                42_000,
+                DurableClipOriginInput::Manual {
+                    flag_receipt_id: "flag-receipt",
+                    flag_time_ms: 12_000,
+                    overlapping_auto_receipts: &["auto-overlap".into()],
+                },
+            )
+            .unwrap();
+        drop(storage);
+
+        let reopened = Storage::open(Layout::at(dir.path())).unwrap();
+        let model = reopened.durable_clip_model(clip.as_str()).unwrap();
+        assert_eq!(model.duration_ms, 42_000);
+        assert_eq!(model.revision, 0);
+        assert!(!model.capture_session_id.is_empty());
+        assert_eq!(
+            model.origin,
+            DurableClipOriginRecord::Manual {
+                flag_receipt_id: "flag-receipt".into(),
+                flag_time_ms: 12_000,
+                overlapping_auto_receipts: vec!["auto-overlap".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn clip_review_compare_and_swap_is_durable_and_rejects_stale_revision() {
+        let (dir, storage) = store();
+        let (clip, _) = stored_clip(&storage, "revisioned-review", b"review media");
+        storage
+            .complete_clip_model_metadata(
+                clip.as_str(),
+                10_000,
+                DurableClipOriginInput::Auto {
+                    trigger_receipts: &["trigger".into()],
+                    evidence_receipts: &["evidence".into()],
+                },
+            )
+            .unwrap();
+        let revision = storage
+            .compare_and_swap_clip_review(
+                clip.as_str(),
+                0,
+                Some("Kept"),
+                Some("Reviewed"),
+                &["clutch".into()],
+                ClipReviewDecision::Keep,
+                true,
+            )
+            .unwrap();
+        assert_eq!(revision, 1);
+        assert!(matches!(
+            storage.compare_and_swap_clip_review(
+                clip.as_str(),
+                0,
+                Some("Stale"),
+                None,
+                &[],
+                ClipReviewDecision::Reject,
+                false,
+            ),
+            Err(Error::Conflict("clip review revision"))
+        ));
+        drop(storage);
+
+        let reopened = Storage::open(Layout::at(dir.path())).unwrap();
+        let model = reopened.durable_clip_model(clip.as_str()).unwrap();
+        assert_eq!(model.revision, 1);
+        assert_eq!(model.detail.review_decision, ClipReviewDecision::Keep);
+        assert_eq!(model.detail.tags, ["clutch"]);
+    }
+
+    #[test]
+    fn derivative_commit_publishes_artifact_clip_origin_and_derivation_together() {
+        let (_dir, storage) = store();
+        let (source, _) = stored_clip(&storage, "derivative-source", b"source media");
+        storage
+            .complete_clip_model_metadata(
+                source.as_str(),
+                42_000,
+                DurableClipOriginInput::Auto {
+                    trigger_receipts: &["trigger".into()],
+                    evidence_receipts: &["evidence".into()],
+                },
+            )
+            .unwrap();
+        let derived = storage
+            .commit_clip_derivative(DerivativeClipCommit {
+                source_clip_id: source.as_str(),
+                staged: storage.stage_artifact(b"trimmed media").unwrap(),
+                extension: "mp4",
+                media_type: Some("video/mp4"),
+                duration_ms: 30_000,
+                trim_start_ms: 5_000,
+                trim_end_ms: 35_000,
+                title: "Trimmed clutch",
+                note: "Local derivative",
+                tags: &["trimmed".into()],
+                favorite: true,
+            })
+            .unwrap();
+
+        let model = storage.durable_clip_model(derived.as_str()).unwrap();
+        assert_eq!(model.duration_ms, 30_000);
+        assert_eq!(model.revision, 0);
+        assert_eq!(model.detail.provenance, "trim_derivative");
+        assert_eq!(model.detail.tags, ["trimmed"]);
+        assert_eq!(
+            model.origin,
+            DurableClipOriginRecord::Auto {
+                trigger_receipts: vec!["trigger".into()],
+                evidence_receipts: vec!["evidence".into()],
+            }
+        );
+        let derivations: i64 = storage
+            .connection
+            .query_row(
+                "SELECT count(*) FROM clip_derivations WHERE derived_clip_id=? AND source_clip_id=? AND operation='trim' AND trim_start_ms=5000 AND trim_end_ms=35000",
+                params![derived.as_str(), source.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(derivations, 1);
+    }
+
+    #[test]
+    fn derivative_transaction_failure_removes_published_file_and_database_rows() {
+        let (_dir, storage) = store();
+        let (source, _) = stored_clip(&storage, "failed-derivative", b"source media");
+        storage
+            .complete_clip_model_metadata(
+                source.as_str(),
+                42_000,
+                DurableClipOriginInput::Manual {
+                    flag_receipt_id: "manual-flag",
+                    flag_time_ms: 2_000,
+                    overlapping_auto_receipts: &[],
+                },
+            )
+            .unwrap();
+        let staged = storage.stage_artifact(b"do not publish").unwrap();
+        let hash = staged.sha256.clone();
+        let target = storage
+            .layout()
+            .artifacts
+            .join(&hash[..2])
+            .join(format!("{hash}.mp4"));
+        storage
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_test_derivative BEFORE INSERT ON clip_derivations BEGIN SELECT RAISE(ABORT,'injected derivative failure'); END;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            storage.commit_clip_derivative(DerivativeClipCommit {
+                source_clip_id: source.as_str(),
+                staged,
+                extension: "mp4",
+                media_type: Some("video/mp4"),
+                duration_ms: 10_000,
+                trim_start_ms: 1_000,
+                trim_end_ms: 11_000,
+                title: "Failed derivative",
+                note: "Must roll back",
+                tags: &[],
+                favorite: false,
+            }),
+            Err(Error::Database(_))
+        ));
+        assert!(!target.exists());
+        assert!(matches!(storage.artifact(&hash), Err(Error::NotFound(_))));
+        let derived_rows: i64 = storage
+            .connection
+            .query_row(
+                "SELECT count(*) FROM clips WHERE artifact_sha256=?",
+                [&hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(derived_rows, 0);
+    }
+
+    #[test]
+    fn clip_export_lifecycle_records_success_and_failure_terminal_states() {
+        let (_dir, storage) = store();
+        let (clip, _) = stored_clip(&storage, "export-source", b"export media");
+        let succeeded = storage.enqueue_export(&clip, "/tmp/clip.mp4").unwrap();
+        storage.begin_clip_export(&succeeded).unwrap();
+        storage
+            .succeed_clip_export(&succeeded, &"a".repeat(64), 123, "discord-h264-aac")
+            .unwrap();
+        let record = storage.clip_export(&succeeded).unwrap();
+        assert_eq!(record.status, ClipExportStatus::Succeeded);
+        assert_eq!(record.output_byte_length, Some(123));
+        assert!(matches!(
+            storage.fail_clip_export(&succeeded, "too_late"),
+            Err(Error::IllegalTransition("clip export fail"))
+        ));
+
+        let failed = storage.enqueue_export(&clip, "/tmp/fail.mp4").unwrap();
+        storage.fail_clip_export(&failed, "disk_full").unwrap();
+        let record = storage.clip_export(&failed).unwrap();
+        assert_eq!(record.status, ClipExportStatus::Failed);
+        assert_eq!(record.error_code.as_deref(), Some("disk_full"));
     }
 }
