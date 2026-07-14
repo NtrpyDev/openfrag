@@ -820,12 +820,14 @@ dependencies = [
  "openfrag-capture",
  "openfrag-gsi",
  "openfrag-import",
+ "openfrag-setup",
  "openfrag-storage",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tower",
+ "uuid",
 ]
 
 [[package]]
