@@ -4,12 +4,13 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
 pub const MAX_DEMO_BYTES: u64 = 2_147_483_648;
 pub const CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const DEMO_MAGIC: &[u8] = b"PBDEMS2\0";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
@@ -80,6 +81,39 @@ pub enum DedupDecision {
     PriorFailure,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParserCapability {
+    Unavailable {
+        reason: String,
+    },
+    Pinned {
+        commit: String,
+        build: String,
+        schema_hash: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedOutput {
+    pub demo_metadata: String,
+    pub participants: Vec<String>,
+    pub rounds: u64,
+    pub events: u64,
+    pub receipts: Vec<String>,
+    pub suspicious_empty: bool,
+}
+
+/// The pinned LaihoE parser is not vendored in this crate yet. Production callers must
+/// surface `Unavailable` and never turn it into an empty Match.
+pub fn parser_capability() -> ParserCapability {
+    ParserCapability::Unavailable { reason: "demoparser commit ba39cc44cd5abfd7f34df2b3c0a7dd3630048311 requires vendored generated protos and is not yet integrated".into() }
+}
+
+pub trait ImportStore {
+    fn save_attempt(&mut self, attempt: &Attempt) -> Result<(), ErrorCode>;
+    fn load_attempt(&self, id: u64) -> Option<Attempt>;
+}
+
 pub trait ParserAdapter {
     type Parsed;
     type Error: std::fmt::Display;
@@ -92,6 +126,9 @@ pub trait ParserAdapter {
 }
 
 pub fn validate(path: &Path, free_bytes: u64) -> Result<u64, ErrorCode> {
+    if path.is_symlink() {
+        return Err(ErrorCode::Corrupt);
+    }
     let meta = fs::metadata(path).map_err(|_| ErrorCode::Io)?;
     if !meta.is_file() {
         return Err(ErrorCode::Corrupt);
@@ -102,10 +139,118 @@ pub fn validate(path: &Path, free_bytes: u64) -> Result<u64, ErrorCode> {
     if free_bytes < meta.len() + meta.len() / 10 {
         return Err(ErrorCode::Io);
     }
-    if meta.len() < 8 {
+    if meta.len() < DEMO_MAGIC.len() as u64 {
         return Err(ErrorCode::Corrupt);
     }
+    let mut f = fs::File::open(path).map_err(|_| ErrorCode::Io)?;
+    let mut magic = [0u8; DEMO_MAGIC.len()];
+    f.read_exact(&mut magic).map_err(|_| ErrorCode::Corrupt)?;
+    if magic != DEMO_MAGIC {
+        return Err(ErrorCode::Unsupported);
+    }
     Ok(meta.len())
+}
+
+pub fn hash_file(
+    src: &Path,
+    total: u64,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<String, ErrorCode> {
+    let before = fs::metadata(src).map_err(|_| ErrorCode::Io)?;
+    let mut input = fs::File::open(src).map_err(|_| ErrorCode::Io)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; CHUNK_BYTES];
+    let mut done = 0;
+    loop {
+        let n = input.read(&mut buf).map_err(|_| ErrorCode::Io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        done += n as u64;
+        progress(Progress {
+            processed_bytes: done,
+            total_bytes: Some(total),
+            indeterminate: false,
+            work_done: 0,
+            heartbeat: done,
+        });
+    }
+    let after = fs::metadata(src).map_err(|_| ErrorCode::Io)?;
+    if before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || done != total
+    {
+        return Err(ErrorCode::Io);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn copy_content_addressed(
+    src: &Path,
+    dst: &Path,
+    expected_hash: &str,
+    total: u64,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<PathBuf, ErrorCode> {
+    if dst.exists() {
+        return Ok(dst.to_path_buf());
+    }
+    let parent = dst.parent().ok_or(ErrorCode::Io)?;
+    fs::create_dir_all(parent).map_err(|_| ErrorCode::Io)?;
+    let tmp = parent.join(format!(
+        ".staging-{}-{:x}",
+        std::process::id(),
+        Sha256::digest(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .to_le_bytes()
+        )
+    ));
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|_| ErrorCode::Io)?;
+    let mut input = fs::File::open(src).map_err(|_| ErrorCode::Io)?;
+    let mut buf = vec![0u8; CHUNK_BYTES];
+    let mut done = 0;
+    let mut h = Sha256::new();
+    let result = (|| {
+        loop {
+            let n = input.read(&mut buf).map_err(|_| ErrorCode::Io)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+            out.write_all(&buf[..n]).map_err(|_| ErrorCode::Io)?;
+            done += n as u64;
+            progress(Progress {
+                processed_bytes: done,
+                total_bytes: Some(total),
+                indeterminate: false,
+                work_done: 0,
+                heartbeat: done,
+            });
+        }
+        out.sync_all().map_err(|_| ErrorCode::Io)?;
+        if done != total || format!("{:x}", h.finalize()) != expected_hash {
+            return Err(ErrorCode::Corrupt);
+        }
+        fs::rename(&tmp, dst).map_err(|_| ErrorCode::Io)?;
+        if let Some(p) = dst.parent() {
+            fs::File::open(p)
+                .and_then(|f| f.sync_all())
+                .map_err(|_| ErrorCode::Io)?;
+        }
+        Ok(dst.to_path_buf())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 pub fn hash_and_copy(
@@ -213,7 +358,7 @@ mod tests {
     fn validates_limit_and_headroom() {
         let d = tempdir().unwrap();
         let p = d.path().join("x.dem");
-        fs::write(&p, b"12345678").unwrap();
+        fs::write(&p, DEMO_MAGIC).unwrap();
         assert_eq!(validate(&p, 7), Err(ErrorCode::Io));
         assert_eq!(validate(&p, 8), Ok(8));
     }
@@ -222,9 +367,9 @@ mod tests {
         let d = tempdir().unwrap();
         let s = d.path().join("a.dem");
         let t = d.path().join("store/a.dem");
-        fs::write(&s, b"demo bytes").unwrap();
+        fs::write(&s, [DEMO_MAGIC, b"demo bytes"].concat()).unwrap();
         let mut seen = Vec::new();
-        let h = hash_and_copy(&s, &t, 10, &mut |p| seen.push(p)).unwrap();
+        let h = hash_and_copy(&s, &t, 18, &mut |p| seen.push(p)).unwrap();
         assert!(t.is_file());
         assert_eq!(seen.last().unwrap().fraction_millionths(), Some(1_000_000));
         assert_eq!(h.len(), 64);
@@ -263,7 +408,7 @@ mod tests {
     fn fake_adapter_is_not_production_parser() {
         let d = tempdir().unwrap();
         let p = d.path().join("x");
-        fs::write(&p, b"x").unwrap();
+        fs::write(&p, DEMO_MAGIC).unwrap();
         let f = Fake;
         let mut n = 0;
         let parsed = f.parse(&p, &mut |x| n = x).unwrap();
