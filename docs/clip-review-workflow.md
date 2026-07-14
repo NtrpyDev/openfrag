@@ -5,8 +5,9 @@
 The dashboard presents every saved Clip in a review queue, then lets the
 player keep, edit metadata, or delete it. A Clip is linked to its Highlight,
 Capture Session, Match when known, and source evidence state. Auto Highlights
-are provisional until the Demo confirms their round evidence. Manual Flags are
-provisional unless a matching Capture Session and saved replay are present.
+are provisional until the Demo confirms their round evidence. Manual Flags
+represent independent user intent; their media save is complete or failed.
+The Demo may separately confirm an overlapping Auto Highlight.
 Demo confirmation never changes the video file silently. It updates evidence
 and labels on the existing Clip.
 
@@ -26,23 +27,31 @@ and labels on the existing Clip.
    only after the file operation succeeds. The original is not recoverable in
    v1 after confirmed deletion.
 5. **Export.** Export a selected Clip to a user-chosen ordinary file. The
-   Discord option creates an MP4 derivative using H.264 video and AAC audio,
-   targeting a configurable size ceiling, then reports the actual size. It
-   never uploads or contacts Discord.
+   Discord option creates an MP4 derivative using H.264 video and AAC audio.
+   The default target is no more than 10 MiB, matching [Discord's documented
+   default upload limit](https://docs.discord.com/developers/reference#uploading-files),
+   and is user-configurable. If minimum acceptable encoding cannot fit, export
+   fails visibly and preserves the source. It never silently overshoots,
+   uploads, or contacts Discord.
 
 ## Merged triggers
 
-Multiple triggers in one Capture Session and overlapping time windows produce
-one Clip with one canonical Highlight record and a list of contributing
-triggers. The review card shows the combined label, for example “multikill +
-Manual Flag”, and links each trigger receipt. A later trigger that falls
-outside the existing window creates a separate Clip. Merging is deterministic
-and does not duplicate video files.
+The Highlight rules define a 60-second Replay Buffer. An Auto Highlight signal
+arrives at `round_end + 10s` and has a desired range from
+`candidate_start - 15s` through `round_end + 10s`. A Manual Flag has the range
+`flag_time - 15s` through `flag_time`, with no future post-roll.
+
+Candidate merge is limited to triggers in the same round whose windows overlap
+or whose starts are at most 10 seconds apart. It preserves every trigger
+receipt and label and does not imply one raw file or one canonical Highlight.
+Raw Manual and later Auto saves remain independent; post-hoc consolidation is
+allowed only when both files cover the desired union. Other triggers remain
+separate Clips.
 
 ## V1 boundary
 
 V1 includes local queue review, playback, one trim range, rename, favorite,
-delete confirmation, deterministic merged-trigger presentation, and explicit
+delete confirmation, deterministic candidate-merge presentation, and explicit
 Discord-friendly export to a local file. It stores Capture Session identity,
 source, evidence status, Match and round links, parser and formula versions
 when available, and immutable file provenance.
@@ -82,22 +91,22 @@ producing a compatible file for the player to attach manually.
 
 ## State and failure rules
 
-Clip states are `saved`, `in_review`, `kept`, `edited`, `favorite`, and
-`deleted`; favorite is a flag, not an exclusive state. Failed encoding,
+Each Clip has a review disposition of `saved`, `in_review`, `kept`, or
+`deleted`, plus independent favorite and derivative records. Failed encoding,
 missing source, or failed deletion remains visible with an actionable error and
 does not silently change state. A Clip whose Capture Session ended before a
 valid replay save is marked incomplete and cannot be presented as confirmed.
 
-The dashboard distinguishes `Provisional` from `Demo confirmed` in every card
-and detail view. If the Demo is unavailable, the Clip remains playable and
-provisional. If parsing later fails, preserve the provisional Clip and its
+The dashboard distinguishes `Provisional` from `Demo confirmed` for Auto
+Highlight evidence. Manual Flags show media-save status and any separate
+overlapping Auto confirmation. If the Demo is unavailable, an Auto Highlight
+remains playable and provisional. If parsing later fails, preserve it and its
 failure Receipt rather than deleting or inventing confirmation.
 
-## Unresolved dependencies
+## Interface requirements
 
-- The resolved highlight contract must provide exact merge-window and
-  post-roll values.
-- The Capture Session contract must define its stable identifier and lifecycle.
-- gpu-screen-recorder output and codec availability determine whether the
-  Discord derivative can meet its size ceiling.
-- Demo confirmation must provide stable Match and round identifiers.
+- Issue 13 must provide the Capture Session identifier and lifecycle interface.
+- Issue 16 must provide stable Demo Match and round identifiers for linking.
+- gpu-screen-recorder output and host codec availability determine whether the
+  Discord derivative can meet its size ceiling. This is a runtime capability
+  and failure path, not a remaining product decision.
