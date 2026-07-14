@@ -1,7 +1,5 @@
 # openfrag
 
-**Never lose a great play. And understand exactly what led to it.**
-
 Your best CS2 moments and your local match history: captured, analyzed, and kept on your Linux PC.
 
 openfrag is one local app. It watches your game through Valve's official Game State Integration and saves a clip every time you ace, clutch, or knife someone, automatically, with the whole play. After the match it imports your Premier demo and turns it into a stats dashboard served from your own machine.
