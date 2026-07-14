@@ -543,6 +543,7 @@ impl Storage {
             == "ok")
     }
     #[cfg(test)]
+    #[allow(clippy::needless_pass_by_value)]
     pub fn hold_write_lock_for_test(
         &mut self,
         ready: std::sync::mpsc::Sender<()>,

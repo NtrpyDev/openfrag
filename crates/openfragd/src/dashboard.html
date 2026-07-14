@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>openfrag</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: #090c10; color: #e7edf5; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 75% -10%, #123447 0, #090c10 38%); }
+    button { font: inherit; }
+    .shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100vh; }
+    aside { border-right: 1px solid #26303b; padding: 24px 16px; background: #0c1016e8; }
+    .brand { display: flex; gap: 10px; align-items: center; margin: 0 8px 28px; font-weight: 800; letter-spacing: .02em; }
+    .mark { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 8px; background: #42c4ef; color: #061018; }
+    nav { display: grid; gap: 5px; }
+    nav button { width: 100%; border: 0; border-radius: 8px; padding: 10px 12px; text-align: left; color: #9aa9ba; background: transparent; cursor: pointer; }
+    nav button[aria-current="page"] { color: #f5fbff; background: #18232e; }
+    main { padding: 30px clamp(20px, 4vw, 56px) 48px; max-width: 1300px; width: 100%; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    h1 { margin: 0; font-size: clamp(28px, 4vw, 42px); }
+    .subtle { color: #93a3b5; }
+    .status { border: 1px solid #315568; border-radius: 999px; padding: 7px 11px; color: #86ddf7; background: #0e2430; }
+    .setup { margin: 28px 0; padding: 22px; display: flex; align-items: center; justify-content: space-between; gap: 24px; border: 1px solid #2d5264; border-radius: 14px; background: linear-gradient(115deg, #102633, #111820); }
+    .setup h2, .panel h2 { margin: 0 0 6px; }
+    .primary { border: 0; border-radius: 9px; padding: 11px 16px; white-space: nowrap; font-weight: 700; background: #49c9f1; color: #061018; cursor: pointer; }
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    .card, .panel { border: 1px solid #242f3a; border-radius: 12px; background: #10161d; }
+    .card { padding: 18px; }
+    .label { color: #8495a8; font-size: 13px; text-transform: uppercase; letter-spacing: .07em; }
+    .value { margin-top: 7px; font-size: 25px; font-weight: 750; }
+    .panels { display: grid; grid-template-columns: 1.4fr 1fr; gap: 14px; margin-top: 14px; }
+    .panel { padding: 20px; min-height: 230px; }
+    .empty { min-height: 150px; display: grid; place-items: center; text-align: center; color: #8595a7; }
+    footer { margin-top: 28px; color: #718194; font-size: 13px; }
+    @media (max-width: 780px) { .shell { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #26303b; } nav { grid-template-columns: repeat(5, 1fr); overflow-x: auto; } nav button { text-align: center; } .grid, .panels { grid-template-columns: 1fr; } .setup { align-items: flex-start; flex-direction: column; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside>
+      <div class="brand"><span class="mark">OF</span> openfrag</div>
+      <nav aria-label="Local dashboard">
+        <button aria-current="page">Tonight</button>
+        <button>Matches</button>
+        <button>Clips</button>
+        <button>Inbox</button>
+        <button>Settings</button>
+      </nav>
+    </aside>
+    <main>
+      <header>
+        <div><h1>Tonight</h1><div class="subtle">Your local session, evidence first.</div></div>
+        <div class="status">Local daemon ready</div>
+      </header>
+      <section class="setup" aria-labelledby="setup-title">
+        <div><h2 id="setup-title">Start with a Premier Demo</h2><div class="subtle">Choose a local .dem file. openfrag never signs into Steam or uploads it.</div></div>
+        <button class="primary" type="button">Import local Demo</button>
+      </section>
+      <section class="grid" aria-label="Tonight summary">
+        <article class="card"><div class="label">Rating</div><div class="value">Not ready</div><div class="subtle">Import a Demo to calculate ofr-1.0.0.</div></article>
+        <article class="card"><div class="label">Matches</div><div class="value">0</div><div class="subtle">No comparable Match tonight.</div></article>
+        <article class="card"><div class="label">Highlights</div><div class="value">0</div><div class="subtle">Demo-confirmed clips appear here.</div></article>
+      </section>
+      <section class="panels">
+        <article class="panel"><h2>Recent Matches</h2><div class="empty">No local Demo has been imported.</div></article>
+        <article class="panel"><h2>Clip review</h2><div class="empty">Saved Clips will wait here for review.</div></article>
+      </section>
+      <footer>No account. No telemetry. No uploads. All data stays in your openfrag data directory.</footer>
+    </main>
+  </div>
+</body>
+</html>
