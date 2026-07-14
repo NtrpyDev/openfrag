@@ -1,3 +1,5 @@
+#![allow(clippy::missing_errors_doc, clippy::struct_excessive_bools)]
+
 use axum::{
     Router,
     body::Bytes,
@@ -205,9 +207,8 @@ async fn route_post(
 
     let received_at = service.clock.now();
     let hash = hex_digest(&body);
-    let mut guard = match service.engine.lock() {
-        Ok(guard) => guard,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "state-unavailable"),
+    let Ok(mut guard) = service.engine.lock() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "state-unavailable");
     };
     if guard.last_hash.as_deref() == Some(hash.as_str()) {
         return (StatusCode::OK, "duplicate");
