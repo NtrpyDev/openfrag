@@ -1,11 +1,9 @@
 use openfrag_capture::{SaveDisposition, SaveProvenance};
 use openfrag_domain::{
-    CandidateTrigger, FinalHighlightLabel, TimeRange, AUTO_POST_ROLL_MS, DESIRED_PRE_ROLL_MS,
-    REPLAY_BUFFER_MS,
+    AUTO_POST_ROLL_MS, CandidateTrigger, DESIRED_PRE_ROLL_MS, FinalHighlightLabel,
+    REPLAY_BUFFER_MS, TimeRange,
 };
-use openfrag_gsi::{
-    EvidenceContext, EvidenceReceipt, PresenceBits, StateOutput, TransitionFact,
-};
+use openfrag_gsi::{EvidenceContext, EvidenceReceipt, PresenceBits, StateOutput, TransitionFact};
 use openfrag_live::{
     CancelReason, CaptureKind, CaptureRecord, CaptureStatus, Clock, Coordinator, EvidenceStore,
     LiveDiagnostic, Recorder, Scheduler, TimerId, TimerOutcome,
@@ -30,7 +28,10 @@ struct MemoryStore {
 
 impl EvidenceStore for MemoryStore {
     fn persist_receipt(&self, receipt: &EvidenceReceipt) -> Result<(), LiveDiagnostic> {
-        self.receipts.lock().expect("receipts lock").push(receipt.clone());
+        self.receipts
+            .lock()
+            .expect("receipts lock")
+            .push(receipt.clone());
         Ok(())
     }
 
@@ -85,7 +86,10 @@ impl Scheduler for FakeScheduler {
     }
 
     fn cancel(&self, timer: &TimerId) -> Result<(), LiveDiagnostic> {
-        self.cancelled.lock().expect("cancelled lock").push(timer.clone());
+        self.cancelled
+            .lock()
+            .expect("cancelled lock")
+            .push(timer.clone());
         Ok(())
     }
 }
@@ -130,7 +134,9 @@ impl Recorder for FakeRecorder {
 
 type TestCoordinator = Coordinator<MemoryStore, FakeRecorder, ManualClock, FakeScheduler>;
 
-fn harness(recorder_available_from_ms: u64) -> (
+fn harness(
+    recorder_available_from_ms: u64,
+) -> (
     TestCoordinator,
     Arc<MemoryStore>,
     Arc<FakeRecorder>,
@@ -190,7 +196,13 @@ fn receipt(
     }
 }
 
-fn round_kill_receipt(sequence: u64, at_ms: u64, round: u64, previous: i64, current: i64) -> EvidenceReceipt {
+fn round_kill_receipt(
+    sequence: u64,
+    at_ms: u64,
+    round: u64,
+    previous: i64,
+    current: i64,
+) -> EvidenceReceipt {
     receipt(
         sequence,
         at_ms,
@@ -231,18 +243,38 @@ fn persists_every_receipt_but_deduplicates_the_same_round_candidate() {
     let candidates = store.candidates.lock().expect("candidates lock");
     assert_eq!(candidates.len(), 1);
     let candidate = candidates.values().next().expect("candidate");
-    assert_eq!(candidate.candidate.triggers, BTreeSet::from([CandidateTrigger::KillMilestone]));
+    assert_eq!(
+        candidate.candidate.triggers,
+        BTreeSet::from([CandidateTrigger::KillMilestone])
+    );
     assert!(candidate.final_labels.is_empty());
 }
 
 #[test]
 fn jump_is_one_candidate_and_round_reset_does_not_invent_another() {
     let (mut coordinator, store, _recorder, _clock, _scheduler) = harness(0);
+    let mut jump = round_kill_receipt(1, 20_000, 3, 1, 4);
+    jump.facts.extend([
+        TransitionFact::CumulativeKillDelta {
+            previous: 1,
+            current: 4,
+            delta: 3,
+        },
+        TransitionFact::HealthDepleted {
+            previous: 100,
+            current: 0,
+        },
+    ]);
+    coordinator.ingest(&jump).expect("jump receipt");
     coordinator
-        .ingest(&round_kill_receipt(1, 20_000, 3, 1, 4))
-        .expect("jump receipt");
-    coordinator
-        .ingest(&receipt(2, 30_000, StateOutput::Healthy, Some(4), Some(0), vec![]))
+        .ingest(&receipt(
+            2,
+            30_000,
+            StateOutput::Healthy,
+            Some(4),
+            Some(0),
+            vec![],
+        ))
         .expect("reset receipt");
 
     assert_eq!(store.candidates.lock().expect("candidates lock").len(), 1);
@@ -263,12 +295,14 @@ fn every_round_end_schedules_a_capture_even_with_zero_kills() {
     assert_eq!(capture.deadline_ms, Some(40_000 + AUTO_POST_ROLL_MS));
     assert_eq!(capture.status, CaptureStatus::Scheduled);
     assert!(capture.final_labels.is_empty());
-    assert!(capture
-        .candidate
-        .as_ref()
-        .expect("official candidate")
-        .triggers
-        .contains(&CandidateTrigger::OfficialRoundEndCapture));
+    assert!(
+        capture
+            .candidate
+            .as_ref()
+            .expect("official candidate")
+            .triggers
+            .contains(&CandidateTrigger::OfficialRoundEndCapture)
+    );
     assert_eq!(scheduler.scheduled.lock().expect("scheduled lock").len(), 1);
 }
 
@@ -277,14 +311,23 @@ fn missing_map_or_round_context_persists_receipt_without_live_inference() {
     let (mut coordinator, store, _recorder, _clock, scheduler) = harness(0);
     let mut missing = round_kill_receipt(1, 10_000, 3, 2, 3);
     missing.context.map_hash = None;
-    missing.facts.push(TransitionFact::RoundEnd { completed: 3, next: 4 });
+    missing.facts.push(TransitionFact::RoundEnd {
+        completed: 3,
+        next: 4,
+    });
 
     coordinator.ingest(&missing).expect("receipt persists");
 
     assert_eq!(store.receipts.lock().expect("receipts lock").len(), 1);
     assert!(store.candidates.lock().expect("candidates lock").is_empty());
     assert!(store.captures.lock().expect("captures lock").is_empty());
-    assert!(scheduler.scheduled.lock().expect("scheduled lock").is_empty());
+    assert!(
+        scheduler
+            .scheduled
+            .lock()
+            .expect("scheduled lock")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -311,7 +354,14 @@ fn timer_boundary_requests_one_save_with_honest_desired_and_raw_coverage() {
     assert_eq!(coordinator.on_timer(&timer), Ok(TimerOutcome::NotDue));
     assert!(recorder.calls.lock().expect("calls lock").is_empty());
     clock.set(80_000);
-    assert_eq!(coordinator.on_timer(&timer), Ok(TimerOutcome::SaveRequested));
+    assert_eq!(
+        coordinator.on_timer(&timer),
+        Ok(TimerOutcome::SaveRequested)
+    );
+    assert_eq!(
+        coordinator.on_timer(&timer),
+        Ok(TimerOutcome::AlreadyHandled)
+    );
 
     assert_eq!(
         recorder.calls.lock().expect("calls lock").as_slice(),
@@ -320,8 +370,20 @@ fn timer_boundary_requests_one_save_with_honest_desired_and_raw_coverage() {
     let captures = store.captures.lock().expect("captures lock");
     let capture = captures.values().next().expect("capture");
     let window = capture.window.expect("capture window");
-    assert_eq!(window.desired, TimeRange { start_ms: 5_000, end_ms: 80_000 });
-    assert_eq!(window.available, TimeRange { start_ms: 30_000, end_ms: 80_000 });
+    assert_eq!(
+        window.desired,
+        TimeRange {
+            start_ms: 5_000,
+            end_ms: 80_000
+        }
+    );
+    assert_eq!(
+        window.available,
+        TimeRange {
+            start_ms: 30_000,
+            end_ms: 80_000
+        }
+    );
     assert!(window.pre_roll_truncated);
     assert_eq!(
         capture.raw_coverage,
@@ -345,7 +407,13 @@ fn overlapping_kill_and_round_end_candidates_merge_without_provisional_labels() 
     let captures = store.captures.lock().expect("captures lock");
     let capture = captures.values().next().expect("capture");
     let candidate = capture.candidate.as_ref().expect("merged candidate");
-    assert_eq!(candidate.range, TimeRange { start_ms: 50_000, end_ms: 58_000 });
+    assert_eq!(
+        candidate.range,
+        TimeRange {
+            start_ms: 50_000,
+            end_ms: 58_000
+        }
+    );
     assert_eq!(
         candidate.triggers,
         BTreeSet::from([
@@ -364,7 +432,14 @@ fn stale_and_reset_cancel_unsaved_deadlines_but_retain_metadata() {
         .ingest(&round_end_receipt(1, 40_000, 3))
         .expect("first round end");
     coordinator
-        .ingest(&receipt(2, 41_000, StateOutput::Stale, Some(4), Some(0), vec![]))
+        .ingest(&receipt(
+            2,
+            41_000,
+            StateOutput::Stale,
+            Some(4),
+            Some(0),
+            vec![],
+        ))
         .expect("stale");
     let first = store
         .captures
@@ -380,14 +455,23 @@ fn stale_and_reset_cancel_unsaved_deadlines_but_retain_metadata() {
         .ingest(&round_end_receipt(3, 50_000, 4))
         .expect("second round end");
     coordinator
-        .ingest(&receipt(4, 51_000, StateOutput::SessionReset, Some(1), Some(0), vec![]))
+        .ingest(&receipt(
+            4,
+            51_000,
+            StateOutput::SessionReset,
+            Some(1),
+            Some(0),
+            vec![],
+        ))
         .expect("reset");
 
     let captures = store.captures.lock().expect("captures lock");
     assert_eq!(captures.len(), 2);
-    assert!(captures
-        .values()
-        .any(|capture| capture.status == CaptureStatus::Cancelled(CancelReason::SessionReset)));
+    assert!(
+        captures
+            .values()
+            .any(|capture| capture.status == CaptureStatus::Cancelled(CancelReason::SessionReset))
+    );
     assert_eq!(scheduler.cancelled.lock().expect("cancelled lock").len(), 2);
 }
 
@@ -425,7 +509,10 @@ fn recorder_failure_remains_retryable_and_retry_preserves_capture_identity() {
         CaptureStatus::Retryable(_)
     ));
 
-    assert_eq!(coordinator.retry_capture(&capture.id), Ok(TimerOutcome::SaveRequested));
+    assert_eq!(
+        coordinator.retry_capture(&capture.id),
+        Ok(TimerOutcome::SaveRequested)
+    );
     assert_eq!(recorder.calls.lock().expect("calls lock").len(), 2);
     assert!(matches!(
         store
@@ -466,7 +553,10 @@ fn manual_flag_is_immediate_and_retains_identity_when_recorder_coalesces() {
     let manual = captures.get(&manual_id).expect("manual capture");
     assert_eq!(manual.kind, CaptureKind::ManualFlag);
     assert_eq!(manual.provenance, SaveProvenance::ManualFlag);
-    assert_eq!(manual.status, CaptureStatus::SaveRequested(SaveDisposition::Coalesced));
+    assert_eq!(
+        manual.status,
+        CaptureStatus::SaveRequested(SaveDisposition::Coalesced)
+    );
     assert_eq!(
         manual.window.expect("manual window").desired,
         TimeRange {
