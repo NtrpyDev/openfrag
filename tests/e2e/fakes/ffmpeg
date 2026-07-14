@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+output=
+for argument in "$@"; do
+  output=$argument
+done
+
+if [ -z "$output" ]; then
+  printf '%s\n' 'fake ffmpeg requires an output path' >&2
+  exit 2
+fi
+
+printf 'fake encoded media\n' > "$output"
+if [ -n "${OPENFRAG_E2E_FAKE_LOG:-}" ]; then
+  printf '%s\n' "ffmpeg $*" >> "$OPENFRAG_E2E_FAKE_LOG"
+fi
