@@ -1,5 +1,7 @@
 //! Durable application service for local Demo import, parsing, and rating analysis.
 
+pub mod reconcile;
+
 use openfrag_analysis::{AnalysisReceipt, AnalysisUnavailable, analyze};
 use openfrag_import::{MAX_DEMO_BYTES, ParsedOutput};
 use openfrag_storage::{AnalysisIdentity, ImportJobId, ImportPhase, Layout, Storage};
