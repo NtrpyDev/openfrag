@@ -28,6 +28,7 @@ fn setup_gsi_writes_a_private_local_configuration_without_printing_the_token() {
         .arg(&cfg)
         .arg("--data-dir")
         .arg(&data)
+        .args(["--steam-id", "76561198000000001"])
         .output()
         .expect("run GSI setup");
 
@@ -40,8 +41,11 @@ fn setup_gsi_writes_a_private_local_configuration_without_printing_the_token() {
     let config = std::fs::read_to_string(cfg.join("gamestate_integration_openfrag.cfg"))
         .expect("GSI config");
     let token = std::fs::read_to_string(data.join("gsi-token")).expect("GSI token");
+    let steam_id =
+        std::fs::read_to_string(data.join("local-steam-id")).expect("local Steam ID");
     assert!(config.contains(token.trim()));
     assert!(!stdout.contains(token.trim()));
+    assert_eq!(steam_id, "76561198000000001\n");
     assert!(stdout.contains("Game State Integration configured"));
 }
 
