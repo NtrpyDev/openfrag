@@ -762,10 +762,7 @@ async fn session_restart_clears_recent_hashes_from_the_previous_session() {
     post(
         &service,
         "application/json",
-        with_provider_timestamp(
-            snapshot(TOKEN, STEAM_ID, "de_inferno", 1, 0, 0, 100),
-            1,
-        ),
+        with_provider_timestamp(snapshot(TOKEN, STEAM_ID, "de_inferno", 1, 0, 0, 100), 1),
     )
     .await;
 
