@@ -2,7 +2,9 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use openfrag_gsi::{Clock, EventSink, EvidenceReceipt, GsiConfig, GsiService, router};
+use openfrag_gsi::{
+    Clock, EventSink, EvidenceReceipt, GsiConfig, GsiService, StateOutput, router,
+};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -96,4 +98,43 @@ async fn rejects_an_invalid_auth_token_without_emitting_evidence() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert!(sink.receipts().is_empty());
+}
+
+#[tokio::test]
+async fn seeds_sanitized_evidence_and_accepts_json_content_type_parameters() {
+    let (service, _clock, sink) = harness();
+
+    let response = post(
+        &service,
+        "application/json; charset=utf-8",
+        payload(TOKEN, STEAM_ID),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipts = sink.receipts();
+    assert_eq!(receipts.len(), 1);
+    let receipt = &receipts[0];
+    assert_eq!(receipt.sequence, 1);
+    assert_eq!(receipt.received_at, Duration::ZERO);
+    assert_eq!(receipt.output, StateOutput::Seeded);
+    assert!(receipt.facts.is_empty());
+    assert_eq!(
+        receipt.payload_hash,
+        "0272ef1d6ec9074916277a9d13500f4195b3c69486ae75509928666f52d724e9"
+    );
+    assert!(receipt.presence.provider);
+    assert!(receipt.presence.provider_timestamp);
+    assert!(receipt.presence.map);
+    assert!(receipt.presence.map_round);
+    assert!(receipt.presence.player);
+    assert!(receipt.presence.player_state);
+    assert!(receipt.presence.match_stats);
+    assert!(receipt.presence.auth);
+    assert!(receipt.presence.auth_token);
+    assert!(receipt.presence.player_steamid);
+    let debug_receipt = format!("{receipt:?}");
+    assert!(!debug_receipt.contains(TOKEN));
+    assert!(!debug_receipt.contains(STEAM_ID));
+    assert!(!debug_receipt.contains("de_dust2"));
 }
