@@ -1,0 +1,9 @@
+[package]
+name = "hotkey-evdev-prototype"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+evdev = "0.13.2"
+libc = "0.2"
