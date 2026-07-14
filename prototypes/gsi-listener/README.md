@@ -70,13 +70,14 @@ Restart CS2 or load a map after installing the file. The receiver is bound to `1
 
 Use a disposable local account or a session whose data you are comfortable retaining. Record the listener output and timestamps for each case:
 
-1. Start in Premier and verify a POST arrives after entering the lobby and again when the match starts.
-2. Capture a live alive state, then die and confirm the player state changes to dead.
-3. Spectate a teammate and confirm the payload identifies the spectating state without treating it as alive.
-4. Observe freeze time, round start, a round in progress, and round end. Check phase, round number, team scores, and bomb state where applicable.
-5. Disconnect the game or stop the listener, wait for a timeout, then reconnect or restart the listener. Confirm recovery and whether the first recovered payload is a complete state.
-6. Repeat the minimum alive/dead/spectating/round-end checks in Deathmatch. Note which fields are absent or differ from Premier.
-7. Confirm no request is accepted on a non-loopback address and that an invalid token is rejected.
+1. Use an official match or official Practice map for contract evidence. On CS2 build 24134959, several minutes of active Aimbotz play continued to report `player.activity` as `menu` and omitted `map`, `round`, weapons, scores, and deltas, so this workshop map is not a valid live-state fixture.
+2. Start in Premier and verify a POST arrives after entering the lobby and again when the match starts.
+3. Capture a live alive state, then die and confirm the player state changes to dead.
+4. Spectate a teammate and confirm the payload identifies the spectating state without treating it as alive.
+5. Observe freeze time, round start, a round in progress, and round end. Check phase, round number, team scores, and bomb state where applicable.
+6. Disconnect the game or stop the listener, wait for a timeout, then reconnect or restart the listener. Confirm recovery and whether the first recovered payload is a complete state.
+7. Repeat the minimum alive/dead/spectating/round-end checks in Deathmatch. Note which fields are absent or differ from Premier.
+8. Confirm no request is accepted on a non-loopback address and that an invalid token is rejected.
 
 ## What to report
 
