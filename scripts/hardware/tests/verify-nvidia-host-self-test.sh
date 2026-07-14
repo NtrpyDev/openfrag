@@ -11,6 +11,7 @@ bin="$stage/bin"
 runtime="$stage/runtime"
 output_directory="$stage/clips"
 launch_log="$stage/recorder-launched"
+nvenc_probe_log="$stage/nvenc-probed"
 mkdir -p "$bin" "$runtime" "$output_directory"
 
 cat >"$bin/nvidia-smi" <<'EOF'
@@ -25,6 +26,9 @@ cat >"$bin/ffmpeg" <<'EOF'
 #!/usr/bin/env bash
 if [[ " $* " == *' -encoders '* ]]; then
     printf '%s\n' ' V....D h264_nvenc NVIDIA NVENC H.264 encoder'
+elif [[ " $* " == *' lavfi '* ]]; then
+    touch "$NVENC_PROBE_LOG"
+    exit "${MOCK_NVENC_FAIL:-0}"
 else
     printf '%s\n' 'ffmpeg fixture version 1'
 fi
@@ -65,11 +69,27 @@ run_verifier() {
     PATH="$bin:/usr/bin:/bin" \
         XDG_RUNTIME_DIR="$runtime" \
         PROBE_LAUNCH_LOG="$launch_log" \
-        "$verifier" --output-dir "$output_directory"
+        NVENC_PROBE_LOG="$nvenc_probe_log" \
+        "$verifier" --output-dir "$output_directory" "$@"
 }
 
 native_json=$(run_verifier)
 python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["ready"] is True; assert value["checks"]["recorder"]["detail"] == "native"' <<<"$native_json"
+test ! -e "$launch_log"
+
+probe_json=$(run_verifier --probe-nvenc)
+python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["ready"] is True; assert value["checks"]["nvenc"]["detail"] == "runtime_verified"' <<<"$probe_json"
+test -e "$nvenc_probe_log"
+test ! -e "$launch_log"
+
+rm "$nvenc_probe_log"
+set +e
+failed_probe_json=$(MOCK_NVENC_FAIL=1 run_verifier --probe-nvenc)
+failed_probe_status=$?
+set -e
+test "$failed_probe_status" -eq 1
+python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["ready"] is False; assert value["checks"]["nvenc"]["detail"] == "runtime_probe_failed"' <<<"$failed_probe_json"
+test -e "$nvenc_probe_log"
 test ! -e "$launch_log"
 
 rm "$bin/gpu-screen-recorder"
