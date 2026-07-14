@@ -159,7 +159,7 @@ pub fn stale_after(heartbeat: Duration) -> Duration {
 
 pub fn router(service: GsiService) -> Router {
     Router::new()
-        .route("/gsi", post(route_post))
+        .route("/gsi/router", post(route_post))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(service)
 }

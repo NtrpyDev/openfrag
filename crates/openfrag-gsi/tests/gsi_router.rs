@@ -102,7 +102,7 @@ async fn post(
 ) -> axum::response::Response {
     router(service.clone())
         .oneshot(
-            Request::post("/gsi")
+            Request::post("/gsi/router")
                 .header("content-type", content_type)
                 .body(body.into())
                 .expect("request"),
