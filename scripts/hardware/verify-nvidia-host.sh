@@ -3,10 +3,11 @@
 set -euo pipefail
 
 usage() {
-    printf '%s\n' 'Usage: scripts/hardware/verify-nvidia-host.sh --output-dir <existing-directory>'
+    printf '%s\n' 'Usage: scripts/hardware/verify-nvidia-host.sh --output-dir <existing-directory> [--probe-nvenc]'
 }
 
 output_directory=
+probe_nvenc=false
 while (( $# > 0 )); do
     case $1 in
         --output-dir)
@@ -16,6 +17,10 @@ while (( $# > 0 )); do
             fi
             output_directory=$2
             shift 2
+            ;;
+        --probe-nvenc)
+            probe_nvenc=true
+            shift
             ;;
         --help|-h)
             usage
@@ -70,7 +75,17 @@ if [[ $ffmpeg_ready == true ]] \
     && encoder_output=$(ffmpeg -hide_banner -encoders 2>/dev/null) \
     && nvenc_encoders=$(printf '%s\n' "$encoder_output" | grep -Eo '(h264|hevc|av1)_nvenc' | sort -u | paste -sd, -) \
     && [[ -n $nvenc_encoders ]]; then
-    set_check nvenc ready "$nvenc_encoders"
+    if [[ $probe_nvenc == false ]]; then
+        set_check nvenc ready advertised_only
+    elif command -v timeout >/dev/null 2>&1 \
+        && timeout --signal=TERM --kill-after=2s 10s \
+            ffmpeg -nostdin -v error \
+            -f lavfi -i color=c=black:s=128x128:r=1:d=0.1 \
+            -frames:v 1 -an -c:v h264_nvenc -f null - >/dev/null 2>&1; then
+        set_check nvenc ready runtime_verified
+    else
+        set_check nvenc blocked runtime_probe_failed
+    fi
 else
     set_check nvenc blocked unavailable
 fi
@@ -110,7 +125,8 @@ else
 fi
 
 keys=(nvidia_driver nvenc recorder ffmpeg ffprobe pipewire output_directory)
-printf '{"schema_version":1,"ready":%s,"checks":{' "$ready"
+printf '{"schema_version":1,"ready":%s,"nvenc_runtime_probe":%s,"checks":{' \
+    "$ready" "$probe_nvenc"
 separator=
 for key in "${keys[@]}"; do
     printf '%s"%s":{"status":"%s","detail":"%s"}' \
