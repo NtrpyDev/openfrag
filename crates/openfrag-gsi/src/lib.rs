@@ -216,6 +216,10 @@ pub fn ingest_configured(
         if let Some(p) = obj.get_mut("provider").and_then(|v| v.as_object_mut()) {
             p.remove("steamid");
         }
+        if let Some(p) = obj.get_mut("player").and_then(|v| v.as_object_mut()) {
+            p.remove("steamid");
+            p.remove("name");
+        }
     }
     let receipt = Receipt {
         sequence: state.next,
