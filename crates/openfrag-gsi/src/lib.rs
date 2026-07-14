@@ -7,7 +7,7 @@ use axum::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -156,7 +156,6 @@ pub struct Receipt {
 }
 #[derive(Debug, Default)]
 pub struct IngestState {
-    seen: HashSet<String>,
     next: u64,
     pub seed: Option<Receipt>,
     hashes: HashMap<String, Instant>,
@@ -263,50 +262,6 @@ pub fn post_gsi(
     }
 }
 
-fn ingest(state: &mut IngestState, body: &[u8]) -> Result<Option<Receipt>, IngestError> {
-    if body.len() > MAX_BODY_BYTES {
-        return Err(IngestError::TooLarge);
-    }
-    let payload: Payload = serde_json::from_slice(body).map_err(|_| IngestError::InvalidJson)?;
-    if payload.provider.as_ref().and_then(|p| p.appid) != Some(730) {
-        return Err(IngestError::WrongApp);
-    }
-    let fingerprint = payload
-        .provider
-        .as_ref()
-        .and_then(|p| p.timestamp.clone())
-        .unwrap_or_default();
-    if !state.seen.insert(fingerprint) {
-        return Ok(None);
-    }
-    state.next += 1;
-    let mut value: serde_json::Value =
-        serde_json::from_slice(body).map_err(|_| IngestError::InvalidJson)?;
-    if let Some(obj) = value.as_object_mut() {
-        obj.remove("auth");
-        if let Some(provider) = obj.get_mut("provider").and_then(|v| v.as_object_mut()) {
-            provider.remove("steamid");
-        }
-        if let Some(player) = obj.get_mut("player").and_then(|v| v.as_object_mut()) {
-            player.remove("steamid");
-            player.remove("name");
-        }
-    }
-    let receipt = Receipt {
-        sequence: state.next,
-        payload,
-        redacted: value.to_string(),
-        evidence: Evidence::Provisional,
-        payload_hash: String::new(),
-        arrival_ordinal: state.next,
-        receive_elapsed_ms: 0,
-    };
-    if state.seed.is_none() {
-        state.seed = Some(receipt.clone());
-    }
-    Ok(Some(receipt))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,9 +269,13 @@ mod tests {
     fn cap_and_duplicate_and_redaction() {
         let mut s = IngestState::default();
         let b=br#"{"provider":{"appid":730,"timestamp":"1"},"player":{"steamid":"secret"},"auth":{"token":"secret"}}"#;
-        let r = ingest(&mut s, b).unwrap().unwrap();
+        let c = IngestConfig {
+            auth_token: "secret".into(),
+            local_steamid: "secret".into(),
+        };
+        let r = ingest_configured(&mut s, &c, b).unwrap().unwrap();
         assert!(!r.redacted.contains("secret"));
-        assert!(ingest(&mut s, b).unwrap().is_none());
+        assert!(ingest_configured(&mut s, &c, b).unwrap().is_none());
         assert_eq!(
             ingest(&mut s, &vec![b'x'; MAX_BODY_BYTES + 1]),
             Err(IngestError::TooLarge)
