@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+output=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    shift
+    if [ "$#" -eq 0 ]; then
+      printf '%s\n' 'fake recorder requires a value after -o' >&2
+      exit 2
+    fi
+    output=$1
+  fi
+  shift
+done
+
+if [ -z "$output" ]; then
+  printf '%s\n' 'fake recorder requires an output path' >&2
+  exit 2
+fi
+
+printf 'fake recorded media\n' > "$output"
+if [ -n "${OPENFRAG_E2E_FAKE_LOG:-}" ]; then
+  printf '%s\n' 'gpu-screen-recorder' >> "$OPENFRAG_E2E_FAKE_LOG"
+fi
