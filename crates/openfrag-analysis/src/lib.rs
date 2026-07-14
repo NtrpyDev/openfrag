@@ -48,10 +48,19 @@ pub struct AnalysisReceipt {
     pub rating_receipt: RatingReceipt,
 }
 
+/// Applies the immutable domain formula to a fully verified input.
+///
+/// # Errors
+/// Returns the domain validation error when the supplied metrics are inconsistent.
 pub fn rate_verified_input(input: RatingInput) -> Result<RatingReceipt, RatingInputError> {
     calculate_rating(input)
 }
 
+/// Converts ordered parser evidence for one local player into canonical ledgers and a receipt.
+///
+/// # Errors
+/// Returns a typed evidence failure whenever required identity, ordering, state, or timing is absent.
+#[allow(clippy::too_many_lines)]
 pub fn analyze(
     parsed: &ParsedOutput,
     local_steam_id: u64,
@@ -241,6 +250,7 @@ fn build_rounds(
     Ok(rounds)
 }
 
+#[allow(clippy::collapsible_if, clippy::too_many_lines)]
 fn score_round(
     parsed: &ParsedOutput,
     round: &RoundLedger,
@@ -391,6 +401,7 @@ fn team_at(parsed: &ParsedOutput, steam_id: u64, tick: i32) -> Option<i32> {
 pub mod fixtures {
     use openfrag_import::{CalculationIdentity as ImportIdentity, DemoMetadata, ParsedOutput};
 
+    #[must_use]
     pub fn minimal_parsed_output_without_tick_rate() -> ParsedOutput {
         ParsedOutput {
             metadata: DemoMetadata {
