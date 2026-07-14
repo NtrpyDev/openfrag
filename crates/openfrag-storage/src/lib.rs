@@ -165,6 +165,16 @@ pub struct ArtifactInfo {
     pub relative_path: Option<String>,
     pub byte_length: i64,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryResult {
+    pub removed_staging_files: usize,
+    pub marked_missing: usize,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeleteResult {
+    pub clip_deleted: bool,
+    pub artifact_deleted: bool,
+}
 impl ClipDisposition {
     fn as_str(self) -> &'static str {
         match self {
@@ -241,6 +251,7 @@ impl Storage {
         let storage = Self { connection, layout };
         storage.migrate()?;
         storage.recover_staging()?;
+        storage.recover_artifacts()?;
         Ok(storage)
     }
     pub fn layout(&self) -> &Layout {
@@ -412,6 +423,98 @@ impl Storage {
             availability: ArtifactAvailability::parse(&availability)?,
             relative_path,
             byte_length,
+        })
+    }
+    pub fn expect_artifact(
+        &self,
+        sha256: &str,
+        byte_length: i64,
+        media_type: Option<&str>,
+    ) -> Result<()> {
+        if sha256.len() != 64 || byte_length < 0 {
+            return Err(Error::Invalid("expected artifact"));
+        }
+        let n=self.connection.execute("INSERT OR IGNORE INTO artifacts(sha256,byte_length,media_type,availability,created_at_ms) VALUES(?,?,?,'expected',?)",params![sha256,byte_length,media_type,now_ms()])?;
+        if n == 0 {
+            return Err(Error::Conflict("expected artifact"));
+        }
+        Ok(())
+    }
+    pub fn recover_artifacts(&self) -> Result<RecoveryResult> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT sha256,relative_path FROM artifacts WHERE availability='present'")?;
+        let rows = statement.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        let mut missing = 0;
+        for row in rows {
+            let (sha, path) = row?;
+            let Some(path) = path else {
+                continue;
+            };
+            let target = self.layout.root.join(&path);
+            if !target.exists() {
+                self.connection.execute("UPDATE artifacts SET availability='missing',missing_reason='file_missing' WHERE sha256=? AND availability='present'",[sha])?;
+                missing += 1;
+            }
+        }
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.layout.staging)? {
+            let entry = entry?;
+            if entry.file_type()?.is_symlink() {
+                continue;
+            }
+            if entry.file_type()?.is_file() {
+                fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+        Ok(RecoveryResult {
+            removed_staging_files: removed,
+            marked_missing: missing,
+        })
+    }
+    pub fn delete_clip(&self, clip: &ClipId) -> Result<DeleteResult> {
+        let artifact: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT artifact_sha256 FROM clips WHERE id=? AND deleted_at_ms IS NULL",
+                [clip.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let artifact = artifact.ok_or(Error::NotFound("live clip"))?;
+        let n=self.connection.execute("UPDATE clips SET disposition='deleted',deleted_at_ms=? WHERE id=? AND deleted_at_ms IS NULL",params![now_ms(),clip.as_str()])?;
+        if n == 0 {
+            return Err(Error::IllegalTransition("clip delete"));
+        }
+        let remaining: i64 = self.connection.query_row(
+            "SELECT count(*) FROM clips WHERE artifact_sha256=? AND deleted_at_ms IS NULL",
+            [&artifact],
+            |r| r.get(0),
+        )?;
+        if remaining > 0 {
+            return Ok(DeleteResult {
+                clip_deleted: true,
+                artifact_deleted: false,
+            });
+        }
+        let info = self.artifact(&artifact)?;
+        if let Some(relative) = info.relative_path {
+            let path = self.layout.root.join(relative);
+            if path.exists() {
+                fs::remove_file(&path)?;
+                sync_parent(&path)?;
+            }
+        }
+        self.connection.execute(
+            "UPDATE artifacts SET availability='deleted',deleted_at_ms=? WHERE sha256=?",
+            params![now_ms(), artifact],
+        )?;
+        Ok(DeleteResult {
+            clip_deleted: true,
+            artifact_deleted: true,
         })
     }
     pub fn create_capture_session(&self, local_steam_id: &str) -> Result<CaptureSessionId> {
@@ -1028,5 +1131,55 @@ mod tests {
             Err(Error::Invalid(_))
         ));
         assert!(matches!(storage.artifact(&hash), Err(Error::NotFound(_))));
+    }
+    #[test]
+    fn shared_delete_retains_then_tombstones_artifact() {
+        let (_dir, storage) = store();
+        let hash = storage
+            .commit_artifact(storage.stage_artifact(b"shared").unwrap(), "mkv", None)
+            .unwrap();
+        let session = storage.create_capture_session("765").unwrap();
+        let a = storage.request_save(&session, "delete-a", 1).unwrap();
+        storage.complete_save(&a, &hash, 1, 2).unwrap();
+        let first = storage.create_clip(&a, "raw_auto").unwrap();
+        let b = storage.request_save(&session, "delete-b", 1).unwrap();
+        storage.complete_save(&b, &hash, 1, 2).unwrap();
+        let second = storage.create_clip(&b, "raw_auto").unwrap();
+        assert_eq!(
+            storage.delete_clip(&first).unwrap(),
+            DeleteResult {
+                clip_deleted: true,
+                artifact_deleted: false
+            }
+        );
+        assert_eq!(
+            storage.delete_clip(&second).unwrap(),
+            DeleteResult {
+                clip_deleted: true,
+                artifact_deleted: true
+            }
+        );
+        assert_eq!(
+            storage.artifact(&hash).unwrap().availability,
+            ArtifactAvailability::Deleted
+        );
+    }
+    #[test]
+    fn reopen_marks_missing_referenced_artifact() {
+        let (dir, storage) = store();
+        let hash = storage
+            .commit_artifact(storage.stage_artifact(b"missing").unwrap(), "dem", None)
+            .unwrap();
+        let path = storage
+            .layout()
+            .root
+            .join(storage.artifact(&hash).unwrap().relative_path.unwrap());
+        drop(storage);
+        fs::remove_file(path).unwrap();
+        let reopened = Storage::open(Layout::at(dir.path())).unwrap();
+        assert_eq!(
+            reopened.artifact(&hash).unwrap().availability,
+            ArtifactAvailability::Missing
+        );
     }
 }
