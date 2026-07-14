@@ -13,6 +13,7 @@ openfrag-capture = { path = "../openfrag-capture" }
 openfrag-clips = { path = "../openfrag-clips" }
 openfrag-gsi = { path = "../openfrag-gsi" }
 openfrag-import = { path = "../openfrag-import", features = ["demoparser"] }
+openfrag-live = { path = "../openfrag-live" }
 openfrag-pipeline = { path = "../openfrag-pipeline", features = ["demoparser"] }
 openfrag-setup = { path = "../openfrag-setup" }
 openfrag-storage = { path = "../openfrag-storage" }

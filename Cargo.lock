@@ -1043,6 +1043,7 @@ dependencies = [
  "openfrag-clips",
  "openfrag-gsi",
  "openfrag-import",
+ "openfrag-live",
  "openfrag-pipeline",
  "openfrag-setup",
  "openfrag-storage",
