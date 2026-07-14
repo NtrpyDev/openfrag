@@ -3,9 +3,10 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -15,6 +16,7 @@ const ENFORCEMENT_MIGRATION: &str = include_str!("../migrations/0003_enforcement
 const IMPORT_LIFECYCLE_MIGRATION: &str = include_str!("../migrations/0004_import_lifecycle.sql");
 const RATING_AVAILABILITY_MIGRATION: &str =
     include_str!("../migrations/0005_rating_availability.sql");
+const CLIP_REVIEW_MIGRATION: &str = include_str!("../migrations/0006_clip_review.sql");
 
 #[derive(Debug)]
 pub enum Error {
@@ -103,6 +105,30 @@ pub enum ClipDisposition {
     InReview,
     Kept,
     Deleted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipReviewDecision {
+    Pending,
+    Keep,
+    Reject,
+}
+impl ClipReviewDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Keep => "keep",
+            Self::Reject => "reject",
+        }
+    }
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "keep" => Ok(Self::Keep),
+            "reject" => Ok(Self::Reject),
+            _ => Err(Error::Invalid("clip review decision")),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,10 +264,19 @@ pub struct ClipDetailRecord {
     pub artifact_availability: ArtifactAvailability,
     pub provenance: String,
     pub favorite: bool,
+    pub review_decision: ClipReviewDecision,
     pub pre_roll_truncated: bool,
     pub retention_class: String,
     pub note: Option<String>,
     pub tags: Vec<String>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipArtifactRecord {
+    pub clip_id: String,
+    pub sha256: String,
+    pub path: PathBuf,
+    pub byte_length: i64,
+    pub media_type: Option<String>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryResult {
@@ -437,6 +472,7 @@ impl Storage {
                 &checksum,
             )?;
         }
+        ensure_migration(&self.connection, 6, CLIP_REVIEW_MIGRATION)?;
         Ok(())
     }
     pub fn stage_artifact(&self, bytes: &[u8]) -> Result<StagedArtifact> {
@@ -722,6 +758,25 @@ impl Storage {
             )
             .optional()?;
         let artifact = artifact.ok_or(Error::NotFound("live clip"))?;
+        let other_live_clips: i64 = self.connection.query_row(
+            "SELECT count(*) FROM clips WHERE artifact_sha256=? AND id<>? AND deleted_at_ms IS NULL",
+            params![artifact, clip.as_str()],
+            |row| row.get(0),
+        )?;
+        let artifact_path = if other_live_clips == 0 {
+            let info = self.artifact(&artifact)?;
+            if info.availability == ArtifactAvailability::Present {
+                let relative = info
+                    .relative_path
+                    .as_deref()
+                    .ok_or(Error::Invalid("artifact path"))?;
+                Some(self.safe_artifact_path(&artifact, relative, info.byte_length)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let n=self.connection.execute("UPDATE clips SET disposition='deleted',deleted_at_ms=? WHERE id=? AND deleted_at_ms IS NULL",params![now_ms(),clip.as_str()])?;
         if n == 0 {
             return Err(Error::IllegalTransition("clip delete"));
@@ -737,13 +792,11 @@ impl Storage {
                 artifact_deleted: false,
             });
         }
-        let info = self.artifact(&artifact)?;
-        if let Some(relative) = info.relative_path {
-            let path = self.layout.root.join(relative);
-            if path.exists() {
-                fs::remove_file(&path)?;
-                sync_parent(&path)?;
-            }
+        if let Some(path) = artifact_path
+            && path.exists()
+        {
+            fs::remove_file(&path)?;
+            sync_parent(&path)?;
         }
         self.connection.execute(
             "UPDATE artifacts SET availability='deleted',deleted_at_ms=? WHERE sha256=?",
@@ -840,10 +893,68 @@ impl Storage {
         title: Option<&str>,
         favorite: bool,
     ) -> Result<()> {
-        let changed=self.connection.execute("UPDATE clips SET disposition=?, title=?, favorite=? WHERE id=? AND disposition <> 'deleted'",params![disposition.as_str(),title,i64::from(favorite),clip.as_str()])?;
+        let review_decision = if disposition == ClipDisposition::Kept {
+            ClipReviewDecision::Keep
+        } else {
+            ClipReviewDecision::Pending
+        };
+        let changed=self.connection.execute("UPDATE clips SET disposition=?, title=?, favorite=?, review_decision=? WHERE id=? AND disposition <> 'deleted'",params![disposition.as_str(),title,i64::from(favorite),review_decision.as_str(),clip.as_str()])?;
         if changed == 0 {
             return Err(Error::IllegalTransition("clip missing or deleted"));
         }
+        Ok(())
+    }
+    pub fn update_clip_review(
+        &self,
+        clip_id: &str,
+        title: Option<&str>,
+        note: Option<&str>,
+        tags: &[String],
+        decision: ClipReviewDecision,
+        favorite: bool,
+    ) -> Result<()> {
+        if title.is_some_and(|value| value.len() > 200)
+            || note.is_some_and(|value| value.len() > 4_000)
+            || tags.len() > 32
+        {
+            return Err(Error::Invalid("clip review metadata limits"));
+        }
+        let mut unique = HashSet::with_capacity(tags.len());
+        if tags
+            .iter()
+            .any(|tag| tag.trim().is_empty() || tag.len() > 64 || !unique.insert(tag.as_str()))
+        {
+            return Err(Error::Invalid("clip tags"));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let disposition = match decision {
+            ClipReviewDecision::Keep => ClipDisposition::Kept,
+            ClipReviewDecision::Pending | ClipReviewDecision::Reject => ClipDisposition::InReview,
+        };
+        let changed = transaction.execute(
+            "UPDATE clips SET disposition=?,title=?,note=?,favorite=?,review_decision=? WHERE id=? AND disposition<>'deleted'",
+            params![
+                disposition.as_str(),
+                title,
+                note,
+                i64::from(favorite),
+                decision.as_str(),
+                clip_id
+            ],
+        )?;
+        if changed == 0 {
+            return Err(Error::NotFound("live clip"));
+        }
+        transaction.execute("DELETE FROM clip_tags WHERE clip_id=?", [clip_id])?;
+        for (position, tag) in tags.iter().enumerate() {
+            let position =
+                i64::try_from(position).map_err(|_| Error::Invalid("clip tag position"))?;
+            transaction.execute(
+                "INSERT INTO clip_tags(clip_id,position,tag) VALUES(?,?,?)",
+                params![clip_id, position, tag],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
     pub fn derive_clip(
@@ -1216,7 +1327,7 @@ impl Storage {
     }
     #[allow(clippy::type_complexity)]
     pub fn clip_detail(&self, id: &str) -> Result<ClipDetailRecord> {
-        let row: Option<(String,Option<String>,String,i64,i64,String,String,i64,i64,String,String,Option<String>)> = self.connection.query_row("SELECT c.id,c.title,c.disposition,c.recorded_at_ms,c.created_at_ms,c.artifact_sha256,c.provenance,c.favorite,c.pre_roll_truncated,c.retention_class,a.availability,a.missing_reason FROM clips c JOIN artifacts a ON a.sha256=c.artifact_sha256 WHERE c.id=? AND c.disposition<>'deleted'", [id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?))).optional()?;
+        let row: Option<(String,Option<String>,String,i64,i64,String,String,i64,String,i64,String,Option<String>,String,Option<String>)> = self.connection.query_row("SELECT c.id,c.title,c.disposition,c.recorded_at_ms,c.created_at_ms,c.artifact_sha256,c.provenance,c.favorite,c.review_decision,c.pre_roll_truncated,c.retention_class,c.note,a.availability,a.missing_reason FROM clips c JOIN artifacts a ON a.sha256=c.artifact_sha256 WHERE c.id=? AND c.disposition<>'deleted'", [id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?))).optional()?;
         let (
             id,
             title,
@@ -1226,8 +1337,10 @@ impl Storage {
             artifact_sha256,
             provenance,
             favorite,
+            review_decision,
             pre_roll_truncated,
             retention_class,
+            note,
             availability,
             reason,
         ) = row.ok_or(Error::NotFound("clip"))?;
@@ -1240,6 +1353,12 @@ impl Storage {
         } else {
             ArtifactAvailability::parse(&availability)?
         };
+        let mut tags = self
+            .connection
+            .prepare("SELECT tag FROM clip_tags WHERE clip_id=? ORDER BY position")?
+            .query_map([&id], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
+        tags.shrink_to_fit();
         Ok(ClipDetailRecord {
             summary: ClipSummaryRecord {
                 id,
@@ -1252,11 +1371,79 @@ impl Storage {
             artifact_availability,
             provenance,
             favorite: favorite != 0,
+            review_decision: ClipReviewDecision::parse(&review_decision)?,
             pre_roll_truncated: pre_roll_truncated != 0,
             retention_class,
-            note: None,
-            tags: Vec::new(),
+            note,
+            tags,
         })
+    }
+
+    pub fn clip_artifact_file(&self, id: &str) -> Result<ClipArtifactRecord> {
+        let row: Option<(String, String, i64, Option<String>)> = self
+            .connection
+            .query_row(
+                "SELECT a.sha256,a.relative_path,a.byte_length,a.media_type FROM clips c JOIN artifacts a ON a.sha256=c.artifact_sha256 WHERE c.id=? AND c.disposition<>'deleted' AND a.availability='present'",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let (sha256, relative_path, byte_length, media_type) =
+            row.ok_or(Error::NotFound("present clip artifact"))?;
+        let path = self.safe_artifact_path(&sha256, &relative_path, byte_length)?;
+        Ok(ClipArtifactRecord {
+            clip_id: id.to_owned(),
+            sha256,
+            path,
+            byte_length,
+            media_type,
+        })
+    }
+
+    fn safe_artifact_path(
+        &self,
+        sha256: &str,
+        relative_path: &str,
+        byte_length: i64,
+    ) -> Result<PathBuf> {
+        if sha256.len() != 64 {
+            return Err(Error::Invalid("artifact sha256"));
+        }
+        let relative = Path::new(relative_path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(Error::Invalid("unsafe artifact path"));
+        }
+        let expected_prefix = Path::new("artifacts").join("sha256").join(&sha256[..2]);
+        if !relative.starts_with(&expected_prefix)
+            || relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| !name.starts_with(&format!("{sha256}.")))
+        {
+            return Err(Error::Invalid("artifact catalog path mismatch"));
+        }
+        let mut current = self.layout.root.clone();
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                return Err(Error::Invalid("unsafe artifact path"));
+            };
+            current.push(component);
+            if fs::symlink_metadata(&current)?.file_type().is_symlink() {
+                return Err(Error::Invalid("artifact path symlink"));
+            }
+        }
+        let metadata = fs::metadata(&current)?;
+        if !metadata.is_file()
+            || i64::try_from(metadata.len()).map_err(|_| Error::Invalid("artifact too large"))?
+                != byte_length
+        {
+            return Err(Error::Invalid("artifact file metadata mismatch"));
+        }
+        Ok(current)
     }
 
     fn rating_availability(
@@ -1397,6 +1584,23 @@ fn apply_migration(connection: &Connection, version: i64, sql: &str, checksum: &
     tx.commit()?;
     Ok(())
 }
+fn ensure_migration(connection: &Connection, version: i64, sql: &str) -> Result<()> {
+    let checksum = hex_sha256(sql.as_bytes());
+    let found: Option<String> = connection
+        .query_row(
+            "SELECT checksum FROM schema_migrations WHERE version=?",
+            [version],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(found) = found {
+        if found != checksum {
+            return Err(Error::Invalid("migration checksum mismatch"));
+        }
+        return Ok(());
+    }
+    apply_migration(connection, version, sql, &checksum)
+}
 fn set_private_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -1426,6 +1630,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(Layout::at(dir.path())).unwrap();
         (dir, storage)
+    }
+    fn stored_clip(storage: &Storage, request: &str, bytes: &[u8]) -> (ClipId, String) {
+        let hash = storage
+            .commit_artifact(
+                storage.stage_artifact(bytes).unwrap(),
+                "mkv",
+                Some("video/x-matroska"),
+            )
+            .unwrap();
+        let session = storage.create_capture_session("765").unwrap();
+        let attempt = storage.request_save(&session, request, 1).unwrap();
+        storage.complete_save(&attempt, &hash, 1, 2).unwrap();
+        (storage.create_clip(&attempt, "raw_manual").unwrap(), hash)
     }
     #[test]
     fn migration_is_idempotent_and_configured() {
@@ -1475,6 +1692,93 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
+    }
+    #[test]
+    fn clip_review_metadata_and_rejection_survive_reopen() {
+        let (dir, storage) = store();
+        let (clip, hash) = stored_clip(&storage, "review", b"review-media");
+        storage
+            .update_clip_review(
+                clip.as_str(),
+                Some("Three-kill hold"),
+                Some("Good crosshair placement"),
+                &["mirage".to_owned(), "rifle".to_owned()],
+                ClipReviewDecision::Reject,
+                true,
+            )
+            .unwrap();
+        drop(storage);
+
+        let reopened = Storage::open(Layout::at(dir.path())).unwrap();
+        let detail = reopened.clip_detail(clip.as_str()).unwrap();
+        assert_eq!(detail.summary.title.as_deref(), Some("Three-kill hold"));
+        assert_eq!(detail.note.as_deref(), Some("Good crosshair placement"));
+        assert_eq!(detail.tags, ["mirage", "rifle"]);
+        assert_eq!(detail.review_decision, ClipReviewDecision::Reject);
+        assert!(detail.favorite);
+        assert_eq!(
+            reopened.artifact(&hash).unwrap().availability,
+            ArtifactAvailability::Present
+        );
+    }
+    #[test]
+    fn invalid_review_update_is_atomic() {
+        let (_dir, storage) = store();
+        let (clip, _) = stored_clip(&storage, "atomic-review", b"atomic-media");
+        storage
+            .update_clip_review(
+                clip.as_str(),
+                Some("Original"),
+                Some("Original note"),
+                &["first".to_owned()],
+                ClipReviewDecision::Keep,
+                false,
+            )
+            .unwrap();
+        assert!(matches!(
+            storage.update_clip_review(
+                clip.as_str(),
+                Some("Replacement"),
+                None,
+                &["duplicate".to_owned(), "duplicate".to_owned()],
+                ClipReviewDecision::Reject,
+                true,
+            ),
+            Err(Error::Invalid("clip tags"))
+        ));
+        let detail = storage.clip_detail(clip.as_str()).unwrap();
+        assert_eq!(detail.summary.title.as_deref(), Some("Original"));
+        assert_eq!(detail.note.as_deref(), Some("Original note"));
+        assert_eq!(detail.tags, ["first"]);
+        assert_eq!(detail.review_decision, ClipReviewDecision::Keep);
+        assert!(!detail.favorite);
+    }
+    #[test]
+    fn clip_artifact_lookup_returns_only_verified_catalog_file() {
+        let (_dir, storage) = store();
+        let (clip, hash) = stored_clip(&storage, "lookup", b"lookup-media");
+        let file = storage.clip_artifact_file(clip.as_str()).unwrap();
+        assert_eq!(file.sha256, hash);
+        assert_eq!(file.byte_length, 12);
+        assert_eq!(file.media_type.as_deref(), Some("video/x-matroska"));
+        assert_eq!(fs::read(file.path).unwrap(), b"lookup-media");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn clip_artifact_lookup_rejects_catalog_path_symlinks() {
+        use std::os::unix::fs::symlink;
+        let (dir, storage) = store();
+        let (clip, hash) = stored_clip(&storage, "lookup-symlink", b"media");
+        let relative = storage.artifact(&hash).unwrap().relative_path.unwrap();
+        let path = storage.layout().root.join(relative);
+        fs::remove_file(&path).unwrap();
+        let outside = dir.path().join("outside.mkv");
+        fs::write(&outside, b"media").unwrap();
+        symlink(&outside, &path).unwrap();
+        assert!(matches!(
+            storage.clip_artifact_file(clip.as_str()),
+            Err(Error::Invalid("artifact path symlink"))
+        ));
     }
     #[test]
     fn reconciliation_is_per_run() {
