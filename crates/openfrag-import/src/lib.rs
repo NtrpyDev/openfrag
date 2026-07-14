@@ -101,6 +101,8 @@ pub struct DemoMetadata {
     pub demo_stamp: Option<String>,
     pub server: Option<String>,
     pub game_directory: Option<String>,
+    pub tick_rate: Option<String>,
+    pub tick_rate_unavailable_reason: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Participant {
@@ -114,7 +116,46 @@ pub struct ParsedEvent {
     pub tick: i32,
     pub ingestion_ordinal: u64,
     pub fields: BTreeMap<String, String>,
-    pub raw_fields: BTreeMap<String, String>,
+    pub raw_fields: BTreeMap<String, serde_json::Value>,
+}
+impl ParsedEvent {
+    pub fn u64_field(&self, name: &str) -> Option<u64> {
+        let value = self.raw_fields.get(name)?;
+        value.as_u64().or_else(|| value.as_str()?.parse().ok())
+    }
+    pub fn i64_field(&self, name: &str) -> Option<i64> {
+        self.raw_fields.get(name)?.as_i64()
+    }
+    pub fn bool_field(&self, name: &str) -> Option<bool> {
+        self.raw_fields.get(name)?.as_bool()
+    }
+    pub fn string_field(&self, name: &str) -> Option<&str> {
+        self.raw_fields.get(name)?.as_str()
+    }
+    pub fn attacker(&self) -> Option<u64> {
+        self.u64_field("attacker_steamid")
+            .or_else(|| self.u64_field("attacker"))
+    }
+    pub fn victim(&self) -> Option<u64> {
+        self.u64_field("user_steamid")
+            .or_else(|| self.u64_field("userid"))
+            .or_else(|| self.u64_field("victim"))
+    }
+    pub fn assister(&self) -> Option<u64> {
+        self.u64_field("assister")
+    }
+    pub fn assisted_flash(&self) -> Option<bool> {
+        self.bool_field("assistedflash")
+    }
+    pub fn damage_health(&self) -> Option<i64> {
+        self.i64_field("dmg_health")
+    }
+    pub fn weapon(&self) -> Option<&str> {
+        self.string_field("weapon")
+    }
+    pub fn winner(&self) -> Option<i64> {
+        self.i64_field("winner")
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventReceipt {
@@ -122,7 +163,8 @@ pub struct EventReceipt {
     pub event_name: String,
     pub tick: i32,
     pub fields: BTreeMap<String, String>,
-    pub raw_fields: BTreeMap<String, String>,
+    pub raw_fields: BTreeMap<String, serde_json::Value>,
+    pub evidence_sha256: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedRound {
@@ -131,12 +173,26 @@ pub struct ParsedRound {
     pub winner: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerSnapshot {
+    pub tick: i32,
+    pub ingestion_ordinal: u64,
+    pub steam_id: u64,
+    pub entity_id: Option<i32>,
+    pub team: Option<i32>,
+    pub health: Option<i32>,
+    pub alive: Option<bool>,
+    pub life_state: Option<i32>,
+    pub round_counter: Option<i32>,
+    pub raw_properties: BTreeMap<String, serde_json::Value>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedOutput {
     pub metadata: DemoMetadata,
     pub participants: Vec<Participant>,
     pub rounds: Vec<ParsedRound>,
     pub events: Vec<ParsedEvent>,
     pub receipts: Vec<EventReceipt>,
+    pub player_snapshots: Vec<PlayerSnapshot>,
     pub suspicious_empty: bool,
     pub identity: CalculationIdentity,
 }
@@ -151,16 +207,19 @@ impl ParsedOutput {
 
 pub const DEMOPARSER_COMMIT: &str = "ba39cc44cd5abfd7f34df2b3c0a7dd3630048311";
 pub const DEMOPARSER_BUILD: &str = "parser-0.1.1/csgoproto-0.1.5";
-pub const QUERY_PLAN_VERSION: &str = "openfrag-v1-events-1";
-pub const QUERY_PLAN: &[&str] = &[
+pub const QUERY_PLAN_VERSION: &str = "openfrag-evidence-query-2";
+pub const EVENT_QUERY: &[&str] = &[
     "round_freeze_end",
     "round_end",
     "player_hurt",
     "player_death",
     "player_disconnect",
+];
+pub const PROPERTY_QUERY: &[&str] = &[
     "player_steamid",
     "team_num",
     "is_alive",
+    "life_state",
     "health",
     "total_rounds_played",
     "tick_rate",
@@ -176,6 +235,16 @@ pub const QUERY_PLAN: &[&str] = &[
 pub const EVIDENCE_SEMANTICS_EPOCH: &str = "openfrag-evidence-1";
 pub const GENERATED_PROTO_BUILD: &str = "csgoproto-0.1.5";
 
+pub fn query_plan_hash() -> String {
+    let canonical = format!(
+        "{}\nevents:{}\nproperties:{}",
+        QUERY_PLAN_VERSION,
+        EVENT_QUERY.join(","),
+        PROPERTY_QUERY.join(",")
+    );
+    format!("{:x}", Sha256::digest(canonical.as_bytes()))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParserError {
     Io(String),
@@ -186,11 +255,11 @@ pub enum ParserError {
 pub fn parser_capability() -> ParserCapability {
     #[cfg(feature = "demoparser")]
     {
-        return ParserCapability::Pinned {
+        ParserCapability::Pinned {
             commit: DEMOPARSER_COMMIT.into(),
             build: DEMOPARSER_BUILD.into(),
-            schema_hash: QUERY_PLAN_VERSION.into(),
-        };
+            schema_hash: query_plan_hash(),
+        }
     }
     #[cfg(not(feature = "demoparser"))]
     {
@@ -207,6 +276,7 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
     use demoparser_parser::{
         first_pass::parser_settings::ParserInputs,
         parse_demo::{Parser, ParsingMode},
+        second_pass::variants::{soa_to_aos, OutputSerdeHelperStruct},
     };
     let bytes = std::fs::read(path).map_err(|e| ParserError::Io(e.to_string()))?;
     let huf = create_huffman_lookup_table();
@@ -217,11 +287,13 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
             "player_steamid".into(),
             "team_num".into(),
             "is_alive".into(),
+            "life_state".into(),
+            "health".into(),
         ],
         wanted_other_props: vec!["total_rounds_played".into()],
         wanted_prop_states: AHashMap::new(),
         wanted_ticks: vec![],
-        wanted_events: QUERY_PLAN.iter().map(|s| (*s).into()).collect(),
+        wanted_events: EVENT_QUERY.iter().map(|s| (*s).into()).collect(),
         parse_ents: true,
         parse_projectiles: false,
         parse_grenades: false,
@@ -236,6 +308,70 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
     let out = parser
         .parse_demo(&bytes)
         .map_err(|e| ParserError::Parse(e.to_string()))?;
+    let mut evidence_ticks: Vec<i32> = out.game_events.iter().map(|event| event.tick).collect();
+    evidence_ticks.sort_unstable();
+    evidence_ticks.dedup();
+    let snapshot_inputs = ParserInputs {
+        real_name_to_og_name: AHashMap::new(),
+        wanted_players: vec![],
+        wanted_player_props: vec![
+            "player_steamid".into(),
+            "team_num".into(),
+            "is_alive".into(),
+            "life_state".into(),
+            "health".into(),
+        ],
+        wanted_other_props: vec!["total_rounds_played".into()],
+        wanted_prop_states: AHashMap::new(),
+        wanted_ticks: evidence_ticks,
+        wanted_events: vec![],
+        parse_ents: true,
+        parse_projectiles: false,
+        parse_grenades: false,
+        only_header: false,
+        only_convars: false,
+        huffman_lookup_table: &huf,
+        order_by_steamid: false,
+        list_props: false,
+        fallback_bytes: None,
+    };
+    let mut snapshot_parser = Parser::new(snapshot_inputs, ParsingMode::Normal);
+    let snapshot_out = snapshot_parser
+        .parse_demo(&bytes)
+        .map_err(|e| ParserError::Parse(e.to_string()))?;
+    let player_snapshots = soa_to_aos(OutputSerdeHelperStruct {
+        prop_infos: snapshot_out.prop_controller.prop_infos.clone(),
+        inner: snapshot_out.df.into(),
+    })
+    .into_iter()
+    .enumerate()
+    .filter_map(|(ordinal, row)| {
+        let raw_properties: BTreeMap<String, serde_json::Value> = row
+            .into_iter()
+            .filter_map(|(name, value)| {
+                value.and_then(|v| serde_json::to_value(v).ok().map(|v| (name, v)))
+            })
+            .collect();
+        let i64_value = |name: &str| raw_properties.get(name).and_then(serde_json::Value::as_i64);
+        let steam_id = raw_properties
+            .get("steamid")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))?;
+        Some(PlayerSnapshot {
+            tick: i64_value("tick")? as i32,
+            ingestion_ordinal: ordinal as u64,
+            steam_id,
+            entity_id: i64_value("entity_id").map(|v| v as i32),
+            team: i64_value("team_num").map(|v| v as i32),
+            health: i64_value("health").map(|v| v as i32),
+            alive: raw_properties
+                .get("is_alive")
+                .and_then(serde_json::Value::as_bool),
+            life_state: i64_value("life_state").map(|v| v as i32),
+            round_counter: i64_value("total_rounds_played").map(|v| v as i32),
+            raw_properties,
+        })
+    })
+    .collect::<Vec<_>>();
     let header = out.header.unwrap_or_default();
     let participants: Vec<Participant> = out
         .roster
@@ -256,16 +392,25 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
         let fields: BTreeMap<String, String> = event
             .fields
             .iter()
-            .map(|f| (f.name.clone(), format!("{:?}", f.data)))
+            .filter_map(|f| {
+                f.data.as_ref().map(|v| {
+                    (
+                        f.name.clone(),
+                        serde_json::to_value(v)
+                            .unwrap_or(serde_json::Value::Null)
+                            .to_string(),
+                    )
+                })
+            })
             .collect();
-        let raw_fields: BTreeMap<String, String> = event
+        let raw_fields: BTreeMap<String, serde_json::Value> = event
             .fields
             .iter()
             .filter_map(|f| {
                 f.data.as_ref().map(|v| {
                     (
                         f.name.clone(),
-                        serde_json::to_string(v).unwrap_or_else(|_| "null".into()),
+                        serde_json::to_value(v).unwrap_or(serde_json::Value::Null),
                     )
                 })
             })
@@ -285,12 +430,20 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
                 winner: fields.get("winner").cloned(),
             });
         }
+        let evidence_sha256 = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(ordinal, &event.name, event.tick, &raw_fields))
+                    .map_err(|e| ParserError::Parse(e.to_string()))?
+            )
+        );
         receipts.push(EventReceipt {
             ingestion_ordinal: ordinal as u64,
             event_name: event.name.clone(),
             tick: event.tick,
             fields: fields.clone(),
             raw_fields,
+            evidence_sha256,
         });
         events.push(parsed);
     }
@@ -312,7 +465,20 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
             reason: "no requested player_death events",
         });
     }
-    let query_hash = format!("{:x}", Sha256::digest(QUERY_PLAN.join("\n").as_bytes()));
+    for required in ["round_freeze_end", "player_hurt"] {
+        if !events.iter().any(|event| event.name == required) {
+            return Err(ParserError::Quarantined {
+                reason: "missing required rating evidence event",
+            });
+        }
+    }
+    if player_snapshots.is_empty() {
+        return Err(ParserError::Quarantined {
+            reason: "no requested player snapshots",
+        });
+    }
+    let query_hash = query_plan_hash();
+    let source_sha256 = format!("{:x}", Sha256::digest(&bytes));
     Ok(ParsedOutput {
         metadata: DemoMetadata {
             map: header.get("map_name").cloned(),
@@ -320,20 +486,24 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
             demo_stamp: header.get("demo_file_stamp").cloned(),
             server: header.get("server_name").cloned(),
             game_directory: header.get("game_directory").cloned(),
+            tick_rate: out.convars.get("sv_tickrate").cloned(),
+            tick_rate_unavailable_reason: (!out.convars.contains_key("sv_tickrate"))
+                .then(|| "pinned parser did not expose sv_tickrate in demo convars".into()),
         },
         participants,
         rounds,
         events,
         receipts,
+        player_snapshots,
         suspicious_empty,
         identity: CalculationIdentity {
-            source_sha256: String::new(),
+            source_sha256,
             parser_commit: DEMOPARSER_COMMIT.into(),
             parser_build: DEMOPARSER_BUILD.into(),
             generated_proto_build: GENERATED_PROTO_BUILD.into(),
             requested_schema_hash: query_hash,
             metric_definition_version: "openfrag-rating-1".into(),
-            formula_version: "openfrag-rating-1".into(),
+            formula_version: "ofr-1.0.0".into(),
             evidence_semantics_epoch: EVIDENCE_SEMANTICS_EPOCH.into(),
         },
     })
@@ -867,6 +1037,20 @@ mod tests {
 
     #[cfg(feature = "demoparser")]
     #[test]
+    fn pinned_capability_uses_canonical_query_identity() {
+        assert_eq!(
+            parser_capability(),
+            ParserCapability::Pinned {
+                commit: DEMOPARSER_COMMIT.into(),
+                build: DEMOPARSER_BUILD.into(),
+                schema_hash: query_plan_hash(),
+            }
+        );
+        assert_ne!(query_plan_hash(), QUERY_PLAN_VERSION);
+    }
+
+    #[cfg(feature = "demoparser")]
+    #[test]
     fn pinned_fixture_adapter_smoke_when_requested() {
         let Ok(path) = std::env::var("OPENFRAG_DEMOPARSER_FIXTURE") else {
             return;
@@ -878,7 +1062,62 @@ mod tests {
         assert_eq!(parsed.metadata.map.as_deref(), Some("de_mirage"));
         assert_eq!(parsed.participants.len(), 10);
         assert_eq!(parsed.rounds.len(), 10);
-        assert_eq!(parsed.events.len(), 83);
+        assert_eq!(parsed.events.len(), 366);
+        assert_eq!(
+            parsed
+                .events
+                .iter()
+                .filter(|e| e.name == "player_hurt")
+                .count(),
+            264
+        );
+        assert_eq!(
+            parsed
+                .events
+                .iter()
+                .filter(|e| e.name == "player_death")
+                .count(),
+            73
+        );
+        assert_eq!(
+            parsed
+                .events
+                .iter()
+                .filter(|e| e.name == "round_freeze_end")
+                .count(),
+            9
+        );
+        let hurt = parsed
+            .events
+            .iter()
+            .find(|e| e.name == "player_hurt")
+            .unwrap();
+        assert_eq!(hurt.attacker(), Some(76561197964020430));
+        assert_eq!(hurt.victim(), Some(76561198073049527));
+        assert_eq!(hurt.damage_health(), Some(100));
+        assert_eq!(hurt.weapon(), Some("p250"));
+        let death = parsed
+            .events
+            .iter()
+            .find(|e| e.name == "player_death")
+            .unwrap();
+        assert_eq!(death.attacker(), Some(76561197964020430));
+        assert_eq!(death.victim(), Some(76561198073049527));
+        assert_eq!(death.weapon(), Some("p250"));
+        assert!(!parsed.player_snapshots.is_empty());
+        assert!(parsed.player_snapshots.iter().all(|snapshot| parsed
+            .participants
+            .iter()
+            .any(|participant| participant.steam_id == snapshot.steam_id)));
+        assert!(
+            parsed.metadata.tick_rate.is_some()
+                || parsed.metadata.tick_rate_unavailable_reason.is_some()
+        );
+        assert_eq!(
+            parsed.identity.source_sha256,
+            "84a1a4191302bdd2a3bbb5a727842093744b1fb1a228aeec630369e44b622cb2"
+        );
+        assert_eq!(parsed.identity.formula_version, "ofr-1.0.0");
         assert!(parsed
             .events
             .iter()
