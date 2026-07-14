@@ -116,6 +116,8 @@ pub struct MapState {
 pub struct PlayerState {
     pub activity: Option<String>,
     pub state: Option<PlayerHealth>,
+    pub steamid: Option<String>,
+    pub name: Option<String>,
     pub weapons: Option<serde_json::Value>,
     pub match_stats: Option<MatchStats>,
 }
@@ -191,10 +193,10 @@ pub fn ingest_configured(
     if payload.provider.as_ref().and_then(|p| p.appid) != Some(730) {
         return Err(IngestError::WrongApp);
     }
-    if payload.provider.as_ref().and_then(|p| p.steamid.as_deref())
+    if payload.player.as_ref().and_then(|p| p.steamid.as_deref())
         != Some(config.local_steamid.as_str())
     {
-        return Err(IngestError::WrongApp);
+        return Err(IngestError::Unauthorized);
     }
     if payload.auth.as_ref().and_then(|a| a.token.as_deref()) != Some(config.auth_token.as_str()) {
         return Err(IngestError::WrongApp);
@@ -283,6 +285,10 @@ pub fn ingest(state: &mut IngestState, body: &[u8]) -> Result<Option<Receipt>, I
         if let Some(provider) = obj.get_mut("provider").and_then(|v| v.as_object_mut()) {
             provider.remove("steamid");
         }
+        if let Some(player) = obj.get_mut("player").and_then(|v| v.as_object_mut()) {
+            player.remove("steamid");
+            player.remove("name");
+        }
     }
     let receipt = Receipt {
         sequence: state.next,
@@ -305,7 +311,7 @@ mod tests {
     #[test]
     fn cap_and_duplicate_and_redaction() {
         let mut s = IngestState::default();
-        let b=br#"{"provider":{"appid":730,"timestamp":"1","steamid":"secret"},"auth":{"token":"secret"}}"#;
+        let b=br#"{"provider":{"appid":730,"timestamp":"1"},"player":{"steamid":"secret"},"auth":{"token":"secret"}}"#;
         let r = ingest(&mut s, b).unwrap().unwrap();
         assert!(!r.redacted.contains("secret"));
         assert!(ingest(&mut s, b).unwrap().is_none());
