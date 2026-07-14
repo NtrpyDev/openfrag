@@ -96,7 +96,9 @@ function analyseAimMetrics(input) {
   } = input;
 
   const sortedRoundEnds = [...roundEnds].sort((a, b) => a.tick - b.tick);
-  const firearmHurts = playerHurts.filter(isEnemyFirearmHurt);
+  const firearmHurts = playerHurts
+    .map((event, rawHurtOrdinal) => ({ ...event, rawHurtOrdinal }))
+    .filter(isEnemyFirearmHurt);
   const pseudonyms = buildPseudonyms([...playerHurts, ...weaponFires], tickRows);
   const player = (steamid) => pseudonyms.get(String(steamid)) || null;
 
@@ -107,7 +109,7 @@ function analyseAimMetrics(input) {
 
   const crosshairRecords = [];
   const crosshairMissingState = [];
-  firearmHurts.forEach((hurt, hurtOrdinal) => {
+  firearmHurts.forEach((hurt) => {
     const attacker = tickState.get(`${hurt.tick}|${hurt.attacker_steamid}`);
     const victim = tickState.get(`${hurt.tick}|${hurt.user_steamid}`);
     const required = attacker && victim
@@ -115,7 +117,7 @@ function analyseAimMetrics(input) {
       : [];
     if (!attacker || !victim || !required.every(Number.isFinite)) {
       crosshairMissingState.push({
-        hurt_ordinal: hurtOrdinal,
+        hurt_ordinal: hurt.rawHurtOrdinal,
         tick: hurt.tick,
         attacker: player(hurt.attacker_steamid),
         victim: player(hurt.user_steamid),
@@ -126,7 +128,7 @@ function analyseAimMetrics(input) {
     const targetBearing = Math.atan2(victim.Y - attacker.Y, victim.X - attacker.X) * 180 / Math.PI;
     const signedError = wrapDegrees(targetBearing - attacker.yaw);
     crosshairRecords.push({
-      receipt_id: `hurt-${hurtOrdinal}`,
+      receipt_id: `hurt-${hurt.rawHurtOrdinal}`,
       round: roundAtTick(hurt.tick, sortedRoundEnds),
       tick: hurt.tick,
       attacker: player(hurt.attacker_steamid),
@@ -157,12 +159,12 @@ function analyseAimMetrics(input) {
     fireByExactKey.get(key).push(fire);
   }
 
-  const shotToHurtRecords = firearmHurts.map((hurt, hurtOrdinal) => {
+  const shotToHurtRecords = firearmHurts.map((hurt) => {
     const weapon = canonicalWeapon(hurt.weapon);
     const key = `${hurt.tick}|${hurt.attacker_steamid}|${weapon}`;
     const candidates = fireByExactKey.get(key) || [];
     return {
-      receipt_id: `hurt-${hurtOrdinal}`,
+      receipt_id: `hurt-${hurt.rawHurtOrdinal}`,
       round: roundAtTick(hurt.tick, sortedRoundEnds),
       tick: hurt.tick,
       attacker: player(hurt.attacker_steamid),
