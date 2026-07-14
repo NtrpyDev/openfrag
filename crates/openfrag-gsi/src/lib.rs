@@ -10,11 +10,14 @@ use axum::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
+    fmt::Write as _,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 pub const MAX_BODY_BYTES: usize = 128 * 1024;
+pub const DUPLICATE_WINDOW: Duration = Duration::from_secs(2);
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> Duration;
@@ -30,8 +33,19 @@ pub struct EvidenceReceipt {
     pub received_at: Duration,
     pub payload_hash: String,
     pub presence: PresenceBits,
+    pub context: EvidenceContext,
     pub output: StateOutput,
+    /// Facts co-observed in one snapshot transition; vector order is not event order.
     pub facts: Vec<TransitionFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceContext {
+    pub map_hash: Option<String>,
+    pub observed_round: Option<u64>,
+    pub provider_timestamp: Option<i64>,
+    pub round_kills: Option<i64>,
+    pub health: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +56,9 @@ pub struct PresenceBits {
     pub map_round: bool,
     pub player: bool,
     pub player_state: bool,
+    pub player_health: bool,
+    pub player_round_kills: bool,
+    pub player_weapons: bool,
     pub match_stats: bool,
     pub auth: bool,
     pub auth_token: bool,
@@ -71,9 +88,29 @@ pub enum ServiceDiagnostic {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransitionFact {
-    Kill { previous: i64, current: i64 },
-    Death { previous: i64, current: i64 },
-    RoundEnd { completed: u64, next: u64 },
+    CumulativeKillDelta {
+        previous: i64,
+        current: i64,
+        delta: i64,
+    },
+    CumulativeDeathDelta {
+        previous: i64,
+        current: i64,
+        delta: i64,
+    },
+    RoundKillDelta {
+        previous: i64,
+        current: i64,
+        delta: i64,
+    },
+    HealthDepleted {
+        previous: i64,
+        current: i64,
+    },
+    RoundEnd {
+        completed: u64,
+        next: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -131,8 +168,11 @@ impl GsiService {
         {
             return Ok(PollOutcome::NoChange);
         }
-        let (Some(payload_hash), Some(presence)) = (guard.last_hash.clone(), guard.last_presence)
-        else {
+        let (Some(payload_hash), Some(presence), Some(context)) = (
+            guard.last_hash.clone(),
+            guard.last_presence,
+            guard.last_context.clone(),
+        ) else {
             return Ok(PollOutcome::NoChange);
         };
         let receipt = EvidenceReceipt {
@@ -140,6 +180,7 @@ impl GsiService {
             received_at: now,
             payload_hash,
             presence,
+            context,
             output: StateOutput::Stale,
             facts: Vec::new(),
         };
@@ -148,6 +189,8 @@ impl GsiService {
             .map_err(|_| ServiceDiagnostic::SinkFailure)?;
         guard.sequence = receipt.sequence;
         guard.stale = true;
+        guard.snapshot = None;
+        guard.recent_hashes.clear();
         Ok(PollOutcome::Stale)
     }
 }
@@ -187,12 +230,19 @@ async fn route_post(
         .as_ref()
         .and_then(|auth| auth.token.as_deref())
         .is_some_and(|token| digest(token.as_bytes()) == service.config.auth_token_hash);
+    if !token_matches {
+        return (StatusCode::UNAUTHORIZED, "unauthorized");
+    }
     let player_matches = payload
         .player
         .as_ref()
         .and_then(|player| player.steamid.as_deref())
         .is_some_and(|steamid| digest(steamid.as_bytes()) == service.config.local_steamid_hash);
-    if !token_matches || !player_matches {
+    if !player_matches {
+        let Ok(mut guard) = service.engine.lock() else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "state-unavailable");
+        };
+        guard.clear_transition_baselines();
         return (StatusCode::UNAUTHORIZED, "unauthorized");
     }
 
@@ -210,31 +260,48 @@ async fn route_post(
     let Ok(mut guard) = service.engine.lock() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "state-unavailable");
     };
-    if guard.last_hash.as_deref() == Some(hash.as_str()) {
+    guard
+        .recent_hashes
+        .retain(|_, seen_at| received_at.saturating_sub(*seen_at) <= DUPLICATE_WINDOW);
+    if guard
+        .recent_hashes
+        .get(&hash)
+        .is_some_and(|seen_at| received_at.saturating_sub(*seen_at) <= DUPLICATE_WINDOW)
+    {
         return (StatusCode::OK, "duplicate");
     }
 
     let snapshot = TrustedSnapshot::from(&payload);
-    let (output, facts) = match guard.snapshot.as_ref() {
-        None => (StateOutput::Seeded, Vec::new()),
-        Some(_) if guard.stale => (StateOutput::Recovered, Vec::new()),
-        Some(previous) => derive_transition(previous, &snapshot),
+    let (output, facts) = if guard.stale {
+        (StateOutput::Recovered, Vec::new())
+    } else {
+        match guard.snapshot.as_ref() {
+            None => (StateOutput::Seeded, Vec::new()),
+            Some(previous) => derive_transition(previous, &snapshot),
+        }
     };
     let presence = PresenceBits::from(&payload);
+    let context = EvidenceContext::from(&snapshot);
     let receipt = EvidenceReceipt {
         sequence: guard.sequence + 1,
         received_at,
         payload_hash: hash.clone(),
         presence,
+        context: context.clone(),
         output,
         facts,
     };
     if service.sink.emit(receipt.clone()).is_err() {
         return (StatusCode::INTERNAL_SERVER_ERROR, "sink-failure");
     }
+    if output == StateOutput::SessionReset {
+        guard.clear_transition_baselines();
+    }
     guard.sequence = receipt.sequence;
+    guard.recent_hashes.insert(hash.clone(), received_at);
     guard.last_hash = Some(hash);
     guard.last_presence = Some(presence);
+    guard.last_context = Some(context);
     guard.last_received_at = Some(received_at);
     guard.snapshot = Some(snapshot);
     guard.stale = false;
@@ -271,11 +338,15 @@ struct Auth {
 struct PlayerState {
     steamid: Option<String>,
     state: Option<PlayerVitals>,
+    weapons: Option<serde_json::Value>,
     match_stats: Option<MatchStats>,
 }
 
 #[derive(Deserialize)]
-struct PlayerVitals {}
+struct PlayerVitals {
+    health: Option<i64>,
+    round_kills: Option<i64>,
+}
 
 #[derive(Deserialize)]
 struct MatchStats {
@@ -298,6 +369,20 @@ impl From<&Payload> for PresenceBits {
                 .player
                 .as_ref()
                 .is_some_and(|player| player.state.is_some()),
+            player_health: payload
+                .player
+                .as_ref()
+                .and_then(|player| player.state.as_ref())
+                .is_some_and(|state| state.health.is_some()),
+            player_round_kills: payload
+                .player
+                .as_ref()
+                .and_then(|player| player.state.as_ref())
+                .is_some_and(|state| state.round_kills.is_some()),
+            player_weapons: payload
+                .player
+                .as_ref()
+                .is_some_and(|player| player.weapons.is_some()),
             match_stats: payload
                 .player
                 .as_ref()
@@ -319,18 +404,36 @@ impl From<&Payload> for PresenceBits {
 struct EngineState {
     sequence: u64,
     snapshot: Option<TrustedSnapshot>,
+    recent_hashes: HashMap<String, Duration>,
     last_hash: Option<String>,
     last_presence: Option<PresenceBits>,
+    last_context: Option<EvidenceContext>,
     last_received_at: Option<Duration>,
     stale: bool,
+}
+
+impl EngineState {
+    fn clear_transition_baselines(&mut self) {
+        self.snapshot = None;
+        self.recent_hashes.clear();
+        self.last_hash = None;
+        self.last_presence = None;
+        self.last_context = None;
+        self.last_received_at = None;
+        self.stale = false;
+    }
 }
 
 #[derive(Debug, Clone)]
 struct TrustedSnapshot {
     session_hash: Option<[u8; 32]>,
+    map_hash: Option<[u8; 32]>,
     round: Option<u64>,
+    provider_timestamp: Option<i64>,
     kills: Option<i64>,
     deaths: Option<i64>,
+    round_kills: Option<i64>,
+    health: Option<i64>,
 }
 
 impl From<&Payload> for TrustedSnapshot {
@@ -349,15 +452,47 @@ impl From<&Payload> for TrustedSnapshot {
             }
             Some(session.finalize().into())
         });
+        let map_hash = payload
+            .map
+            .as_ref()
+            .and_then(|map| map.name.as_deref())
+            .map(|name| digest(name.as_bytes()));
         let stats = payload
             .player
             .as_ref()
             .and_then(|player| player.match_stats.as_ref());
         Self {
             session_hash,
+            map_hash,
             round: payload.map.as_ref().and_then(|map| map.round),
+            provider_timestamp: payload
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.timestamp),
             kills: stats.and_then(|stats| stats.kills),
             deaths: stats.and_then(|stats| stats.deaths),
+            round_kills: payload
+                .player
+                .as_ref()
+                .and_then(|player| player.state.as_ref())
+                .and_then(|state| state.round_kills),
+            health: payload
+                .player
+                .as_ref()
+                .and_then(|player| player.state.as_ref())
+                .and_then(|state| state.health),
+        }
+    }
+}
+
+impl From<&TrustedSnapshot> for EvidenceContext {
+    fn from(snapshot: &TrustedSnapshot) -> Self {
+        Self {
+            map_hash: snapshot.map_hash.map(hex_array),
+            observed_round: snapshot.round,
+            provider_timestamp: snapshot.provider_timestamp,
+            round_kills: snapshot.round_kills,
+            health: snapshot.health,
         }
     }
 }
@@ -375,18 +510,48 @@ fn derive_transition(
         && previous >= 0
         && current > previous
     {
-        facts.push(TransitionFact::Kill { previous, current });
+        facts.push(TransitionFact::CumulativeKillDelta {
+            previous,
+            current,
+            delta: current - previous,
+        });
     }
     if let (Some(previous), Some(current)) = (previous.deaths, current.deaths)
         && previous >= 0
         && current > previous
     {
-        facts.push(TransitionFact::Death { previous, current });
+        facts.push(TransitionFact::CumulativeDeathDelta {
+            previous,
+            current,
+            delta: current - previous,
+        });
     }
-    if let (Some(completed), Some(next)) = (previous.round, current.round)
-        && next > completed
+    let same_round = matches!((previous.round, current.round), (Some(previous), Some(current)) if previous == current);
+    if same_round
+        && let (Some(previous), Some(current)) = (previous.round_kills, current.round_kills)
+        && previous >= 0
+        && current > previous
     {
-        facts.push(TransitionFact::RoundEnd { completed, next });
+        facts.push(TransitionFact::RoundKillDelta {
+            previous,
+            current,
+            delta: current - previous,
+        });
+    }
+    if same_round
+        && let (Some(previous), Some(current)) = (previous.health, current.health)
+        && previous > 0
+        && current <= 0
+    {
+        facts.push(TransitionFact::HealthDepleted { previous, current });
+    }
+    if let (Some(previous), Some(current)) = (previous.round, current.round) {
+        for completed in previous..current {
+            facts.push(TransitionFact::RoundEnd {
+                completed,
+                next: completed + 1,
+            });
+        }
     }
     (StateOutput::Healthy, facts)
 }
@@ -398,6 +563,7 @@ fn session_reset(previous: &TrustedSnapshot, current: &TrustedSnapshot) -> bool 
     ) || decreased(previous.round, current.round)
         || decreased(previous.kills, current.kills)
         || decreased(previous.deaths, current.deaths)
+        || decreased(previous.provider_timestamp, current.provider_timestamp)
 }
 
 fn decreased<T: PartialOrd>(previous: Option<T>, current: Option<T>) -> bool {
@@ -410,4 +576,12 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
 
 fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn hex_array(bytes: [u8; 32]) -> String {
+    let mut encoded = String::with_capacity(64);
+    for byte in bytes {
+        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
