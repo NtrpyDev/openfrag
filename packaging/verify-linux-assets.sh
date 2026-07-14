@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Static verification only: this script never installs, starts, or opens anything.
+# Headless verification only: staged installation stays in a temporary HOME.
 set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -7,6 +7,7 @@ service="$root/linux/openfragd.service"
 desktop="$root/linux/openfrag.desktop"
 helper="$root/linux/openfrag-open-dashboard"
 installer="$root/install-user.sh"
+install_verifier="$root/verify-user-install.sh"
 
 require_line() {
     grep -Fqx -- "$2" "$1" || { printf 'missing required line: %s\n' "$2" >&2; exit 1; }
@@ -39,7 +40,9 @@ fi
 
 bash -n "$helper"
 bash -n "$installer"
+bash -n "$install_verifier"
 if command -v desktop-file-validate >/dev/null 2>&1; then
     desktop-file-validate "$desktop"
 fi
-printf '%s\n' 'Linux packaging assets passed static verification.'
+"$install_verifier"
+printf '%s\n' 'Linux packaging assets passed headless verification.'
