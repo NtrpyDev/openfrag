@@ -1,0 +1,8 @@
+[package]
+name = "global-shortcuts-introspection"
+version = "0.1.0"
+edition = "2021"
+description = "Non-invasive XDG Global Shortcuts portal introspection probe for issue 23"
+
+[dependencies]
+zbus = { version = "4", features = ["blocking"] }
