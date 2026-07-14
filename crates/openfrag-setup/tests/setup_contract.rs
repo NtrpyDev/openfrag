@@ -80,7 +80,13 @@ fn gsi_install_is_private_loopback_only_and_rerunnable() {
     fs::create_dir_all(&cfg).unwrap();
     fs::create_dir_all(&data).unwrap();
 
-    let first = install_gsi(&cfg, &data, "safe-token_123").unwrap();
+    let first = install_gsi(
+        &cfg,
+        &data,
+        "safe-token_123",
+        "76561198000000001",
+    )
+    .unwrap();
     let config = fs::read_to_string(&first.config_path).unwrap();
     assert!(config.contains("http://127.0.0.1:7130/gsi/router"));
     assert!(config.contains("\"token\" \"safe-token_123\""));
@@ -102,8 +108,18 @@ fn gsi_install_is_private_loopback_only_and_rerunnable() {
             & 0o777,
         0o600
     );
+    assert_eq!(
+        fs::read_to_string(&first.local_steam_id_path).unwrap(),
+        "76561198000000001\n"
+    );
 
-    let second = install_gsi(&cfg, &data, "replacement-token").unwrap();
+    let second = install_gsi(
+        &cfg,
+        &data,
+        "replacement-token",
+        "76561198000000001",
+    )
+    .unwrap();
     assert_eq!(first, second);
     assert!(
         fs::read_to_string(second.config_path)
@@ -123,12 +139,13 @@ fn unsafe_tokens_and_symlink_targets_are_rejected_without_mutation() {
     let data = temp.path().join("data");
     fs::create_dir_all(&cfg).unwrap();
     fs::create_dir_all(&data).unwrap();
-    assert!(install_gsi(&cfg, &data, "bad\n\"token").is_err());
+    assert!(install_gsi(&cfg, &data, "bad\n\"token", "76561198000000001").is_err());
+    assert!(install_gsi(&cfg, &data, "safe-token", "not-a-steamid").is_err());
     assert!(!cfg.join("gamestate_integration_openfrag.cfg").exists());
 
     let outside = temp.path().join("outside");
     fs::write(&outside, "do not replace").unwrap();
     std::os::unix::fs::symlink(&outside, cfg.join("gamestate_integration_openfrag.cfg")).unwrap();
-    assert!(install_gsi(&cfg, &data, "safe-token").is_err());
+    assert!(install_gsi(&cfg, &data, "safe-token", "76561198000000001").is_err());
     assert_eq!(fs::read_to_string(outside).unwrap(), "do not replace");
 }
