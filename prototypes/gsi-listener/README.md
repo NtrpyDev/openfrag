@@ -15,7 +15,7 @@ TOKEN_FILE=prototypes/gsi-listener/.local-token
 test ! -e "$TOKEN_FILE" || { echo "refusing existing token file: $TOKEN_FILE" >&2; exit 1; }
 openssl rand -hex 24 > "$TOKEN_FILE"
 chmod 600 "$TOKEN_FILE"
-DEST="$GAME/game/csgo/cfg/gamestate_integration_openfrag_prototype.local.cfg"
+DEST="$GAME/game/csgo/cfg/gamestate_integration_openfrag.cfg"
 test ! -e "$DEST" && test ! -L "$DEST" || { echo "refusing existing or symlink destination: $DEST" >&2; exit 1; }
 TMP="$(mktemp "${DEST}.tmp.XXXXXX")"
 trap 'rm -f "$TMP"' EXIT
@@ -42,7 +42,7 @@ For this throwaway loopback-only capture, use a deliberately non-secret marker
 instead of pretending the token is protected:
 
 ```sh
-DEST='/mnt/shared/SteamLibrary/steamapps/common/Counter-Strike Global Offensive/game/csgo/cfg/gamestate_integration_openfrag_prototype.local.cfg'
+DEST='/mnt/shared/SteamLibrary/steamapps/common/Counter-Strike Global Offensive/game/csgo/cfg/gamestate_integration_openfrag.cfg'
 test ! -e "$DEST" && test ! -L "$DEST"
 sed 's/REPLACE_WITH_RANDOM_LOCAL_TOKEN/OPENFRAG_PROTOTYPE_PUBLIC_MARKER/' \
   prototypes/gsi-listener/gamestate_integration_openfrag_prototype.cfg > "$DEST"
@@ -89,7 +89,7 @@ The listener is intentionally minimal: its request-body read has no slow-client 
 Stop the listener, remove the installed config and captures, and verify no token remains in shell history or tracked files:
 
 ```sh
-rm -f '/mnt/shared/SteamLibrary/steamapps/common/Counter-Strike Global Offensive/game/csgo/cfg/gamestate_integration_openfrag_prototype.local.cfg'
+rm -f '/mnt/shared/SteamLibrary/steamapps/common/Counter-Strike Global Offensive/game/csgo/cfg/gamestate_integration_openfrag.cfg'
 rm -f prototypes/gsi-listener/captures/gsi-listener-capture.jsonl
 rm -f prototypes/gsi-listener/.local-token
 ```
