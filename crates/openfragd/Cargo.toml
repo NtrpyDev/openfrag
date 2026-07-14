@@ -10,6 +10,7 @@ repository.workspace = true
 axum = { version = "0.8", features = ["json", "multipart"] }
 clap = { version = "4.5", features = ["derive"] }
 openfrag-capture = { path = "../openfrag-capture" }
+openfrag-clips = { path = "../openfrag-clips" }
 openfrag-gsi = { path = "../openfrag-gsi" }
 openfrag-import = { path = "../openfrag-import", features = ["demoparser"] }
 openfrag-pipeline = { path = "../openfrag-pipeline", features = ["demoparser"] }
