@@ -766,6 +766,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "openfrag-clips"
+version = "1.0.0"
+
+[[package]]
 name = "openfrag-domain"
 version = "1.0.0"
 
