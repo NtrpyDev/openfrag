@@ -505,16 +505,18 @@ impl Storage {
                         r.get(0)
                     })
                     .optional()?;
+                let relative = entry
+                    .path()
+                    .strip_prefix(&self.layout.root)
+                    .map_err(|_| Error::Invalid("orphan path"))?
+                    .to_string_lossy()
+                    .to_string();
                 if exists.is_none() {
-                    let relative = entry
-                        .path()
-                        .strip_prefix(&self.layout.root)
-                        .map_err(|_| Error::Invalid("orphan path"))?
-                        .to_string_lossy()
-                        .to_string();
                     let byte_length = i64::try_from(fs::metadata(entry.path())?.len())
                         .map_err(|_| Error::Invalid("orphan too large"))?;
                     self.connection.execute("INSERT INTO artifacts(sha256,relative_path,byte_length,availability,created_at_ms) VALUES(?,?,?,'present',?)",params![sha,relative,byte_length,now_ms()])?;
+                } else {
+                    self.connection.execute("UPDATE artifacts SET availability='present',relative_path=?,missing_reason=NULL WHERE sha256=? AND availability IN ('expected','missing')",params![relative,sha])?;
                 }
             }
         }
@@ -1273,5 +1275,53 @@ mod tests {
             fs::read_dir(&reopened.layout().quarantine).unwrap().count(),
             1
         );
+    }
+    #[test]
+    fn reopen_repairs_expected_artifact_at_verified_path() {
+        let (dir, storage) = store();
+        let staged = storage.stage_artifact(b"expected").unwrap();
+        let hash = staged.sha256.clone();
+        storage
+            .expect_artifact(&hash, i64::try_from(staged.byte_length).unwrap(), None)
+            .unwrap();
+        let path = storage
+            .layout()
+            .artifacts
+            .join(&hash[..2])
+            .join(format!("{hash}.dem"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::rename(staged.path, path).unwrap();
+        drop(storage);
+        let reopened = Storage::open(Layout::at(dir.path())).unwrap();
+        assert_eq!(
+            reopened.artifact(&hash).unwrap().availability,
+            ArtifactAvailability::Present
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn staging_symlink_is_rejected_without_following_it() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        fs::create_dir_all(&layout.staging).unwrap();
+        symlink("/etc/passwd", layout.staging.join("bad.part")).unwrap();
+        assert!(matches!(
+            Storage::open(layout),
+            Err(Error::Invalid("staging symlink"))
+        ));
+    }
+    #[test]
+    fn two_open_handles_preserve_independent_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Storage::open(Layout::at(dir.path())).unwrap();
+        let second = Storage::open(Layout::at(dir.path())).unwrap();
+        let a = first.create_capture_session("one").unwrap();
+        let b = second.create_capture_session("two").unwrap();
+        assert_ne!(a.as_str(), b.as_str());
+        drop(first);
+        drop(second);
+        let reopened = Storage::open(Layout::at(dir.path())).unwrap();
+        assert!(reopened.create_capture_session("three").is_ok());
     }
 }
