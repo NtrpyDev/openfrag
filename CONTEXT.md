@@ -12,7 +12,9 @@ The ubiquitous language for this project. Terms mean exactly this everywhere: co
 - **Share Code**: the CSGO-xxxxx token identifying a Valve matchmaking match, used to locate its demo.
 - **Match**: one Premier game, with its demo, parsed stats, and any clips linked to its rounds.
 - **Lobby**: all ten players in a match. Every one of them is browsable in the dashboard.
-- **openfrag Rating**: the project's explainable per-match performance score. Its formula is public and every component links to the rounds that produced it.
+- **openfrag Rating**: the project's explainable per-match self-improvement score, used to compare the local player's own matches over time and never to rank different players. It measures attributable individual performance; team and match outcomes are context, not Rating inputs. Its formula is public and every component links to the rounds that produced it.
+- **Eligible Round**: a scored Premier round with complete Demo evidence for the local player that may contribute to openfrag Rating.
+- **Preview Rating**: an openfrag Rating calculated from valid but incomplete or small-sample evidence and excluded from trends.
 - **Receipt**: the evidence link from a stat to its rounds or clips. Clicking "lost 4 opening duels" opens those four rounds.
 - **Tonight**: the dashboard home view, the current play session's matches, stats, and best clips.
 - **Setup Wizard**: the first-run flow in the dashboard that configures storage, writes the GSI config into CS2, tests recording and hotkey, and signs into Steam.
