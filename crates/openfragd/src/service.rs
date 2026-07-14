@@ -235,9 +235,14 @@ impl<P: MutationPorts> LocalApi for StorageApi<P> {
         self.ports.manual_flag()
     }
     fn diagnostics(&self) -> Result<Value, ApiError> {
-        Ok(
-            json!({"capture":"unavailable until pipeline is connected","gsi":"unavailable until pipeline is connected"}),
-        )
+        let status = |id: &str| {
+            self.setup
+                .checks
+                .iter()
+                .find(|check| check.id == id)
+                .map_or("unknown", |check| check.status.as_str())
+        };
+        Ok(json!({"capture":status("capture"),"gsi":status("gsi")}))
     }
 }
 fn unavailable(name: &str) -> ApiError {

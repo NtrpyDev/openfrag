@@ -212,7 +212,17 @@ def verify_mounted_api_contracts(
     status, _, body = request(opener, f"{base_url}/api/setup")
     require(status == 200, f"setup API returned {status}: {body!r}")
     setup = json.loads(body)
-    require(setup == {"checks": []}, f"unexpected setup API response: {setup}")
+    checks = {check["id"]: check["status"] for check in setup.get("checks", [])}
+    require(
+        checks
+        == {
+            "storage": "ready",
+            "demo_import": "ready",
+            "gsi": "ready",
+            "capture": "blocked",
+        },
+        f"unexpected setup API response: {setup}",
+    )
 
     for route, name in (("/api/matches", "matches"), ("/api/clips", "clips")):
         status, _, body = request(opener, f"{base_url}{route}")
@@ -223,11 +233,7 @@ def verify_mounted_api_contracts(
     require(status == 200, f"diagnostics API returned {status}: {body!r}")
     diagnostics = json.loads(body)
     require(
-        diagnostics
-        == {
-            "capture": "unavailable until pipeline is connected",
-            "gsi": "unavailable until pipeline is connected",
-        },
+        diagnostics == {"capture": "blocked", "gsi": "ready"},
         f"unexpected diagnostics API response: {diagnostics}",
     )
 
