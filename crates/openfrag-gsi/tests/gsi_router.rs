@@ -95,17 +95,23 @@ fn snapshot(
     )
 }
 
-fn with_round_kills(body: String, round_kills: i64) -> String {
-    let mut payload: serde_json::Value = serde_json::from_str(&body).expect("test payload");
+fn with_round_kills(body: impl AsRef<str>, round_kills: i64) -> String {
+    let mut payload: serde_json::Value = serde_json::from_str(body.as_ref()).expect("test payload");
     payload["player"]["state"]["round_kills"] = round_kills.into();
     payload.to_string()
 }
 
-fn with_weapons(body: String) -> String {
-    let mut payload: serde_json::Value = serde_json::from_str(&body).expect("test payload");
+fn with_weapons(body: impl AsRef<str>) -> String {
+    let mut payload: serde_json::Value = serde_json::from_str(body.as_ref()).expect("test payload");
     payload["player"]["weapons"] = serde_json::json!({
         "weapon_0": { "name": "weapon_ak47", "state": "active" }
     });
+    payload.to_string()
+}
+
+fn with_provider_timestamp(body: impl AsRef<str>, timestamp: i64) -> String {
+    let mut payload: serde_json::Value = serde_json::from_str(body.as_ref()).expect("test payload");
+    payload["provider"]["timestamp"] = timestamp.into();
     payload.to_string()
 }
 
@@ -161,7 +167,7 @@ async fn seeds_sanitized_evidence_and_accepts_json_content_type_parameters() {
     assert!(receipt.facts.is_empty());
     assert_eq!(
         receipt.payload_hash,
-        "0272ef1d6ec9074916277a9d13500f4195b3c69486ae75509928666f52d724e9"
+        "927150fcbff815195a283cc526feefaf26fee4cac9e5105433223958b1476012"
     );
     assert!(receipt.presence.provider);
     assert!(receipt.presence.provider_timestamp);
@@ -182,7 +188,7 @@ async fn seeds_sanitized_evidence_and_accepts_json_content_type_parameters() {
     assert!(!debug_receipt.contains("de_dust2"));
     assert_eq!(
         receipt.context.map_hash.as_deref(),
-        Some("371e8ec5af8518a1fd49f2d74644675ebf4d5514a865c0364e2a6a929cc57ff8")
+        Some("f99f33e2882aa01d4d3060562bd3f088bc74086e344c1dbbf1862d0239ef4954")
     );
     assert_eq!(receipt.context.observed_round, Some(3));
     assert_eq!(receipt.context.provider_timestamp, Some(1));
@@ -281,7 +287,7 @@ async fn derives_a_trusted_death_fact_from_consecutive_snapshots() {
     let response = post(
         &service,
         "application/json",
-        snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 4, 3, 0),
+        snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 4, 3, 100),
     )
     .await;
 
@@ -453,19 +459,13 @@ async fn round_kill_reset_seeds_the_new_round_without_a_false_kill() {
     post(
         &service,
         "application/json",
-        with_round_kills(
-            snapshot(TOKEN, STEAM_ID, "de_dust2", 4, 4, 2, 100),
-            0,
-        ),
+        with_round_kills(snapshot(TOKEN, STEAM_ID, "de_dust2", 4, 4, 2, 100), 0),
     )
     .await;
     post(
         &service,
         "application/json",
-        with_round_kills(
-            snapshot(TOKEN, STEAM_ID, "de_dust2", 4, 4, 2, 100),
-            1,
-        ),
+        with_round_kills(snapshot(TOKEN, STEAM_ID, "de_dust2", 4, 4, 2, 100), 1),
     )
     .await;
 
@@ -518,10 +518,7 @@ async fn multi_deltas_are_one_co_observed_batch_without_invented_event_order() {
     post(
         &service,
         "application/json",
-        with_round_kills(
-            snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 6, 3, 0),
-            3,
-        ),
+        with_round_kills(snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 6, 3, 0), 3),
     )
     .await;
 
@@ -600,10 +597,7 @@ async fn valid_token_identity_mismatch_clears_transition_baselines() {
     post(
         &service,
         "application/json",
-        with_round_kills(
-            snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 5, 2, 100),
-            2,
-        ),
+        with_round_kills(snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 5, 2, 100), 2),
     )
     .await;
 
@@ -627,10 +621,7 @@ async fn invalid_token_cannot_reset_a_valid_transition_baseline() {
     post(
         &service,
         "application/json",
-        with_round_kills(
-            snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 5, 2, 100),
-            2,
-        ),
+        with_round_kills(snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 5, 2, 100), 2),
     )
     .await;
 
@@ -657,19 +648,13 @@ async fn recovery_reseeds_before_later_round_kill_progress() {
     post(&service, "application/json", payload(TOKEN, STEAM_ID)).await;
     clock.advance(Duration::from_secs(30));
     assert_eq!(service.poll_stale(), Ok(PollOutcome::Stale));
-    let recovered = with_round_kills(
-        snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 5, 2, 80),
-        2,
-    );
+    let recovered = with_round_kills(snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 5, 2, 80), 2);
     post(&service, "application/json", recovered.clone()).await;
     post(&service, "application/json", recovered).await;
     post(
         &service,
         "application/json",
-        with_round_kills(
-            snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 6, 2, 80),
-            3,
-        ),
+        with_round_kills(snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 6, 2, 80), 3),
     )
     .await;
 
@@ -702,10 +687,7 @@ async fn round_jump_records_each_implied_round_end() {
     post(
         &service,
         "application/json",
-        with_round_kills(
-            snapshot(TOKEN, STEAM_ID, "de_dust2", 5, 4, 2, 100),
-            0,
-        ),
+        with_round_kills(snapshot(TOKEN, STEAM_ID, "de_dust2", 5, 4, 2, 100), 0),
     )
     .await;
 
@@ -722,4 +704,76 @@ async fn round_jump_records_each_implied_round_end() {
             },
         ]
     );
+}
+
+#[tokio::test]
+async fn detected_provider_session_restart_reseeds_all_transition_baselines() {
+    let (service, _clock, sink) = harness();
+    post(
+        &service,
+        "application/json",
+        with_provider_timestamp(payload(TOKEN, STEAM_ID), 100),
+    )
+    .await;
+    post(
+        &service,
+        "application/json",
+        with_provider_timestamp(
+            with_round_kills(snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 10, 2, 100), 0),
+            1,
+        ),
+    )
+    .await;
+    post(
+        &service,
+        "application/json",
+        with_provider_timestamp(
+            with_round_kills(snapshot(TOKEN, STEAM_ID, "de_dust2", 3, 11, 2, 100), 1),
+            2,
+        ),
+    )
+    .await;
+
+    let receipts = sink.receipts();
+    assert_eq!(receipts[1].output, StateOutput::SessionReset);
+    assert!(receipts[1].facts.is_empty());
+    assert_eq!(
+        receipts[2].facts,
+        vec![
+            TransitionFact::CumulativeKillDelta {
+                previous: 10,
+                current: 11,
+                delta: 1,
+            },
+            TransitionFact::RoundKillDelta {
+                previous: 0,
+                current: 1,
+                delta: 1,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn session_restart_clears_recent_hashes_from_the_previous_session() {
+    let (service, _clock, sink) = harness();
+    let original = with_provider_timestamp(payload(TOKEN, STEAM_ID), 100);
+    post(&service, "application/json", original.clone()).await;
+    post(
+        &service,
+        "application/json",
+        with_provider_timestamp(
+            snapshot(TOKEN, STEAM_ID, "de_inferno", 1, 0, 0, 100),
+            1,
+        ),
+    )
+    .await;
+
+    post(&service, "application/json", original).await;
+
+    let receipts = sink.receipts();
+    assert_eq!(receipts.len(), 3);
+    assert_eq!(receipts[1].output, StateOutput::SessionReset);
+    assert_eq!(receipts[2].output, StateOutput::SessionReset);
+    assert!(receipts[2].facts.is_empty());
 }
