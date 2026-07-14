@@ -3,71 +3,57 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>openfrag</title>
+  <title>openfrag local dashboard</title>
   <style>
-    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: #090c10; color: #e7edf5; }
-    * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 75% -10%, #123447 0, #090c10 38%); }
-    button { font: inherit; }
-    .shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100vh; }
-    aside { border-right: 1px solid #26303b; padding: 24px 16px; background: #0c1016e8; }
-    .brand { display: flex; gap: 10px; align-items: center; margin: 0 8px 28px; font-weight: 800; letter-spacing: .02em; }
-    .mark { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 8px; background: #42c4ef; color: #061018; }
-    nav { display: grid; gap: 5px; }
-    nav button { width: 100%; border: 0; border-radius: 8px; padding: 10px 12px; text-align: left; color: #9aa9ba; background: transparent; cursor: pointer; }
-    nav button[aria-current="page"] { color: #f5fbff; background: #18232e; }
-    main { padding: 30px clamp(20px, 4vw, 56px) 48px; max-width: 1300px; width: 100%; }
-    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-    h1 { margin: 0; font-size: clamp(28px, 4vw, 42px); }
-    .subtle { color: #93a3b5; }
-    .status { border: 1px solid #315568; border-radius: 999px; padding: 7px 11px; color: #86ddf7; background: #0e2430; }
-    .setup { margin: 28px 0; padding: 22px; display: flex; align-items: center; justify-content: space-between; gap: 24px; border: 1px solid #2d5264; border-radius: 14px; background: linear-gradient(115deg, #102633, #111820); }
-    .setup h2, .panel h2 { margin: 0 0 6px; }
-    .primary { border: 0; border-radius: 9px; padding: 11px 16px; white-space: nowrap; font-weight: 700; background: #49c9f1; color: #061018; cursor: pointer; }
-    .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
-    .card, .panel { border: 1px solid #242f3a; border-radius: 12px; background: #10161d; }
-    .card { padding: 18px; }
-    .label { color: #8495a8; font-size: 13px; text-transform: uppercase; letter-spacing: .07em; }
-    .value { margin-top: 7px; font-size: 25px; font-weight: 750; }
-    .panels { display: grid; grid-template-columns: 1.4fr 1fr; gap: 14px; margin-top: 14px; }
-    .panel { padding: 20px; min-height: 230px; }
-    .empty { min-height: 150px; display: grid; place-items: center; text-align: center; color: #8595a7; }
-    footer { margin-top: 28px; color: #718194; font-size: 13px; }
-    @media (max-width: 780px) { .shell { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #26303b; } nav { grid-template-columns: repeat(5, 1fr); overflow-x: auto; } nav button { text-align: center; } .grid, .panels { grid-template-columns: 1fr; } .setup { align-items: flex-start; flex-direction: column; } }
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background:#0b1016; color:#edf4fa; }
+    * { box-sizing:border-box; } body { margin:0; } button,input { font:inherit; }
+    .shell { display:grid; grid-template-columns:14rem 1fr; min-height:100vh; } aside { padding:1rem; border-right:1px solid #293846; }
+    nav { display:grid; gap:.4rem; } nav button,.button { border:0; border-radius:.5rem; padding:.65rem .8rem; background:#1a2834; color:inherit; text-align:left; cursor:pointer; }
+    nav button[aria-current="page"],.primary { background:#62d1f2; color:#071319; font-weight:700; } main { max-width:1100px; padding:2rem; }
+    .row { display:flex; flex-wrap:wrap; gap:.8rem; align-items:center; justify-content:space-between; } .grid { display:grid; gap:1rem; grid-template-columns:repeat(auto-fit,minmax(15rem,1fr)); }
+    section { margin:1.4rem 0; } .panel { border:1px solid #293846; border-radius:.7rem; padding:1rem; background:#101923; } .muted { color:#a5b6c6; }
+    .hidden { display:none; } .list { display:grid; gap:.6rem; padding:0; list-style:none; } label { display:grid; gap:.35rem; } input,textarea { padding:.55rem; border-radius:.4rem; border:1px solid #425466; background:#0b1016; color:inherit; }
+    dialog { max-width:42rem; color:inherit; background:#101923; border:1px solid #425466; border-radius:.7rem; } .status { min-height:1.5rem; }
+    @media (max-width:700px) { .shell { grid-template-columns:1fr; } aside { border-right:0; border-bottom:1px solid #293846; } nav { grid-template-columns:repeat(5,1fr); overflow:auto; } main { padding:1rem; } }
   </style>
 </head>
 <body>
   <div class="shell">
-    <aside>
-      <div class="brand"><span class="mark">OF</span> openfrag</div>
-      <nav aria-label="Local dashboard">
-        <button aria-current="page">Tonight</button>
-        <button>Matches</button>
-        <button>Clips</button>
-        <button>Inbox</button>
-        <button>Settings</button>
-      </nav>
-    </aside>
+    <aside><strong>openfrag</strong><nav aria-label="Dashboard sections">
+      <button type="button" data-view="home" aria-current="page">Tonight</button><button type="button" data-view="matches">Matches</button><button type="button" data-view="clips">Clips</button><button type="button" data-view="diagnostics">Diagnostics</button><button type="button" data-view="setup">Setup</button>
+    </nav></aside>
     <main>
-      <header>
-        <div><h1>Tonight</h1><div class="subtle">Your local session, evidence first.</div></div>
-        <div class="status">Local daemon ready</div>
-      </header>
-      <section class="setup" aria-labelledby="setup-title">
-        <div><h2 id="setup-title">Start with a Premier Demo</h2><div class="subtle">Choose a local .dem file. openfrag never signs into Steam or uploads it.</div></div>
-        <button class="primary" type="button">Import local Demo</button>
+      <div id="announcements" class="status" role="status" aria-live="polite"></div>
+      <section data-panel="home"><div class="row"><div><h1>Tonight</h1><p class="muted">Local match evidence and clip review.</p></div><button id="manual-flag" class="button primary" type="button">Manual Flag</button></div>
+        <div class="panel"><h2>Import a local Demo</h2><form id="import-form"><label for="dem-file">Demo file (.dem)<input id="dem-file" name="file" type="file" accept=".dem" required></label><button class="button primary" type="submit">Import</button></form><p id="import-progress" class="muted" aria-live="polite"></p></div>
+        <div class="grid"><article class="panel"><h2>Rating</h2><p id="rating-state" class="muted">Awaiting local match data.</p></article><article class="panel"><h2>Recent matches</h2><ul id="recent-matches" class="list"></ul></article></div>
       </section>
-      <section class="grid" aria-label="Tonight summary">
-        <article class="card"><div class="label">Rating</div><div class="value">Not ready</div><div class="subtle">Import a Demo to calculate ofr-1.0.0.</div></article>
-        <article class="card"><div class="label">Matches</div><div class="value">0</div><div class="subtle">No comparable Match tonight.</div></article>
-        <article class="card"><div class="label">Highlights</div><div class="value">0</div><div class="subtle">Demo-confirmed clips appear here.</div></article>
-      </section>
-      <section class="panels">
-        <article class="panel"><h2>Recent Matches</h2><div class="empty">No local Demo has been imported.</div></article>
-        <article class="panel"><h2>Clip review</h2><div class="empty">Saved Clips will wait here for review.</div></article>
-      </section>
-      <footer>No account. No telemetry. No uploads. All data stays in your openfrag data directory.</footer>
+      <section data-panel="matches" class="hidden"><h1>Matches</h1><ul id="match-list" class="list" aria-live="polite"></ul><article id="match-detail" class="panel" aria-live="polite"><p class="muted">Select a local match.</p></article></section>
+      <section data-panel="clips" class="hidden"><h1>Clip review</h1><ul id="clip-list" class="list" aria-live="polite"></ul></section>
+      <section data-panel="diagnostics" class="hidden"><h1>Capture and GSI diagnostics</h1><pre id="diagnostics-output" class="panel" aria-live="polite">Loading diagnostics…</pre></section>
+      <section data-panel="setup" class="hidden"><h1>Setup status</h1><div id="setup-output" class="panel" aria-live="polite">Loading setup status…</div></section>
     </main>
   </div>
+  <dialog id="clip-editor" aria-labelledby="clip-editor-title"><form id="clip-form" method="dialog"><h2 id="clip-editor-title">Review clip</h2><input id="clip-id" type="hidden"><label for="clip-title">Title<input id="clip-title" required></label><label for="clip-note">Note<textarea id="clip-note"></textarea></label><label for="clip-tags">Tags (comma separated)<input id="clip-tags"></label><label for="clip-decision">Review decision<select id="clip-decision"><option value="keep">Keep</option><option value="reject">Reject</option></select></label><div class="row"><button class="button" value="cancel">Cancel</button><button id="clip-save" class="button primary" value="default">Save review</button><button id="clip-trim" class="button" type="button">Trim local clip</button><button id="clip-export" class="button" type="button">Export local file</button></div></form></dialog>
+  <script>
+    const $ = (selector) => document.querySelector(selector); const api = (path, options) => fetch(path, options).then(async response => { const body = await response.json().catch(() => ({})); if (!response.ok) throw new Error(body.message || `Request failed (${response.status})`); return body; });
+    const announce = (text) => $('#announcements').textContent = text; let selectedClip;
+    function show(view) { document.querySelectorAll('[data-panel]').forEach(panel => panel.classList.toggle('hidden', panel.dataset.panel !== view)); document.querySelectorAll('[data-view]').forEach(button => button.setAttribute('aria-current', String(button.dataset.view === view))); if (view === 'matches') loadMatches(); if (view === 'clips') loadClips(); if (view === 'diagnostics') loadDiagnostics(); if (view === 'setup') loadSetup(); }
+    function text(node, value) { node.textContent = value ?? 'Unavailable'; }
+    async function loadHealth() { const health = await api('/api/health'); text($('#rating-state'), health.rating_state === 'rated' ? `Rated: ${health.rating}` : health.rating_state === 'preview' ? 'Preview rating' : 'Rating unavailable'); }
+    async function loadSetup() { const setup = await api('/api/setup'); $('#setup-output').textContent = setup.checks.map(check => `${check.id}: ${check.status} — ${check.summary}`).join('\n'); }
+    async function loadMatches() { const matches = await api('/api/matches'); const list = $('#match-list'); list.replaceChildren(...matches.map(match => { const button = document.createElement('button'); button.className='button'; button.textContent=`${match.map ?? 'Match'} — ${match.rating_state}`; button.onclick=() => loadMatch(match.id); const item=document.createElement('li'); item.append(button); return item; })); }
+    async function loadMatch(id) { const match = await api(`/api/matches/${encodeURIComponent(id)}`); const detail=$('#match-detail'); detail.replaceChildren(); const heading=document.createElement('h2'); heading.textContent=match.map ?? 'Match'; const rating=document.createElement('p'); rating.textContent=match.rating_state === 'rated' ? `Rating: ${match.rating}` : match.rating_state === 'preview' ? 'Rating: preview' : 'Rating unavailable'; detail.append(heading,rating); for (const receipt of match.receipts ?? []) { const button=document.createElement('button'); button.className='button'; button.textContent=`Receipt ${receipt.id}`; button.onclick=async()=>{ const data=await api(`/api/receipts/${encodeURIComponent(receipt.id)}`); announce(JSON.stringify(data)); }; detail.append(button); } }
+    async function loadClips() { const clips=await api('/api/clips'); const list=$('#clip-list'); list.replaceChildren(...clips.map(clip=>{ const button=document.createElement('button'); button.className='button'; button.textContent=clip.title ?? `Clip ${clip.id}`; button.onclick=()=>editClip(clip); const item=document.createElement('li'); item.append(button); return item; })); }
+    function editClip(clip) { selectedClip=clip; $('#clip-id').value=clip.id; $('#clip-title').value=clip.title ?? ''; $('#clip-note').value=clip.note ?? ''; $('#clip-tags').value=(clip.tags ?? []).join(', '); $('#clip-editor').showModal(); }
+    async function loadDiagnostics() { $('#diagnostics-output').textContent=JSON.stringify(await api('/api/diagnostics'), null, 2); }
+    $('#import-form').onsubmit=async event=>{ event.preventDefault(); const data=new FormData(event.currentTarget); $('#import-progress').textContent='Submitting local Demo…'; const job=await api('/api/imports',{method:'POST',body:data}); const poll=async()=>{ const state=await api(`/api/imports/${encodeURIComponent(job.id)}`); $('#import-progress').textContent=state.progress ?? state.status; if (!['completed','failed'].includes(state.status)) setTimeout(poll,1000); else announce(`Import ${state.status}`); }; poll(); };
+    $('#manual-flag').onclick=async()=>{ await api('/api/manual-flag',{method:'POST'}); announce('Manual Flag requested.'); };
+    $('#clip-form').onsubmit=async event=>{ if (event.submitter?.value==='cancel') return; event.preventDefault(); const id=$('#clip-id').value; await api(`/api/clips/${encodeURIComponent(id)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:$('#clip-title').value,note:$('#clip-note').value,tags:$('#clip-tags').value.split(',').map(tag=>tag.trim()).filter(Boolean),decision:$('#clip-decision').value})}); $('#clip-editor').close(); loadClips(); };
+    $('#clip-trim').onclick=async()=>{ await api(`/api/clips/${encodeURIComponent(selectedClip.id)}/trim`,{method:'POST'}); announce('Local trim requested.'); };
+    $('#clip-export').onclick=async()=>{ await api(`/api/clips/${encodeURIComponent(selectedClip.id)}/export`,{method:'POST'}); announce('Local export requested.'); };
+    document.querySelectorAll('[data-view]').forEach(button=>button.onclick=()=>show(button.dataset.view));
+    loadHealth().catch(error=>announce(error.message));
+  </script>
 </body>
 </html>
