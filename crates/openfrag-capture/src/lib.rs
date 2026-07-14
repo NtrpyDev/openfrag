@@ -3,7 +3,9 @@
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 /// How the recorder is launched. Arguments are always passed directly, never to a shell.
@@ -336,17 +338,31 @@ fn duration_ms(duration: Duration) -> u64 {
 #[derive(Default)]
 pub struct StdProcess {
     child: Option<std::process::Child>,
-    stderr: Vec<u8>,
+    stderr: Option<Receiver<Vec<u8>>>,
 }
 impl Process for StdProcess {
     fn spawn(&mut self, argv: &[OsString]) -> Result<(), String> {
         let (program, command_args) = argv.split_first().ok_or_else(|| "empty argv".to_owned())?;
-        let child = std::process::Command::new(program)
+        let mut child = std::process::Command::new(program)
             .args(command_args)
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| e.to_string())?;
+        let (sender, receiver) = mpsc::channel();
+        if let Some(mut stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                loop {
+                    let mut chunk = [0; 4096];
+                    match stderr.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(length) if sender.send(chunk[..length].to_vec()).is_err() => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
         self.child = Some(child);
+        self.stderr = Some(receiver);
         Ok(())
     }
     fn try_wait(&mut self) -> Result<Option<i32>, String> {
@@ -368,7 +384,10 @@ impl Process for StdProcess {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal).map_err(|e| e.to_string())
     }
     fn drain_stderr(&mut self) -> Result<Vec<u8>, String> {
-        Ok(std::mem::take(&mut self.stderr))
+        Ok(self
+            .stderr
+            .as_ref()
+            .map_or_else(Vec::new, |receiver| receiver.try_iter().flatten().collect()))
     }
 }
 
