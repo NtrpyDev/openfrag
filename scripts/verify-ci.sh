@@ -2,7 +2,19 @@
 # Mirrors CI for first-party crates; it does not run vendored parser formatting or private fixtures.
 set -euo pipefail
 
-packages=(openfrag-capture openfrag-clips openfrag-domain openfrag-gsi openfrag-import openfrag-setup openfrag-storage openfragd)
+packages=(
+    openfrag-analysis
+    openfrag-capture
+    openfrag-clips
+    openfrag-domain
+    openfrag-gsi
+    openfrag-import
+    openfrag-pipeline
+    openfrag-setup
+    openfrag-shortcuts
+    openfrag-storage
+    openfragd
+)
 
 for package in "${packages[@]}"; do
     cargo fmt --check --package "$package"
@@ -14,6 +26,7 @@ for package in "${packages[@]}"; do
     cargo clippy -p "$package" --no-deps -- -D warnings
 done
 cargo test -p openfrag-import --features demoparser
+cargo test -p openfrag-pipeline --features demoparser
 cargo build -p openfragd --release
 packaging/verify-linux-assets.sh
 
