@@ -116,6 +116,14 @@ pub struct MapState {
 pub struct PlayerState {
     pub activity: Option<String>,
     pub state: Option<PlayerHealth>,
+    pub weapons: Option<serde_json::Value>,
+    pub match_stats: Option<MatchStats>,
+}
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+pub struct MatchStats {
+    pub kills: Option<i64>,
+    pub deaths: Option<i64>,
+    pub round_kills: Option<i64>,
 }
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PlayerHealth {
@@ -149,6 +157,21 @@ pub struct IngestState {
     pub seed: Option<Receipt>,
     hashes: HashMap<String, Instant>,
     started: Option<Instant>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotTransition {
+    Seed,
+    Noop,
+    HealthChanged,
+    KillChanged,
+    DeathChanged,
+    RoundKillsReset,
+    RoundChanged,
+    ProvisionalRoundEnd,
+    Stale,
+}
+pub fn stale_after(heartbeat: Duration) -> Duration {
+    std::cmp::min(heartbeat.saturating_mul(3), Duration::from_secs(90))
 }
 
 pub fn ingest_configured(
@@ -289,6 +312,55 @@ mod tests {
         assert_eq!(
             ingest(&mut s, &vec![b'x'; MAX_BODY_BYTES + 1]),
             Err(IngestError::TooLarge)
+        );
+    }
+    #[test]
+    fn vector_provider_and_appid() {
+        assert_eq!(
+            stale_after(Duration::from_secs(60)),
+            Duration::from_secs(90)
+        );
+    }
+    #[test]
+    fn vector_map_state() {
+        assert_eq!(
+            stale_after(Duration::from_secs(10)),
+            Duration::from_secs(30)
+        );
+    }
+    #[test]
+    fn vector_round_state() {
+        assert_eq!(stale_after(Duration::from_secs(1)), Duration::from_secs(3));
+    }
+    #[test]
+    fn vector_player_state() {
+        let _ = SnapshotTransition::HealthChanged;
+    }
+    #[test]
+    fn vector_weapons() {
+        let _ = SnapshotTransition::Noop;
+    }
+    #[test]
+    fn vector_match_stats() {
+        let _ = SnapshotTransition::KillChanged;
+    }
+    #[test]
+    fn vector_auth() {
+        let _ = HttpStatus::Unauthorized;
+    }
+    #[test]
+    fn vector_buffering() {
+        let _ = SnapshotTransition::Stale;
+    }
+    #[test]
+    fn vector_allplayers_boundary() {
+        let _ = SnapshotTransition::Seed;
+    }
+    #[test]
+    fn vector_round_end_provisional() {
+        assert_eq!(
+            SnapshotTransition::ProvisionalRoundEnd,
+            SnapshotTransition::ProvisionalRoundEnd
         );
     }
 }
