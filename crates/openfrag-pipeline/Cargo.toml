@@ -1,0 +1,26 @@
+[package]
+name = "openfrag-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+demoparser = ["openfrag-import/demoparser"]
+
+[dependencies]
+fs2 = "0.4"
+openfrag-analysis = { path = "../openfrag-analysis" }
+openfrag-domain = { path = "../openfrag-domain" }
+openfrag-import = { path = "../openfrag-import" }
+openfrag-storage = { path = "../openfrag-storage" }
+serde_json = "1"
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
+
+[lints]
+workspace = true
