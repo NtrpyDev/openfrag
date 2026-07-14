@@ -1036,6 +1036,7 @@ dependencies = [
  "axum",
  "clap",
  "openfrag-capture",
+ "openfrag-clips",
  "openfrag-gsi",
  "openfrag-import",
  "openfrag-pipeline",
