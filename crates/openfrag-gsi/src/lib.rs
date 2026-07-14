@@ -158,13 +158,18 @@ async fn route_post(
         return (StatusCode::OK, "duplicate");
     }
 
+    let snapshot = TrustedSnapshot::from(&payload);
+    let (output, facts) = guard.snapshot.as_ref().map_or(
+        (StateOutput::Seeded, Vec::new()),
+        |previous| derive_transition(previous, &snapshot),
+    );
     let receipt = EvidenceReceipt {
         sequence: guard.sequence + 1,
         received_at,
         payload_hash: hash.clone(),
         presence: PresenceBits::from(&payload),
-        output: StateOutput::Seeded,
-        facts: Vec::new(),
+        output,
+        facts,
     };
     if service.sink.emit(receipt.clone()).is_err() {
         return (StatusCode::INTERNAL_SERVER_ERROR, "sink-failure");
@@ -172,7 +177,7 @@ async fn route_post(
     guard.sequence = receipt.sequence;
     guard.last_hash = Some(hash);
     guard.last_received_at = Some(received_at);
-    guard.snapshot = Some(TrustedSnapshot::from(&payload));
+    guard.snapshot = Some(snapshot);
     let _ = service.config.heartbeat;
     (StatusCode::OK, "seeded")
 }
@@ -211,15 +216,12 @@ struct PlayerState {
 }
 
 #[derive(Deserialize)]
-struct PlayerVitals {
-    health: Option<i64>,
-}
+struct PlayerVitals {}
 
 #[derive(Deserialize)]
 struct MatchStats {
     kills: Option<i64>,
     deaths: Option<i64>,
-    round_kills: Option<i64>,
 }
 
 impl From<&Payload> for PresenceBits {
@@ -264,18 +266,19 @@ struct EngineState {
 
 #[derive(Debug, Clone)]
 struct TrustedSnapshot {
-    session_hash: [u8; 32],
+    session_hash: Option<[u8; 32]>,
     round: Option<u64>,
     kills: Option<i64>,
     deaths: Option<i64>,
-    round_kills: Option<i64>,
-    health: Option<i64>,
 }
 
 impl From<&Payload> for TrustedSnapshot {
     fn from(payload: &Payload) -> Self {
-        let mut session = Sha256::new();
-        if let Some(map) = &payload.map {
+        let session_hash = payload.map.as_ref().and_then(|map| {
+            if map.name.is_none() && map.mode.is_none() {
+                return None;
+            }
+            let mut session = Sha256::new();
             if let Some(name) = &map.name {
                 session.update(name.as_bytes());
             }
@@ -283,24 +286,61 @@ impl From<&Payload> for TrustedSnapshot {
             if let Some(mode) = &map.mode {
                 session.update(mode.as_bytes());
             }
-        }
+            Some(session.finalize().into())
+        });
         let stats = payload
             .player
             .as_ref()
             .and_then(|player| player.match_stats.as_ref());
         Self {
-            session_hash: session.finalize().into(),
+            session_hash,
             round: payload.map.as_ref().and_then(|map| map.round),
             kills: stats.and_then(|stats| stats.kills),
             deaths: stats.and_then(|stats| stats.deaths),
-            round_kills: stats.and_then(|stats| stats.round_kills),
-            health: payload
-                .player
-                .as_ref()
-                .and_then(|player| player.state.as_ref())
-                .and_then(|state| state.health),
         }
     }
+}
+
+fn derive_transition(
+    previous: &TrustedSnapshot,
+    current: &TrustedSnapshot,
+) -> (StateOutput, Vec<TransitionFact>) {
+    if session_reset(previous, current) {
+        return (StateOutput::SessionReset, Vec::new());
+    }
+
+    let mut facts = Vec::new();
+    if let (Some(previous), Some(current)) = (previous.kills, current.kills)
+        && previous >= 0
+        && current > previous
+    {
+        facts.push(TransitionFact::Kill { previous, current });
+    }
+    if let (Some(previous), Some(current)) = (previous.deaths, current.deaths)
+        && previous >= 0
+        && current > previous
+    {
+        facts.push(TransitionFact::Death { previous, current });
+    }
+    if let (Some(completed), Some(next)) = (previous.round, current.round)
+        && next > completed
+    {
+        facts.push(TransitionFact::RoundEnd { completed, next });
+    }
+    (StateOutput::Healthy, facts)
+}
+
+fn session_reset(previous: &TrustedSnapshot, current: &TrustedSnapshot) -> bool {
+    matches!(
+        (previous.session_hash, current.session_hash),
+        (Some(previous), Some(current)) if previous != current
+    ) || decreased(previous.round, current.round)
+        || decreased(previous.kills, current.kills)
+        || decreased(previous.deaths, current.deaths)
+}
+
+fn decreased<T: PartialOrd>(previous: Option<T>, current: Option<T>) -> bool {
+    matches!((previous, current), (Some(previous), Some(current)) if current < previous)
 }
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
