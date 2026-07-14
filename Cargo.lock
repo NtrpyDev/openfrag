@@ -777,9 +777,12 @@ version = "1.0.0"
 name = "openfrag-gsi"
 version = "1.0.0"
 dependencies = [
+ "axum",
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
+ "tower",
 ]
 
 [[package]]
