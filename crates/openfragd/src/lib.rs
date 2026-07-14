@@ -1,11 +1,13 @@
 //! Loopback HTTP application for the openfrag daemon and local dashboard.
 #![allow(clippy::missing_errors_doc)]
 
-use axum::{Json, Router, routing::get};
+use axum::{Json, Router, response::Html, routing::get};
 use openfrag_storage::{Layout, Storage};
 use serde::Serialize;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
+
+const DASHBOARD: &str = include_str!("dashboard.html");
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -52,8 +54,13 @@ pub async fn app(config: AppConfig) -> Result<Router, AppError> {
         storage: Arc::new(Mutex::new(storage)),
     };
     Ok(Router::new()
+        .route("/", get(dashboard))
         .route("/api/health", get(health))
         .with_state(state))
+}
+
+async fn dashboard() -> Html<&'static str> {
+    Html(DASHBOARD)
 }
 
 async fn health() -> Json<Health> {
