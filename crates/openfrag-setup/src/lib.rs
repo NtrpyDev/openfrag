@@ -4,11 +4,13 @@
 
 use serde::Serialize;
 use std::{
+    ffi::OsString,
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 const GSI_FILE: &str = "gamestate_integration_openfrag.cfg";
@@ -316,4 +318,253 @@ fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), InstallError> {
         let _ = fs::remove_file(&temporary);
     }
     result.map_err(InstallError::Io)
+}
+
+/// Headless discovery is deliberately separate from the stable setup facts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Discovery {
+    Available,
+    Missing(String),
+    Unknown(String),
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PortalBinding {
+    Unapproved,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoveredHost {
+    pub data_directory: Discovery,
+    pub cs2_cfg_candidates: Vec<PathBuf>,
+    pub native_recorder: Discovery,
+    pub flatpak_recorder: Discovery,
+    pub ffmpeg: Discovery,
+    pub ffprobe: Discovery,
+    pub audio: Discovery,
+    pub session: SessionKind,
+    pub portal_service: Discovery,
+    pub portal_binding: PortalBinding,
+}
+pub trait HostProbe {
+    fn discover(&self) -> DiscoveredHost;
+}
+pub trait ProbeEnvironment {
+    fn var(&self, name: &str) -> Option<OsString>;
+    fn home(&self) -> Option<PathBuf>;
+}
+pub trait ProbeFilesystem {
+    fn exists(&self, path: &Path) -> bool;
+    fn writable(&self, path: &Path) -> Result<bool, String>;
+    fn executable(&self, name: &str) -> bool;
+}
+pub trait ProbeCommands {
+    fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        limit: usize,
+        timeout: Duration,
+    ) -> Result<(bool, Vec<u8>, Vec<u8>), String>;
+}
+pub struct SystemProbe<E, F, C> {
+    environment: E,
+    filesystem: F,
+    commands: C,
+}
+impl<E, F, C> SystemProbe<E, F, C> {
+    #[must_use]
+    pub fn new(environment: E, filesystem: F, commands: C) -> Self {
+        Self {
+            environment,
+            filesystem,
+            commands,
+        }
+    }
+}
+impl<E: ProbeEnvironment, F: ProbeFilesystem, C: ProbeCommands> HostProbe for SystemProbe<E, F, C> {
+    fn discover(&self) -> DiscoveredHost {
+        let home = self.environment.home();
+        let data = self
+            .environment
+            .var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|path| path.join(".local/share")));
+        let data_directory = match data.as_deref() {
+            Some(path) => self.filesystem.writable(path).map_or_else(
+                |error| Discovery::Unknown(format!("cannot verify {}: {error}", path.display())),
+                |writable| {
+                    if writable {
+                        Discovery::Available
+                    } else {
+                        Discovery::Missing(format!("{} is not writable", path.display()))
+                    }
+                },
+            ),
+            None => Discovery::Missing("HOME and XDG_DATA_HOME are unavailable".into()),
+        };
+        let mut cs2_cfg_candidates = Vec::new();
+        if let Some(data) = data {
+            cs2_cfg_candidates.push(
+                data.join("Steam/steamapps/common/Counter-Strike Global Offensive/game/csgo/cfg"),
+            );
+        }
+        if let Some(home) = home {
+            cs2_cfg_candidates.push(home.join(
+                ".steam/steam/steamapps/common/Counter-Strike Global Offensive/game/csgo/cfg",
+            ));
+            cs2_cfg_candidates.push(home.join(".var/app/com.valvesoftware.Steam/data/Steam/steamapps/common/Counter-Strike Global Offensive/game/csgo/cfg"));
+        }
+        cs2_cfg_candidates.retain(|path| self.filesystem.exists(path));
+        cs2_cfg_candidates.sort();
+        cs2_cfg_candidates.dedup();
+        let native_recorder = executable(&self.filesystem, "gpu-screen-recorder");
+        let ffmpeg = executable(&self.filesystem, "ffmpeg");
+        let ffprobe = executable(&self.filesystem, "ffprobe");
+        let flatpak_recorder = command_status(
+            &self.commands,
+            "flatpak",
+            &[
+                "info",
+                "--show-application",
+                "com.dec05eba.gpu_screen_recorder",
+            ],
+            "gpu-screen-recorder Flatpak",
+        );
+        let audio = if matches!(
+            self.commands
+                .run("pw-cli", &["info", "0"], 8192, Duration::from_secs(1)),
+            Ok((true, _, _))
+        ) || matches!(
+            self.commands
+                .run("pactl", &["info"], 8192, Duration::from_secs(1)),
+            Ok((true, _, _))
+        ) {
+            Discovery::Available
+        } else {
+            Discovery::Missing("no PipeWire or PulseAudio source is available".into())
+        };
+        let session = match self.environment.var("XDG_SESSION_TYPE").as_deref() {
+            Some(value) if value == "wayland" => SessionKind::Wayland,
+            Some(value) if value == "x11" => SessionKind::X11,
+            _ => SessionKind::Other,
+        };
+        let portal_service = match self.commands.run(
+            "busctl",
+            &["--user", "--no-legend", "list"],
+            65536,
+            Duration::from_secs(1),
+        ) {
+            Ok((true, out, _))
+                if String::from_utf8_lossy(&out).lines().any(|line| {
+                    line.split_whitespace().next() == Some("org.freedesktop.portal.Desktop")
+                }) =>
+            {
+                Discovery::Available
+            }
+            Ok((true, _, _)) => {
+                Discovery::Missing("XDG GlobalShortcuts portal service is not registered".into())
+            }
+            Ok(_) => Discovery::Unknown("cannot list user D-Bus names without activation".into()),
+            Err(error) => Discovery::Unknown(format!(
+                "cannot inspect user D-Bus without activation: {error}"
+            )),
+        };
+        DiscoveredHost {
+            data_directory,
+            cs2_cfg_candidates,
+            native_recorder,
+            flatpak_recorder,
+            ffmpeg,
+            ffprobe,
+            audio,
+            session,
+            portal_service,
+            portal_binding: PortalBinding::Unapproved,
+        }
+    }
+}
+impl From<&DiscoveredHost> for HostFacts {
+    fn from(value: &DiscoveredHost) -> Self {
+        Self {
+            data_directory_writable: value.data_directory == Discovery::Available,
+            cs2_cfg_directory: value.cs2_cfg_candidates.first().cloned(),
+            recorder: if value.native_recorder == Discovery::Available {
+                Some(RecorderInstall::Native(PathBuf::from(
+                    "gpu-screen-recorder",
+                )))
+            } else if value.flatpak_recorder == Discovery::Available {
+                Some(RecorderInstall::Flatpak)
+            } else {
+                None
+            },
+            ffmpeg_available: value.ffmpeg == Discovery::Available,
+            audio_source_available: value.audio == Discovery::Available,
+            session: value.session,
+            global_shortcuts_portal: false,
+        }
+    }
+}
+fn executable(filesystem: &impl ProbeFilesystem, name: &str) -> Discovery {
+    if filesystem.executable(name) {
+        Discovery::Available
+    } else {
+        Discovery::Missing(format!("{name} is not available on PATH"))
+    }
+}
+fn command_status(
+    commands: &impl ProbeCommands,
+    program: &str,
+    args: &[&str],
+    label: &str,
+) -> Discovery {
+    match commands.run(program, args, 8192, Duration::from_secs(1)) {
+        Ok((true, _, _)) => Discovery::Available,
+        Ok(_) => Discovery::Missing(format!("{label} is not installed")),
+        Err(error) => Discovery::Unknown(format!("cannot inspect {label}: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    struct Env;
+    impl ProbeEnvironment for Env {
+        fn var(&self, _: &str) -> Option<OsString> {
+            None
+        }
+        fn home(&self) -> Option<PathBuf> {
+            Some(PathBuf::from("/home/fake"))
+        }
+    }
+    struct Fs;
+    impl ProbeFilesystem for Fs {
+        fn exists(&self, _: &Path) -> bool {
+            false
+        }
+        fn writable(&self, _: &Path) -> Result<bool, String> {
+            Err("NotFound".into())
+        }
+        fn executable(&self, _: &str) -> bool {
+            false
+        }
+    }
+    struct Commands;
+    impl ProbeCommands for Commands {
+        fn run(
+            &self,
+            _: &str,
+            _: &[&str],
+            _: usize,
+            _: Duration,
+        ) -> Result<(bool, Vec<u8>, Vec<u8>), String> {
+            Ok((false, vec![], vec![]))
+        }
+    }
+    #[test]
+    fn fake_probe_reports_missing_paths_and_unapproved_portal() {
+        let host = SystemProbe::new(Env, Fs, Commands).discover();
+        assert!(host.cs2_cfg_candidates.is_empty());
+        assert!(matches!(host.ffprobe, Discovery::Missing(_)));
+        assert!(matches!(host.data_directory, Discovery::Unknown(_)));
+        assert!(!HostFacts::from(&host).global_shortcuts_portal);
+    }
 }
