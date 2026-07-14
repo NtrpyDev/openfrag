@@ -74,6 +74,11 @@ Candidate transitions, candidate intervals, desired media ranges, actual media
 ranges, and save request times are monotonic-nanosecond values scoped to the
 CaptureSession. They are deliberately not UTC timestamps. A Manual Flag is a
 separate user-intent row and may overlap an Auto candidate without becoming one.
+`recorder_save_attempts.recorder_request_id` is the exact recorder request ID.
+One request is serialized and retried idempotently under that ID; duplicate
+acknowledgements increment diagnostic count but never create another Clip.
+Failed or missing attempts have no artifact and no Clip. Only a verified saved
+artifact may create a raw Clip and then a candidate or Manual Flag Clip link.
 
 Reconciliation is optional and non-destructive. It requires the configured
 local SteamID, known map equality when both sides provide one, unique Demo round
@@ -83,8 +88,9 @@ when GSI supplied one, and compatible transition category. Failure leaves
 ## SQLite schema
 
 Enable `PRAGMA foreign_keys = ON`, WAL journal mode, and `busy_timeout`. Store
-times as UTC integer milliseconds. Demo ticks are integer parser ticks and
-never converted from GSI time.
+wall-clock times as UTC integer milliseconds except fields explicitly named
+`*_monotonic_ns`, which are CaptureSession-scoped monotonic nanoseconds. Demo
+ticks are integer parser ticks and never converted from GSI time.
 
 ```sql
 CREATE TABLE schema_migrations (
@@ -153,7 +159,7 @@ CREATE TABLE live_candidates (
 
 CREATE TABLE clips (
   id TEXT PRIMARY KEY,
-  artifact_sha256 TEXT NOT NULL UNIQUE REFERENCES artifacts(sha256),
+  artifact_sha256 TEXT NOT NULL REFERENCES artifacts(sha256),
   capture_session_id TEXT NOT NULL REFERENCES capture_sessions(id),
   recorded_at_ms INTEGER NOT NULL,
   disposition TEXT NOT NULL CHECK(disposition IN ('saved','in_review','kept','deleted')),
@@ -176,37 +182,64 @@ CREATE TABLE candidate_trigger_receipts (
 
 CREATE TABLE candidate_media (
   candidate_id TEXT NOT NULL REFERENCES live_candidates(id),
+  save_attempt_id TEXT NOT NULL REFERENCES recorder_save_attempts(id),
   clip_id TEXT NOT NULL REFERENCES clips(id),
-  raw_media_sha256 TEXT NOT NULL REFERENCES artifacts(sha256),
-  desired_start_monotonic_ns INTEGER NOT NULL,
-  desired_end_monotonic_ns INTEGER NOT NULL,
+  PRIMARY KEY(candidate_id, save_attempt_id, clip_id)
+);
+
+CREATE TABLE recorder_save_attempts (
+  id TEXT PRIMARY KEY,
+  recorder_request_id TEXT NOT NULL UNIQUE,
+  capture_session_id TEXT NOT NULL REFERENCES capture_sessions(id),
+  requested_monotonic_ns INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('requested','acknowledged','saved','failed')),
+  acknowledgement_count INTEGER NOT NULL DEFAULT 0 CHECK(acknowledgement_count >= 0),
+  verified_artifact_sha256 TEXT REFERENCES artifacts(sha256),
   actual_start_monotonic_ns INTEGER,
   actual_end_monotonic_ns INTEGER,
-  save_status TEXT NOT NULL CHECK(save_status IN ('requested','saved','failed','missing')),
-  PRIMARY KEY(candidate_id, clip_id, raw_media_sha256),
-  CHECK(desired_end_monotonic_ns >= desired_start_monotonic_ns),
+  error_code TEXT,
+  CHECK((status = 'saved' AND verified_artifact_sha256 IS NOT NULL)
+     OR (status <> 'saved' AND verified_artifact_sha256 IS NULL)),
   CHECK(actual_end_monotonic_ns IS NULL OR actual_start_monotonic_ns IS NOT NULL),
   CHECK(actual_end_monotonic_ns IS NULL OR actual_end_monotonic_ns >= actual_start_monotonic_ns)
+);
+
+CREATE TABLE candidate_save_attempts (
+  candidate_id TEXT NOT NULL REFERENCES live_candidates(id),
+  save_attempt_id TEXT NOT NULL REFERENCES recorder_save_attempts(id),
+  desired_start_monotonic_ns INTEGER NOT NULL,
+  desired_end_monotonic_ns INTEGER NOT NULL,
+  PRIMARY KEY(candidate_id, save_attempt_id),
+  CHECK(desired_end_monotonic_ns >= desired_start_monotonic_ns)
 );
 
 CREATE TABLE manual_flags (
   id TEXT PRIMARY KEY,
   capture_session_id TEXT NOT NULL REFERENCES capture_sessions(id),
   flagged_monotonic_ns INTEGER NOT NULL,
-  save_status TEXT NOT NULL CHECK(save_status IN ('requested','saved','failed','missing')),
   created_at_ms INTEGER NOT NULL
+);
+
+CREATE TABLE manual_flag_save_attempts (
+  manual_flag_id TEXT NOT NULL REFERENCES manual_flags(id),
+  save_attempt_id TEXT NOT NULL REFERENCES recorder_save_attempts(id),
+  desired_start_monotonic_ns INTEGER NOT NULL,
+  desired_end_monotonic_ns INTEGER NOT NULL,
+  PRIMARY KEY(manual_flag_id, save_attempt_id),
+  CHECK(desired_end_monotonic_ns >= desired_start_monotonic_ns)
 );
 
 CREATE TABLE manual_flag_clips (
   manual_flag_id TEXT NOT NULL REFERENCES manual_flags(id),
+  save_attempt_id TEXT NOT NULL REFERENCES recorder_save_attempts(id),
   clip_id TEXT NOT NULL REFERENCES clips(id),
-  PRIMARY KEY(manual_flag_id, clip_id)
+  PRIMARY KEY(manual_flag_id, save_attempt_id, clip_id)
 );
 
 CREATE TABLE clip_derivations (
   derived_clip_id TEXT NOT NULL REFERENCES clips(id),
   source_clip_id TEXT NOT NULL REFERENCES clips(id),
-  operation TEXT NOT NULL CHECK(operation IN ('consolidate','trim','transcode')),
+  operation TEXT NOT NULL CHECK(operation IN ('consolidate','trim')),
   trim_start_ms INTEGER,
   trim_end_ms INTEGER,
   created_at_ms INTEGER NOT NULL,
@@ -224,7 +257,9 @@ CREATE TABLE clip_exports (
   completed_at_ms INTEGER,
   status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','failed')),
   error_code TEXT,
-  output_artifact_sha256 TEXT REFERENCES artifacts(sha256)
+  output_sha256 TEXT,
+  output_byte_length INTEGER CHECK(output_byte_length >= 0),
+  output_media_profile TEXT
 );
 
 CREATE TABLE matches (
@@ -247,12 +282,14 @@ CREATE TABLE analysis_runs (
   formula_id TEXT NOT NULL,
   metric_definition_version TEXT NOT NULL,
   requested_schema_hash TEXT NOT NULL,
+  evidence_semantics_epoch TEXT NOT NULL,
   started_at_ms INTEGER NOT NULL,
   completed_at_ms INTEGER,
   status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed')),
   error_code TEXT,
   UNIQUE(match_id, parser_build, generated_proto_build, formula_id,
-         metric_definition_version, requested_schema_hash)
+         parser_commit, metric_definition_version, requested_schema_hash,
+         evidence_semantics_epoch)
 );
 
 CREATE TABLE rounds (
@@ -347,7 +384,7 @@ CREATE TABLE player_rating_components (
 CREATE TABLE candidate_reconciliations (
   id TEXT PRIMARY KEY,
   live_candidate_id TEXT NOT NULL REFERENCES live_candidates(id),
-  analysis_run_id TEXT REFERENCES analysis_runs(id),
+  analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(id),
   match_id TEXT REFERENCES matches(id),
   round_id TEXT REFERENCES rounds(id),
   receipt_id TEXT REFERENCES receipts(id),
@@ -355,16 +392,19 @@ CREATE TABLE candidate_reconciliations (
   decided_at_ms INTEGER NOT NULL,
   reason_code TEXT NOT NULL,
   CHECK((status = 'confirmed' AND analysis_run_id IS NOT NULL AND match_id IS NOT NULL AND round_id IS NOT NULL AND receipt_id IS NOT NULL)
-     OR status <> 'confirmed')
+     OR status <> 'confirmed'),
+  UNIQUE(live_candidate_id, analysis_run_id)
 );
 
 CREATE INDEX gsi_snapshots_session_receive ON gsi_snapshots(capture_session_id, received_at_ms);
 CREATE INDEX live_candidates_session_status ON live_candidates(capture_session_id, status, first_transition_monotonic_ns);
+CREATE INDEX clips_artifact ON clips(artifact_sha256);
 CREATE INDEX clips_retention ON clips(retention_class, recorded_at_ms) WHERE deleted_at_ms IS NULL;
 CREATE INDEX analysis_runs_match_status ON analysis_runs(match_id, status, completed_at_ms);
 CREATE INDEX rounds_run_number ON rounds(analysis_run_id, round_number);
 CREATE INDEX receipts_run_metric ON receipts(analysis_run_id, metric_key, round_id);
-CREATE INDEX candidate_media_candidate ON candidate_media(candidate_id, save_status);
+CREATE INDEX candidate_media_candidate ON candidate_media(candidate_id, save_attempt_id, clip_id);
+CREATE INDEX save_attempts_session_status ON recorder_save_attempts(capture_session_id, status, requested_monotonic_ns);
 CREATE INDEX clip_derivations_source ON clip_derivations(source_clip_id);
 CREATE INDEX match_players_steam ON match_players(steam_id, match_id);
 CREATE INDEX round_metrics_player ON round_player_metrics(analysis_run_id, steam_id, metric_key);
@@ -379,7 +419,17 @@ same run as its vector. The sum of `player_rating_components.weight_bp` is
 validated against the formula version before publishing a vector. These are
 typed columns rather than a JSON-only stats blob so every numerator,
 denominator, scaled value, weight, participant, and Receipt can be indexed and
-audited.
+audited. A second trigger permits `candidate_media` or `manual_flag_clips` only
+when its save attempt is `saved` and its verified artifact equals the Clip
+artifact; failed, requested, acknowledged, or missing attempts cannot create a
+fake Clip or artifact row.
+
+An artifact is deleted from disk only when no nondeleted Clip, Demo, source
+derivative, or managed-root receipt still references it. Export outputs are
+ordinary user-chosen files outside the managed artifact root, so their hash,
+bytes, media profile, target, and failure are stored on `clip_exports` without
+an `artifacts` foreign key. A transcode for export is therefore not a review
+Clip derivation.
 
 `matches` and `analysis_runs` form a deferred foreign-key cycle. Insert a Match
 with `canonical_run_id=NULL`, insert its run, then set the pointer in the same
@@ -396,7 +446,9 @@ round in that run has the candidate's observed round number; and the referenced
 Receipt has a compatible categorical transition. The trigger must not compare
 GSI monotonic time to ticks, select a nearest tick, or overwrite a prior result.
 Thus a reparse appends another reconciliation row for the new analysis run and
-retains every prior confirmation or rejection.
+retains every prior confirmation or rejection. Every outcome names an analysis
+run and there is at most one decision per candidate per run; only confirmed
+outcomes require a round and Receipt.
 
 ## Retention, deletion, and recovery
 
@@ -431,7 +483,10 @@ and affected Clip or Match degraded or quarantined, never silently empty.
   columns/tables, backfills in a resumable migration, validates counts and
   foreign keys, then removes old data only in a later user-visible release.
 - Parser, generated-protobuf, requested field schema, metric definition, or
-  formula changes create a new `analysis_runs` row. They never overwrite a
+  formula changes create a new `analysis_runs` row. `evidence_semantics_epoch`
+  changes whenever Receipt interpretation changes. The full identity is parser
+  commit/build, generated-protobuf build, requested schema hash, metric
+  definition, formula, and evidence semantics epoch. Runs never overwrite a
   Receipt or mutate a prior canonical run.
 - GSI listener changes version live receipts only. They cannot invalidate Demo
   canonical facts, but may alter future candidate behavior.
@@ -452,6 +507,9 @@ and affected Clip or Match degraded or quarantined, never silently empty.
    consolidation provenance.
 6. Retention and hard-delete tests prove the 30-day and 2 GiB policy never
    deletes manual or confirmed media first, and never purges shared artifacts.
+7. Recorder fixtures prove failed requests, duplicate acknowledgement, crash
+   recovery, serialized retry, and no fake Clip or artifact before a verified
+   saved output.
 
 ## Unresolved dependencies
 
