@@ -124,11 +124,22 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
         let relative = artifact
             .relative_path
             .ok_or(PipelineError::Storage("artifact path absent".into()))?;
-        let parsed = self
+        let parsed = match self
             .parser
             .parse(&self.storage.layout().root.join(relative))
-            .map_err(PipelineError::Parser)?;
+        {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.storage
+                    .quarantine_artifact(demo_sha256, "parser_corrupt")
+                    .map_err(storage_error)?;
+                return Err(PipelineError::Parser(error));
+            }
+        };
         if parsed.participants.is_empty() {
+            self.storage
+                .quarantine_artifact(demo_sha256, "suspicious_empty_roster")
+                .map_err(storage_error)?;
             return Err(PipelineError::Parser(
                 "empty participant roster quarantined".into(),
             ));
@@ -356,6 +367,7 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
                     component.exact_numerator.saturating_mul(10_000) / component.exact_denominator;
                 let weight_bp = component.weight.numerator().saturating_mul(10_000)
                     / component.weight.denominator();
+                let component_receipt = self.storage.add_receipt(run, None, &format!("component:{:?}", component.kind), None, None, &format!("[\"{local}\"]"), &serde_json::json!({"numerator": component.exact_numerator, "denominator": component.exact_denominator}).to_string(), "[]", &serde_json::json!({"weight_numerator": component.weight.numerator(), "weight_denominator": component.weight.denominator()}).to_string()).map_err(storage_error)?;
                 self.storage
                     .persist_rating_component(
                         &vector,
@@ -364,7 +376,7 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
                         component.exact_denominator,
                         value_bp,
                         weight_bp,
-                        &rating_receipt,
+                        &component_receipt,
                     )
                     .map_err(storage_error)?;
             }
