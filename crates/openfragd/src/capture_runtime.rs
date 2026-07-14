@@ -2,9 +2,7 @@ use openfrag_capture::{
     Clock, Config, Error as SupervisorError, Filesystem, MediaProbe, RecorderInstall, ReplayConfig,
     SaveAcknowledgement, SaveDisposition, SaveProvenance, Supervisor, replay_launch,
 };
-use openfrag_setup::{
-    CaptureConfigError, CaptureRecorder, read_capture_configuration,
-};
+use openfrag_setup::{CaptureConfigError, CaptureRecorder, read_capture_configuration};
 use std::{ffi::OsString, path::Path};
 
 const FLATPAK_APP_ID: &str = "com.dec05eba.gpu_screen_recorder";

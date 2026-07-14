@@ -4,10 +4,7 @@ mod live_runtime {
     pub trait CaptureRuntimePort: Send {
         fn readiness(&self) -> Result<(), String>;
         fn available_from_ms(&self) -> u64;
-        fn request_save(
-            &mut self,
-            provenance: SaveProvenance,
-        ) -> Result<SaveDisposition, String>;
+        fn request_save(&mut self, provenance: SaveProvenance) -> Result<SaveDisposition, String>;
     }
 }
 
@@ -18,9 +15,7 @@ use capture_runtime::{CaptureRuntime, RuntimeError, RuntimeStatus, UnavailableRe
 use openfrag_capture::{
     Clock, Filesystem, MediaInfo, MediaProbe, Process, SaveDisposition, SaveProvenance, Signal,
 };
-use openfrag_setup::{
-    CaptureConfiguration, CaptureRecorder, write_capture_configuration,
-};
+use openfrag_setup::{CaptureConfiguration, CaptureRecorder, write_capture_configuration};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -130,9 +125,8 @@ fn write_configuration(data_directory: &Path, enabled: bool, recorder: CaptureRe
     std::fs::create_dir_all(&output).expect("capture directory");
     let ffprobe = data_directory.join("ffprobe");
     make_executable(&ffprobe);
-    let configuration =
-        CaptureConfiguration::new(enabled, recorder, "screen", output, ffprobe)
-            .expect("valid capture configuration");
+    let configuration = CaptureConfiguration::new(enabled, recorder, "screen", output, ffprobe)
+        .expect("valid capture configuration");
     write_capture_configuration(data_directory, &configuration).expect("write capture config");
 }
 
@@ -205,8 +199,7 @@ fn enabled_runtime_delegates_lifecycle_to_fakes_only() {
     assert_eq!(runtime.status(), RuntimeStatus::Running);
     assert_live_port_ready(&runtime);
     assert_eq!(
-        runtime
-            .request_save(SaveProvenance::ManualFlag)
+        live_runtime::CaptureRuntimePort::request_save(&mut runtime, SaveProvenance::ManualFlag,)
             .expect("fake save"),
         SaveDisposition::Signalled
     );
@@ -239,9 +232,6 @@ fn enabled_runtime_delegates_lifecycle_to_fakes_only() {
     .map(OsString::from)
     .collect::<Vec<_>>();
     expected.push(directory.path().join("captures").into_os_string());
-    assert_eq!(
-        log.spawns,
-        vec![expected]
-    );
+    assert_eq!(log.spawns, vec![expected]);
     assert_eq!(log.signals, vec![Signal::User1, Signal::Interrupt]);
 }

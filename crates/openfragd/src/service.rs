@@ -50,6 +50,50 @@ pub trait MutationPorts: Send + Sync + 'static {
 pub struct UnavailablePorts;
 impl MutationPorts for UnavailablePorts {}
 
+/// Composes independently testable import, clip, and live-capture adapters.
+pub struct CompositePorts {
+    imports: Arc<dyn MutationPorts>,
+    clips: Arc<dyn MutationPorts>,
+    live: Arc<dyn MutationPorts>,
+}
+
+impl CompositePorts {
+    #[must_use]
+    pub fn new(
+        imports: Arc<dyn MutationPorts>,
+        clips: Arc<dyn MutationPorts>,
+        live: Arc<dyn MutationPorts>,
+    ) -> Self {
+        Self {
+            imports,
+            clips,
+            live,
+        }
+    }
+}
+
+impl MutationPorts for CompositePorts {
+    fn import(&self, file: ImportedFile) -> Result<ImportJob, ApiError> {
+        self.imports.import(file)
+    }
+
+    fn update_clip(&self, id: &str, update: ClipUpdate) -> Result<Clip, ApiError> {
+        self.clips.update_clip(id, update)
+    }
+
+    fn trim(&self, id: &str) -> Result<Value, ApiError> {
+        self.clips.trim(id)
+    }
+
+    fn export(&self, id: &str) -> Result<Value, ApiError> {
+        self.clips.export(id)
+    }
+
+    fn manual_flag(&self) -> Result<Value, ApiError> {
+        self.live.manual_flag()
+    }
+}
+
 pub struct PipelinePorts {
     storage: Arc<Mutex<Storage>>,
     data_directory: PathBuf,
@@ -264,7 +308,8 @@ fn pipeline_error(error: &PipelineError) -> ApiError {
         }
         PipelineError::InsufficientHeadroom
         | PipelineError::Parser(_)
-        | PipelineError::Storage(_) => {
+        | PipelineError::Storage(_)
+        | PipelineError::Reconciliation(_) => {
             ApiError::Unavailable(format!("local Demo import failed: {error:?}"))
         }
     }
