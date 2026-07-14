@@ -15,5 +15,5 @@ The ubiquitous language for this project. Terms mean exactly this everywhere: co
 - **openfrag Rating**: the project's explainable per-match performance score. Its formula is public and every component links to the rounds that produced it.
 - **Receipt**: the evidence link from a stat to its rounds or clips. Clicking "lost 4 opening duels" opens those four rounds.
 - **Tonight**: the dashboard home view, the current play session's matches, stats, and best clips.
-- **Setup Wizard**: the first-run flow in the dashboard that configures storage, writes the GSI config into CS2, tests recording and hotkey, and signs into Steam.
+- **Setup Wizard**: the first-run flow in the dashboard that configures storage, writes the GSI config into CS2, tests recording and hotkey, and imports a local Demo.
 - **Compatibility Doctor**: the wizard's diagnostic step, verifying compositor, encoder, hotkey, GSI, and Steam location before first use. Re-runnable from settings.
