@@ -214,8 +214,8 @@ mod tests {
         let d = tempdir().unwrap();
         let p = d.path().join("x.dem");
         fs::write(&p, b"12345678").unwrap();
-        assert_eq!(validate(&p, 8), Err(ErrorCode::Io));
-        assert_eq!(validate(&p, 9), Ok(8));
+        assert_eq!(validate(&p, 7), Err(ErrorCode::Io));
+        assert_eq!(validate(&p, 8), Ok(8));
     }
     #[test]
     fn hashes_and_copies_atomically() {
