@@ -84,6 +84,7 @@ fn write_executable(path: &Path, body: &str) {
     let mut permissions = std::fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(path, permissions).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(10));
 }
 
 fn provisional_clip(source_path: PathBuf) -> Clip {
