@@ -769,6 +769,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "openfrag-setup"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "openfrag-storage"
 version = "1.0.0"
 dependencies = [
