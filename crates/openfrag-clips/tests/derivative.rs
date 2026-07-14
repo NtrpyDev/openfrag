@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 
 use openfrag_clips::{
     ArtifactProvenance, CancellationToken, Clip, ClipId, ClipOrigin, ClipRepository,
-    DerivativeProfile, DerivativeReviewError, DerivativeReviewRequest, DiscordEncodeProfile,
-    FfmpegTranscoder, FfprobeMediaProbe, MAX_CAPTURED_PROCESS_BYTES, MediaInfo, MediaProbe,
-    MediaProbeError, RepositoryError, ReviewError, ReviewMetadata, ReviewState, TranscodeError,
-    TranscodeRequest, Transcoder, TrimRange, prepare_derivative_and_review,
+    DerivativeProfile, DerivativeReviewError, DerivativeReviewRequest, DiscordCompatibilityError,
+    DiscordEncodeProfile, FfmpegTranscoder, FfprobeMediaProbe, MAX_CAPTURED_PROCESS_BYTES,
+    MediaInfo, MediaProbe, MediaProbeError, RepositoryError, ReviewError, ReviewMetadata,
+    ReviewState, TranscodeError, TranscodeRequest, Transcoder, TrimRange,
+    prepare_derivative_and_review,
 };
 
 #[derive(Default)]
@@ -197,7 +198,7 @@ fn trimmed_discord_derivative_uses_direct_deterministic_ffmpeg_arguments() {
     let ffprobe = root.join("fake-ffprobe");
     write_executable(
         &ffprobe,
-        "#!/bin/sh\nprintf 'codec_type=video\\nduration=30.000000\\n'\n",
+        "#!/bin/sh\nprintf '%s\\n' '{\"streams\":[{\"codec_type\":\"video\",\"codec_name\":\"h264\",\"pix_fmt\":\"yuv420p\",\"width\":1920,\"height\":1080,\"avg_frame_rate\":\"60/1\"},{\"codec_type\":\"audio\",\"codec_name\":\"aac\"}],\"format\":{\"duration\":\"30.000000\"}}'\n",
     );
     let clip = provisional_clip(source_path.clone());
     let original = clip.clone();
@@ -261,6 +262,63 @@ fn trimmed_discord_derivative_uses_direct_deterministic_ffmpeg_arguments() {
 
 #[cfg(unix)]
 #[test]
+fn trimmed_review_reencodes_for_accurate_cuts_instead_of_stream_copying() {
+    let root = temporary_directory("trim-review");
+    let source_path = root.join("source.mp4");
+    let source_bytes = b"immutable source bytes";
+    std::fs::write(&source_path, source_bytes).unwrap();
+    let destination_directory = root.join("derivatives");
+    std::fs::create_dir(&destination_directory).unwrap();
+    let argument_log = root.join("ffmpeg-arguments.txt");
+    let ffmpeg = root.join("fake-ffmpeg");
+    write_executable(
+        &ffmpeg,
+        &format!(
+            "#!/bin/sh\n: > '{}'\nfor argument in \"$@\"; do printf '%s\\n' \"$argument\" >> '{}'; last=$argument; done\nprintf 'accurately trimmed bytes' > \"$last\"\n",
+            argument_log.display(),
+            argument_log.display()
+        ),
+    );
+    let clip = provisional_clip(source_path.clone());
+    let mut repository = MemoryRepository::default();
+
+    let reviewed = prepare_derivative_and_review(
+        &mut repository,
+        &mut FfmpegTranscoder::new(ffmpeg, std::time::Duration::from_secs(2)),
+        &mut ValidProbe,
+        &clip,
+        DerivativeReviewRequest {
+            artifact_id: "review-trim".into(),
+            destination_directory,
+            trim: Some(TrimRange::new(5_000, 35_000).unwrap()),
+            profile: DerivativeProfile::Review,
+            metadata: review_metadata(),
+            reviewed_at_ms: 90_000,
+        },
+        &CancellationToken::new(),
+    )
+    .unwrap();
+
+    let arguments: Vec<String> = std::fs::read_to_string(argument_log)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(arguments.windows(2).any(|pair| pair == ["-ss", "5.000"]));
+    assert!(arguments.windows(2).any(|pair| pair == ["-t", "30.000"]));
+    assert!(arguments.windows(2).any(|pair| pair == ["-c:v", "libx264"]));
+    assert!(arguments.windows(2).any(|pair| pair == ["-c:a", "aac"]));
+    assert!(!arguments.windows(2).any(|pair| pair == ["-c", "copy"]));
+    assert_eq!(
+        std::fs::read(reviewed.derivative().unwrap().artifact().path()).unwrap(),
+        b"accurately trimmed bytes"
+    );
+    assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn malformed_ffprobe_output_prevents_commit_and_removes_staging_file() {
     let root = temporary_directory("malformed-probe");
     let source_path = root.join("source.mp4");
@@ -276,7 +334,7 @@ fn malformed_ffprobe_output_prevents_commit_and_removes_staging_file() {
     let ffprobe = root.join("fake-ffprobe");
     write_executable(
         &ffprobe,
-        "#!/bin/sh\nprintf 'codec_type=video\\nduration=30.000junk\\n'\n",
+        "#!/bin/sh\nprintf '%s\\n' '{\"streams\":[{\"codec_type\":\"video\"}],\"format\":{\"duration\":\"30.000junk\"}}'\n",
     );
     let clip = provisional_clip(source_path.clone());
     let mut repository = MemoryRepository::default();
@@ -319,13 +377,243 @@ fn ffprobe_rejects_positive_duration_without_a_video_stream() {
     let ffprobe = root.join("fake-ffprobe");
     write_executable(
         &ffprobe,
-        "#!/bin/sh\nprintf 'codec_type=audio\\nduration=30.000000\\n'\n",
+        "#!/bin/sh\nprintf '%s\\n' '{\"streams\":[{\"codec_type\":\"audio\",\"codec_name\":\"aac\"}],\"format\":{\"duration\":\"30.000000\"}}'\n",
     );
 
     let result = FfprobeMediaProbe::new(ffprobe, std::time::Duration::from_secs(2))
         .probe(Path::new("unused.mp4"), &CancellationToken::new());
 
     assert_eq!(result, Err(MediaProbeError::MissingVideoStream));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn ffprobe_rejects_zero_duration_json() {
+    let root = temporary_directory("probe-zero-duration");
+    let ffprobe = root.join("fake-ffprobe");
+    write_executable(
+        &ffprobe,
+        "#!/bin/sh\nprintf '%s\\n' '{\"streams\":[{\"codec_type\":\"video\",\"codec_name\":\"h264\",\"pix_fmt\":\"yuv420p\",\"width\":1920,\"height\":1080,\"avg_frame_rate\":\"60/1\"}],\"format\":{\"duration\":\"0.000000\"}}'\n",
+    );
+
+    let result = FfprobeMediaProbe::new(ffprobe, std::time::Duration::from_secs(2))
+        .probe(Path::new("unused.mp4"), &CancellationToken::new());
+
+    assert_eq!(result, Err(MediaProbeError::NonPositiveDuration));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+enum ExpectedDiscordRejection {
+    Codec,
+    PixelFormat,
+    Dimensions,
+    FrameRate,
+    AudioCodec,
+}
+
+#[cfg(unix)]
+fn assert_incompatible_discord_fixture(
+    name: &str,
+    fixture: &str,
+    expected: ExpectedDiscordRejection,
+) {
+    let root = temporary_directory(name);
+    let source_path = root.join("source.mp4");
+    let source_bytes = b"immutable source bytes";
+    std::fs::write(&source_path, source_bytes).unwrap();
+    let destination_directory = root.join("derivatives");
+    std::fs::create_dir(&destination_directory).unwrap();
+    let ffmpeg = root.join("fake-ffmpeg");
+    write_executable(
+        &ffmpeg,
+        "#!/bin/sh\nfor argument in \"$@\"; do last=$argument; done\nprintf 'encoded bytes' > \"$last\"\n",
+    );
+    let ffprobe = root.join("fake-ffprobe");
+    write_executable(
+        &ffprobe,
+        &format!("#!/bin/sh\nprintf '%s\\n' '{fixture}'\n"),
+    );
+    let clip = provisional_clip(source_path.clone());
+    let mut repository = MemoryRepository::default();
+
+    let result = prepare_derivative_and_review(
+        &mut repository,
+        &mut FfmpegTranscoder::new(ffmpeg, std::time::Duration::from_secs(2)),
+        &mut FfprobeMediaProbe::new(ffprobe, std::time::Duration::from_secs(2)),
+        &clip,
+        DerivativeReviewRequest {
+            artifact_id: format!("incompatible-{name}"),
+            destination_directory: destination_directory.clone(),
+            trim: Some(TrimRange::new(5_000, 35_000).unwrap()),
+            profile: DerivativeProfile::Discord(DiscordEncodeProfile::default()),
+            metadata: review_metadata(),
+            reviewed_at_ms: 90_000,
+        },
+        &CancellationToken::new(),
+    );
+
+    let Err(DerivativeReviewError::DiscordIncompatible(actual)) = result else {
+        panic!("expected incompatible Discord media for {name}");
+    };
+    assert!(matches!(
+        (expected, actual),
+        (
+            ExpectedDiscordRejection::Codec,
+            DiscordCompatibilityError::VideoCodec { .. }
+        ) | (
+            ExpectedDiscordRejection::PixelFormat,
+            DiscordCompatibilityError::PixelFormat { .. }
+        ) | (
+            ExpectedDiscordRejection::Dimensions,
+            DiscordCompatibilityError::Dimensions { .. }
+        ) | (
+            ExpectedDiscordRejection::FrameRate,
+            DiscordCompatibilityError::FrameRate { .. }
+        ) | (
+            ExpectedDiscordRejection::AudioCodec,
+            DiscordCompatibilityError::AudioCodec { .. }
+        )
+    ));
+    assert!(repository.committed.is_empty());
+    assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+    assert_eq!(
+        std::fs::read_dir(&destination_directory).unwrap().count(),
+        0
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn discord_profile_rejects_each_incompatible_ffprobe_json_fixture() {
+    let fixtures = [
+        (
+            "codec",
+            "{\"streams\":[{\"codec_type\":\"video\",\"codec_name\":\"vp9\",\"pix_fmt\":\"yuv420p\",\"width\":1920,\"height\":1080,\"avg_frame_rate\":\"60/1\"}],\"format\":{\"duration\":\"30.000000\"}}",
+            ExpectedDiscordRejection::Codec,
+        ),
+        (
+            "pixel-format",
+            "{\"streams\":[{\"codec_type\":\"video\",\"codec_name\":\"h264\",\"pix_fmt\":\"yuv444p\",\"width\":1920,\"height\":1080,\"avg_frame_rate\":\"60/1\"}],\"format\":{\"duration\":\"30.000000\"}}",
+            ExpectedDiscordRejection::PixelFormat,
+        ),
+        (
+            "width",
+            "{\"streams\":[{\"codec_type\":\"video\",\"codec_name\":\"h264\",\"pix_fmt\":\"yuv420p\",\"width\":1921,\"height\":1080,\"avg_frame_rate\":\"60/1\"}],\"format\":{\"duration\":\"30.000000\"}}",
+            ExpectedDiscordRejection::Dimensions,
+        ),
+        (
+            "height",
+            "{\"streams\":[{\"codec_type\":\"video\",\"codec_name\":\"h264\",\"pix_fmt\":\"yuv420p\",\"width\":1920,\"height\":1081,\"avg_frame_rate\":\"60/1\"}],\"format\":{\"duration\":\"30.000000\"}}",
+            ExpectedDiscordRejection::Dimensions,
+        ),
+        (
+            "frame-rate",
+            "{\"streams\":[{\"codec_type\":\"video\",\"codec_name\":\"h264\",\"pix_fmt\":\"yuv420p\",\"width\":1920,\"height\":1080,\"avg_frame_rate\":\"61/1\"}],\"format\":{\"duration\":\"30.000000\"}}",
+            ExpectedDiscordRejection::FrameRate,
+        ),
+        (
+            "audio-codec",
+            "{\"streams\":[{\"codec_type\":\"video\",\"codec_name\":\"h264\",\"pix_fmt\":\"yuv420p\",\"width\":1920,\"height\":1080,\"avg_frame_rate\":\"60/1\"},{\"codec_type\":\"audio\",\"codec_name\":\"opus\"}],\"format\":{\"duration\":\"30.000000\"}}",
+            ExpectedDiscordRejection::AudioCodec,
+        ),
+    ];
+
+    for (name, fixture, expected) in fixtures {
+        assert_incompatible_discord_fixture(name, fixture, expected);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn discord_profile_rejects_verified_output_above_ten_mib_and_cleans_it() {
+    let root = temporary_directory("discord-size");
+    let source_path = root.join("source.mp4");
+    let source_bytes = b"immutable source bytes";
+    std::fs::write(&source_path, source_bytes).unwrap();
+    let destination_directory = root.join("derivatives");
+    std::fs::create_dir(&destination_directory).unwrap();
+    let ffmpeg = root.join("fake-ffmpeg");
+    write_executable(
+        &ffmpeg,
+        "#!/bin/sh\nfor argument in \"$@\"; do last=$argument; done\ntruncate -s 10485761 \"$last\"\n",
+    );
+    let ffprobe = root.join("fake-ffprobe");
+    write_executable(
+        &ffprobe,
+        "#!/bin/sh\nprintf '%s\\n' '{\"streams\":[{\"codec_type\":\"video\",\"codec_name\":\"h264\",\"pix_fmt\":\"yuv420p\",\"width\":1920,\"height\":1080,\"avg_frame_rate\":\"60/1\"},{\"codec_type\":\"audio\",\"codec_name\":\"aac\"}],\"format\":{\"duration\":\"30.000000\"}}'\n",
+    );
+    let clip = provisional_clip(source_path.clone());
+    let mut repository = MemoryRepository::default();
+
+    let result = prepare_derivative_and_review(
+        &mut repository,
+        &mut FfmpegTranscoder::new(ffmpeg, std::time::Duration::from_secs(2)),
+        &mut FfprobeMediaProbe::new(ffprobe, std::time::Duration::from_secs(2)),
+        &clip,
+        DerivativeReviewRequest {
+            artifact_id: "oversize-discord".into(),
+            destination_directory: destination_directory.clone(),
+            trim: Some(TrimRange::new(5_000, 35_000).unwrap()),
+            profile: DerivativeProfile::Discord(DiscordEncodeProfile::default()),
+            metadata: review_metadata(),
+            reviewed_at_ms: 90_000,
+        },
+        &CancellationToken::new(),
+    );
+
+    assert_eq!(
+        result,
+        Err(DerivativeReviewError::OutputTooLarge {
+            actual_bytes: 10_485_761,
+            max_bytes: 10_485_760,
+        })
+    );
+    assert!(repository.committed.is_empty());
+    assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+    assert_eq!(
+        std::fs::read_dir(&destination_directory).unwrap().count(),
+        0
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ordinary_review_copy_may_exceed_the_discord_size_ceiling() {
+    let root = temporary_directory("large-review");
+    let source_path = root.join("source.mp4");
+    let source_file = std::fs::File::create(&source_path).unwrap();
+    source_file.set_len(10_485_761).unwrap();
+    source_file.sync_all().unwrap();
+    let destination_directory = root.join("derivatives");
+    std::fs::create_dir(&destination_directory).unwrap();
+    let clip = provisional_clip(source_path.clone());
+    let mut repository = MemoryRepository::default();
+
+    let reviewed = prepare_derivative_and_review(
+        &mut repository,
+        &mut UnavailableTranscoder,
+        &mut ValidProbe,
+        &clip,
+        DerivativeReviewRequest {
+            artifact_id: "large-review".into(),
+            destination_directory,
+            trim: None,
+            profile: DerivativeProfile::Review,
+            metadata: review_metadata(),
+            reviewed_at_ms: 90_000,
+        },
+        &CancellationToken::new(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        reviewed.derivative().unwrap().artifact().bytes(),
+        10_485_761
+    );
+    assert_eq!(std::fs::metadata(&source_path).unwrap().len(), 10_485_761);
     std::fs::remove_dir_all(root).unwrap();
 }
 
