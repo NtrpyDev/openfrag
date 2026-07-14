@@ -9,6 +9,7 @@ packages=(
     openfrag-domain
     openfrag-gsi
     openfrag-import
+    openfrag-live
     openfrag-pipeline
     openfrag-setup
     openfrag-shortcuts

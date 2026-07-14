@@ -945,6 +945,11 @@ dependencies = [
 [[package]]
 name = "openfrag-clips"
 version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "openfrag-domain"
@@ -971,6 +976,15 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "openfrag-live"
+version = "1.0.0"
+dependencies = [
+ "openfrag-capture",
+ "openfrag-domain",
+ "openfrag-gsi",
 ]
 
 [[package]]
