@@ -11,10 +11,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 mod derivative;
 
 pub use derivative::{
-    CancellationToken, DerivativeProfile, DerivativeReviewError, DerivativeReviewRequest,
-    DiscordEncodeProfile, FfmpegTranscoder, FfprobeMediaProbe, MAX_CAPTURED_PROCESS_BYTES,
-    MediaInfo, MediaProbe, MediaProbeError, ReviewMetadata, TranscodeError, TranscodeRequest,
-    Transcoder, prepare_derivative_and_review,
+    AudioStreamInfo, CancellationToken, DerivativeProfile, DerivativeReviewError,
+    DerivativeReviewRequest, DiscordCompatibilityError, DiscordEncodeProfile, FfmpegTranscoder,
+    FfprobeMediaProbe, FrameRate, MAX_CAPTURED_PROCESS_BYTES, MediaInfo, MediaProbe,
+    MediaProbeError, ReviewMetadata, TranscodeError, TranscodeRequest, Transcoder, VideoStreamInfo,
+    prepare_derivative_and_review,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -63,6 +64,8 @@ pub enum MediaProbeError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaInfo {
     duration_ms: u64,
+    video: VideoStreamInfo,
+    audio_streams: Vec<AudioStreamInfo>,
 }
 
 impl MediaInfo {
@@ -72,12 +75,92 @@ impl MediaInfo {
         } else if !has_video_stream {
             Err(MediaProbeError::MissingVideoStream)
         } else {
-            Ok(Self { duration_ms })
+            Ok(Self {
+                duration_ms,
+                video: VideoStreamInfo::unknown(),
+                audio_streams: Vec::new(),
+            })
         }
     }
 
     pub const fn duration_ms(&self) -> u64 {
         self.duration_ms
+    }
+
+    pub const fn video(&self) -> &VideoStreamInfo {
+        &self.video
+    }
+
+    pub fn audio_streams(&self) -> &[AudioStreamInfo] {
+        &self.audio_streams
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VideoStreamInfo {
+    codec_name: Option<String>,
+    pixel_format: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    frame_rate: Option<FrameRate>,
+}
+
+impl VideoStreamInfo {
+    const fn unknown() -> Self {
+        Self {
+            codec_name: None,
+            pixel_format: None,
+            width: None,
+            height: None,
+            frame_rate: None,
+        }
+    }
+
+    pub fn codec_name(&self) -> Option<&str> {
+        self.codec_name.as_deref()
+    }
+
+    pub fn pixel_format(&self) -> Option<&str> {
+        self.pixel_format.as_deref()
+    }
+
+    pub const fn width(&self) -> Option<u32> {
+        self.width
+    }
+
+    pub const fn height(&self) -> Option<u32> {
+        self.height
+    }
+
+    pub const fn frame_rate(&self) -> Option<FrameRate> {
+        self.frame_rate
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioStreamInfo {
+    codec_name: Option<String>,
+}
+
+impl AudioStreamInfo {
+    pub fn codec_name(&self) -> Option<&str> {
+        self.codec_name.as_deref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameRate {
+    numerator: u64,
+    denominator: u64,
+}
+
+impl FrameRate {
+    pub const fn numerator(self) -> u64 {
+        self.numerator
+    }
+
+    pub const fn denominator(self) -> u64 {
+        self.denominator
     }
 }
 
@@ -197,7 +280,11 @@ impl Transcoder for FfmpegTranscoder {
         ]);
         match request.profile() {
             DerivativeProfile::Review => {
-                command.args(["-map", "0", "-c", "copy"]);
+                command
+                    .args(["-map", "0:v:0", "-map", "0:a?"])
+                    .args(["-c:v", "libx264", "-preset", "medium", "-crf", "18"])
+                    .args(["-c:a", "aac", "-b:a", "192000"])
+                    .args(["-movflags", "+faststart", "-f", "mp4"]);
             }
             DerivativeProfile::Discord(profile) => {
                 let duration_ms = request.trim().end_ms() - request.trim().start_ms();
@@ -266,14 +353,10 @@ impl MediaProbe for FfprobeMediaProbe {
         command.args([
             "-v",
             "error",
-            "-select_streams",
-            "v:0",
             "-show_entries",
-            "stream=codec_type",
-            "-show_entries",
-            "format=duration",
+            "format=duration:stream=codec_type,codec_name,pix_fmt,width,height,avg_frame_rate",
             "-of",
-            "default=noprint_wrappers=1",
+            "json",
         ]);
         command.arg(path);
         let output = match run_process(&mut command, self.timeout, cancellation) {
@@ -296,20 +379,7 @@ impl MediaProbe for FfprobeMediaProbe {
         if output.stdout_truncated {
             return Err(MediaProbeError::MalformedOutput);
         }
-        let has_video = output
-            .stdout
-            .lines()
-            .any(|line| line.trim() == "codec_type=video");
-        if !has_video {
-            return Err(MediaProbeError::MissingVideoStream);
-        }
-        let duration = output
-            .stdout
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("duration="))
-            .ok_or(MediaProbeError::MalformedOutput)?;
-        let duration_ms = parse_seconds_as_milliseconds(duration)?;
-        MediaInfo::new(duration_ms, true)
+        parse_probe_json(&output.stdout)
     }
 }
 
@@ -356,6 +426,27 @@ pub enum DerivativeReviewError {
     OutputTooLarge {
         actual_bytes: u64,
         max_bytes: u64,
+    },
+    DiscordIncompatible(DiscordCompatibilityError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DiscordCompatibilityError {
+    VideoCodec {
+        actual: Option<String>,
+    },
+    PixelFormat {
+        actual: Option<String>,
+    },
+    Dimensions {
+        width: Option<u32>,
+        height: Option<u32>,
+    },
+    FrameRate {
+        actual: Option<FrameRate>,
+    },
+    AudioCodec {
+        actual: Option<String>,
     },
 }
 
@@ -471,6 +562,11 @@ fn verify_staging_derivative(
         DerivativeReviewError::Probe(error)
     })?;
     if let DerivativeProfile::Discord(discord) = profile {
+        verify_discord_media(&media, discord)
+            .map_err(DerivativeReviewError::DiscordIncompatible)
+            .inspect_err(|_| {
+                let _ = fs::remove_file(staging_path);
+            })?;
         let actual_bytes = fs::metadata(staging_path)
             .map_err(|error| {
                 let _ = fs::remove_file(staging_path);
@@ -486,6 +582,59 @@ fn verify_staging_derivative(
         }
     }
     Ok(media)
+}
+
+fn verify_discord_media(
+    media: &MediaInfo,
+    profile: &DiscordEncodeProfile,
+) -> Result<(), DiscordCompatibilityError> {
+    if media.video.codec_name.as_deref() != Some("h264") {
+        return Err(DiscordCompatibilityError::VideoCodec {
+            actual: media.video.codec_name.clone(),
+        });
+    }
+    if media.video.pixel_format.as_deref() != Some("yuv420p") {
+        return Err(DiscordCompatibilityError::PixelFormat {
+            actual: media.video.pixel_format.clone(),
+        });
+    }
+    let dimensions_valid = media
+        .video
+        .width
+        .is_some_and(|width| width > 0 && width <= u32::from(profile.max_width))
+        && media
+            .video
+            .height
+            .is_some_and(|height| height > 0 && height <= u32::from(profile.max_height));
+    if !dimensions_valid {
+        return Err(DiscordCompatibilityError::Dimensions {
+            width: media.video.width,
+            height: media.video.height,
+        });
+    }
+    let frame_rate_valid = media.video.frame_rate.is_some_and(|frame_rate| {
+        frame_rate.denominator > 0
+            && frame_rate.numerator > 0
+            && frame_rate.numerator
+                <= frame_rate
+                    .denominator
+                    .saturating_mul(u64::from(profile.max_frames_per_second))
+    });
+    if !frame_rate_valid {
+        return Err(DiscordCompatibilityError::FrameRate {
+            actual: media.video.frame_rate,
+        });
+    }
+    if let Some(audio) = media
+        .audio_streams
+        .iter()
+        .find(|audio| audio.codec_name.as_deref() != Some("aac"))
+    {
+        return Err(DiscordCompatibilityError::AudioCodec {
+            actual: audio.codec_name.clone(),
+        });
+    }
+    Ok(())
 }
 
 fn create_staging_derivative(
@@ -599,6 +748,71 @@ fn discord_video_bitrate(
     } else {
         Ok(available.min(profile.max_video_bitrate_bps))
     }
+}
+
+#[derive(Deserialize)]
+struct ProbeDocument {
+    #[serde(default)]
+    streams: Vec<ProbeStream>,
+    format: Option<ProbeFormat>,
+}
+
+#[derive(Deserialize)]
+struct ProbeFormat {
+    duration: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProbeStream {
+    codec_type: Option<String>,
+    codec_name: Option<String>,
+    pix_fmt: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    avg_frame_rate: Option<String>,
+}
+
+fn parse_probe_json(output: &str) -> Result<MediaInfo, MediaProbeError> {
+    let document: ProbeDocument =
+        serde_json::from_str(output).map_err(|_| MediaProbeError::MalformedOutput)?;
+    let duration = document
+        .format
+        .and_then(|format| format.duration)
+        .ok_or(MediaProbeError::MalformedOutput)?;
+    let duration_ms = parse_seconds_as_milliseconds(&duration)?;
+    let video = document
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("video"))
+        .ok_or(MediaProbeError::MissingVideoStream)?;
+    let video = VideoStreamInfo {
+        codec_name: video.codec_name.clone(),
+        pixel_format: video.pix_fmt.clone(),
+        width: video.width,
+        height: video.height,
+        frame_rate: video.avg_frame_rate.as_deref().and_then(parse_frame_rate),
+    };
+    let audio_streams = document
+        .streams
+        .into_iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("audio"))
+        .map(|stream| AudioStreamInfo {
+            codec_name: stream.codec_name,
+        })
+        .collect();
+    Ok(MediaInfo {
+        duration_ms,
+        video,
+        audio_streams,
+    })
+}
+
+fn parse_frame_rate(value: &str) -> Option<FrameRate> {
+    let (numerator, denominator) = value.split_once('/')?;
+    Some(FrameRate {
+        numerator: numerator.parse().ok()?,
+        denominator: denominator.parse().ok()?,
+    })
 }
 
 fn parse_seconds_as_milliseconds(value: &str) -> Result<u64, MediaProbeError> {
