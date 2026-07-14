@@ -3,8 +3,10 @@
 #![allow(clippy::missing_errors_doc)]
 
 mod capture_config;
+mod setup_flow;
 
 pub use capture_config::*;
+pub use setup_flow::*;
 
 use serde::Serialize;
 use std::{
