@@ -6,11 +6,196 @@ use openfrag_live::{
 };
 use openfrag_storage::Storage;
 use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex},
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex, mpsc},
+    time::{Duration, Instant},
 };
 
 const MAX_DIAGNOSTICS: usize = 32;
+
+/// Cloneable monotonic clock sharing one daemon-relative epoch.
+#[derive(Clone)]
+pub struct MonotonicClock {
+    started: Arc<Instant>,
+}
+
+impl Default for MonotonicClock {
+    fn default() -> Self {
+        Self {
+            started: Arc::new(Instant::now()),
+        }
+    }
+}
+
+impl Clock for MonotonicClock {
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+enum DeadlineCommand {
+    Schedule { timer: TimerId, deadline_ms: u64 },
+    Cancel { timer: TimerId },
+}
+
+/// Coordinator-owned scheduling handle; it never owns or calls the live runtime.
+#[derive(Clone)]
+pub struct ChannelScheduler {
+    sender: mpsc::Sender<DeadlineCommand>,
+}
+
+/// Daemon-owned deadline receiver that yields timer identities for dispatch.
+pub struct DeadlineDriver {
+    receiver: mpsc::Receiver<DeadlineCommand>,
+    deadlines: HashMap<TimerId, u64>,
+    disconnected: bool,
+}
+
+#[must_use]
+pub fn deadline_channel() -> (ChannelScheduler, DeadlineDriver) {
+    let (sender, receiver) = mpsc::channel();
+    (
+        ChannelScheduler { sender },
+        DeadlineDriver {
+            receiver,
+            deadlines: HashMap::new(),
+            disconnected: false,
+        },
+    )
+}
+
+impl Scheduler for ChannelScheduler {
+    fn schedule(&self, timer: &TimerId, deadline_ms: u64) -> Result<(), LiveDiagnostic> {
+        self.sender
+            .send(DeadlineCommand::Schedule {
+                timer: timer.clone(),
+                deadline_ms,
+            })
+            .map_err(|_| LiveDiagnostic::Scheduler("deadline driver is unavailable".into()))
+    }
+
+    fn cancel(&self, timer: &TimerId) -> Result<(), LiveDiagnostic> {
+        self.sender
+            .send(DeadlineCommand::Cancel {
+                timer: timer.clone(),
+            })
+            .map_err(|_| LiveDiagnostic::Scheduler("deadline driver is unavailable".into()))
+    }
+}
+
+impl DeadlineDriver {
+    /// Applies queued schedule changes and returns every timer due at `now_ms`.
+    #[must_use]
+    pub fn take_due(&mut self, now_ms: u64) -> Vec<TimerId> {
+        self.drain_commands();
+        let mut due = self
+            .deadlines
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now_ms)
+            .map(|(timer, deadline)| (*deadline, timer.clone()))
+            .collect::<Vec<_>>();
+        due.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.as_str().cmp(right.1.as_str()))
+        });
+        for (_, timer) in &due {
+            self.deadlines.remove(timer);
+        }
+        due.into_iter().map(|(_, timer)| timer).collect()
+    }
+
+    /// Returns the earliest known deadline after applying queued changes.
+    #[must_use]
+    pub fn next_deadline_ms(&mut self) -> Option<u64> {
+        self.drain_commands();
+        self.deadlines.values().copied().min()
+    }
+
+    /// Blocks a dedicated worker until a timer is due or every scheduler handle is dropped.
+    ///
+    /// A Tokio daemon can run this method in `spawn_blocking`, then send each returned
+    /// [`TimerId`] to the async owner of [`LiveRuntime::dispatch_timer`].
+    pub fn wait_next_due<C: Clock>(&mut self, clock: &C) -> Option<TimerId> {
+        loop {
+            self.drain_commands();
+            if let Some(timer) = self.take_next_due(clock.now_ms()) {
+                return Some(timer);
+            }
+            let command = match self.next_deadline_ms() {
+                Some(deadline_ms) => {
+                    let wait_ms = deadline_ms.saturating_sub(clock.now_ms());
+                    if self.disconnected {
+                        std::thread::sleep(Duration::from_millis(wait_ms));
+                        None
+                    } else {
+                        match self.receiver.recv_timeout(Duration::from_millis(wait_ms)) {
+                            Ok(command) => Some(command),
+                            Err(mpsc::RecvTimeoutError::Timeout) => None,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                self.disconnected = true;
+                                None
+                            }
+                        }
+                    }
+                }
+                None if self.disconnected => return None,
+                None => {
+                    if let Ok(command) = self.receiver.recv() {
+                        Some(command)
+                    } else {
+                        self.disconnected = true;
+                        None
+                    }
+                }
+            };
+            if let Some(command) = command {
+                self.apply(command);
+            } else if self.disconnected && self.deadlines.is_empty() {
+                return None;
+            }
+        }
+    }
+
+    fn drain_commands(&mut self) {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(command) => self.apply(command),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.disconnected = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn take_next_due(&mut self, now_ms: u64) -> Option<TimerId> {
+        let timer = self
+            .deadlines
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now_ms)
+            .min_by(|left, right| {
+                left.1
+                    .cmp(right.1)
+                    .then_with(|| left.0.as_str().cmp(right.0.as_str()))
+            })
+            .map(|(timer, _)| timer.clone())?;
+        self.deadlines.remove(&timer);
+        Some(timer)
+    }
+
+    fn apply(&mut self, command: DeadlineCommand) {
+        match command {
+            DeadlineCommand::Schedule { timer, deadline_ms } => {
+                self.deadlines.insert(timer, deadline_ms);
+            }
+            DeadlineCommand::Cancel { timer } => {
+                self.deadlines.remove(&timer);
+            }
+        }
+    }
+}
 
 pub trait CaptureRuntimePort: Send {
     fn readiness(&self) -> Result<(), String>;

@@ -2,7 +2,8 @@
 mod live_runtime;
 
 use live_runtime::{
-    CaptureRuntimePort, LiveRuntime, LiveRuntimeError, LiveRuntimeStatus, UnavailableReason,
+    CaptureRuntimePort, LiveRuntime, LiveRuntimeError, LiveRuntimeStatus, MonotonicClock,
+    UnavailableReason, deadline_channel,
 };
 use openfrag_capture::{SaveDisposition, SaveProvenance};
 use openfrag_gsi::{
@@ -21,6 +22,64 @@ use std::{
     },
     time::Duration,
 };
+
+#[test]
+fn monotonic_clock_clones_share_one_non_decreasing_epoch() {
+    let clock = MonotonicClock::default();
+    let clone = clock.clone();
+    let before = clock.now_ms();
+    std::thread::sleep(Duration::from_millis(2));
+    assert!(clone.now_ms() >= before);
+    assert!(clock.now_ms() >= before);
+}
+
+#[test]
+fn channel_scheduler_reschedules_cancels_and_yields_due_ids() {
+    let (scheduler, mut driver) = deadline_channel();
+    let late = TimerId::new("late");
+    let first = TimerId::new("first");
+    let cancelled = TimerId::new("cancelled");
+    scheduler.schedule(&late, 300).expect("schedule late");
+    scheduler.schedule(&first, 100).expect("schedule first");
+    scheduler
+        .schedule(&cancelled, 200)
+        .expect("schedule cancelled");
+    scheduler.cancel(&cancelled).expect("cancel timer");
+    scheduler.schedule(&late, 150).expect("reschedule late");
+
+    assert_eq!(driver.next_deadline_ms(), Some(100));
+    assert_eq!(
+        driver.take_due(150),
+        vec![TimerId::new("first"), TimerId::new("late")]
+    );
+    assert!(driver.take_due(1_000).is_empty());
+}
+
+#[test]
+fn deadline_driver_waits_without_owning_the_runtime() {
+    let (scheduler, mut driver) = deadline_channel();
+    let clock = MonotonicClock::default();
+    let deadline = clock.now_ms();
+    scheduler
+        .schedule(&TimerId::new("immediate-b"), deadline)
+        .expect("schedule immediate b");
+    scheduler
+        .schedule(&TimerId::new("immediate-a"), deadline)
+        .expect("schedule immediate a");
+    assert_eq!(
+        driver.wait_next_due(&clock),
+        Some(TimerId::new("immediate-a"))
+    );
+    assert_eq!(
+        driver.wait_next_due(&clock),
+        Some(TimerId::new("immediate-b"))
+    );
+    drop(driver);
+    assert!(matches!(
+        scheduler.schedule(&TimerId::new("orphaned"), 0),
+        Err(LiveDiagnostic::Scheduler(_))
+    ));
+}
 
 #[derive(Default)]
 struct MemoryStore {
