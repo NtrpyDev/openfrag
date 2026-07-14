@@ -1,9 +1,10 @@
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 pub const MAX_BODY_BYTES: usize = 128 * 1024;
+pub const DUPLICATE_WINDOW: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
@@ -16,6 +17,31 @@ pub enum IngestError {
     TooLarge,
     InvalidJson,
     WrongApp,
+    Unauthorized,
+    SinkFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpStatus {
+    Ok,
+    BadRequest,
+    Unauthorized,
+    PayloadTooLarge,
+    MethodNotAllowed,
+    NotFound,
+    InternalError,
+}
+pub fn http_status(error: Option<&IngestError>) -> HttpStatus {
+    match error {
+        None => HttpStatus::Ok,
+        Some(IngestError::TooLarge) => HttpStatus::PayloadTooLarge,
+        Some(IngestError::Unauthorized) => HttpStatus::Unauthorized,
+        Some(IngestError::WrongApp | IngestError::InvalidJson) => HttpStatus::BadRequest,
+        Some(IngestError::SinkFailure) => HttpStatus::InternalError,
+    }
+}
+pub trait ReceiptSink {
+    fn persist(&mut self, receipt: &Receipt) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -73,7 +99,7 @@ pub struct IngestState {
     seen: HashSet<String>,
     next: u64,
     pub seed: Option<Receipt>,
-    hashes: HashSet<String>,
+    hashes: HashMap<String, Instant>,
     started: Option<Instant>,
 }
 
@@ -102,7 +128,10 @@ pub fn ingest_configured(
     if payload.auth.as_ref().and_then(|a| a.token.as_deref()) != Some(config.auth_token.as_str()) {
         return Err(IngestError::WrongApp);
     }
-    if !state.hashes.insert(hash.clone()) {
+    state
+        .hashes
+        .retain(|_, seen| now.duration_since(*seen) <= DUPLICATE_WINDOW);
+    if state.hashes.insert(hash.clone(), now).is_some() {
         return Ok(None);
     }
     state.next += 1;
@@ -127,6 +156,36 @@ pub fn ingest_configured(
         state.seed = Some(receipt.clone());
     }
     Ok(Some(receipt))
+}
+
+pub fn post_gsi(
+    state: &mut IngestState,
+    config: &IngestConfig,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+    sink: &mut dyn ReceiptSink,
+) -> (HttpStatus, Option<Receipt>) {
+    if method != "POST" {
+        return (HttpStatus::MethodNotAllowed, None);
+    }
+    if path != "/gsi" {
+        return (HttpStatus::NotFound, None);
+    }
+    if content_type != "application/json" {
+        return (HttpStatus::BadRequest, None);
+    }
+    match ingest_configured(state, config, body) {
+        Ok(Some(r)) => {
+            if sink.persist(&r).is_err() {
+                return (HttpStatus::InternalError, None);
+            }
+            (HttpStatus::Ok, Some(r))
+        }
+        Ok(None) => (HttpStatus::Ok, None),
+        Err(e) => (http_status(Some(&e)), None),
+    }
 }
 
 pub fn ingest(state: &mut IngestState, body: &[u8]) -> Result<Option<Receipt>, IngestError> {
