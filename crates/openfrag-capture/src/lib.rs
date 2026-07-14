@@ -1,6 +1,46 @@
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const REPLAY_SECONDS: u32 = 60;
+pub const STDERR_LIMIT: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    Starting,
+    Warming,
+    Running,
+    Saving,
+    Backoff,
+    Faulted,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartDelay {
+    One,
+    Two,
+    Four,
+    Eight,
+    Sixteen,
+    Thirty,
+}
+pub fn restart_delay(attempt: u8) -> RestartDelay {
+    match attempt {
+        0 => RestartDelay::One,
+        1 => RestartDelay::Two,
+        2 => RestartDelay::Four,
+        3 => RestartDelay::Eight,
+        4 => RestartDelay::Sixteen,
+        _ => RestartDelay::Thirty,
+    }
+}
+
+pub fn validate_clip_path(root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let root = root.canonicalize().ok()?;
+    let path = candidate.canonicalize().ok()?;
+    if !path.starts_with(&root) || !path.is_file() || std::fs::metadata(&path).ok()?.len() == 0 {
+        return None;
+    }
+    Some(path)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchSpec {
