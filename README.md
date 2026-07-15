@@ -15,6 +15,10 @@ openfrag is one local app. It watches your game through Valve's official Game St
 
 Pre-development. Planning happens in the open on the [wayfinder map](../../issues/1).
 
+## Support status
+
+No environment is release-qualified yet. Physical prototypes have established limited KDE Wayland evidence, while installed-package, recorder, and cross-machine gates remain open. See the exact [support matrix](docs/support-matrix.md).
+
 ## Stack
 
 Rust daemon plus a local web dashboard. Recording via [gpu-screen-recorder](https://git.dec05eba.com/gpu-screen-recorder/about/) (run as a separate process). Single-file SQLite metadata; demos and clips stored as ordinary files.
