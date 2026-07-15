@@ -19,6 +19,8 @@ const RATING_AVAILABILITY_MIGRATION: &str =
 const CLIP_REVIEW_MIGRATION: &str = include_str!("../migrations/0006_clip_review.sql");
 const CLIP_MODEL_MIGRATION: &str = include_str!("../migrations/0007_clip_model.sql");
 const CLIP_REVIEW_TIME_MIGRATION: &str = include_str!("../migrations/0008_clip_review_time.sql");
+const IMPORT_DIAGNOSTICS_MIGRATION: &str =
+    include_str!("../migrations/0009_import_diagnostics.sql");
 
 #[derive(Debug)]
 pub enum Error {
@@ -171,6 +173,19 @@ pub struct ImportJob {
     pub lease_owner: Option<String>,
     pub lease_expires_at_ms: Option<i64>,
     pub error_code: Option<String>,
+    pub remediation_code: Option<String>,
+    pub diagnostic_json: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportAttempt {
+    pub attempt_number: i64,
+    pub started_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+    pub status: String,
+    pub error_code: Option<String>,
+    pub remediation_code: Option<String>,
+    pub diagnostic_json: Option<String>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArtifactAvailability {
@@ -563,6 +578,7 @@ impl Storage {
         ensure_migration(&self.connection, 6, CLIP_REVIEW_MIGRATION)?;
         ensure_migration(&self.connection, 7, CLIP_MODEL_MIGRATION)?;
         ensure_migration(&self.connection, 8, CLIP_REVIEW_TIME_MIGRATION)?;
+        ensure_migration(&self.connection, 9, IMPORT_DIAGNOSTICS_MIGRATION)?;
         Ok(())
     }
     pub fn stage_artifact(&self, bytes: &[u8]) -> Result<StagedArtifact> {
@@ -1609,9 +1625,24 @@ impl Storage {
     }
     #[allow(clippy::type_complexity)]
     pub fn import_job(&self, id: &ImportJobId) -> Result<ImportJob> {
-        let row: Option<(String, i64, Option<String>, Option<i64>, Option<String>)> = self.connection.query_row("SELECT status,progress_bp,lease_owner,lease_expires_at_ms,error_code FROM import_jobs WHERE id=?",[id.as_str()],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-        let (phase, progress_bp, lease_owner, lease_expires_at_ms, error_code) =
-            row.ok_or(Error::NotFound("import job"))?;
+        let row: Option<(
+            String,
+            i64,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = self.connection.query_row("SELECT status,progress_bp,lease_owner,lease_expires_at_ms,error_code,remediation_code,diagnostic_json FROM import_jobs WHERE id=?",[id.as_str()],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
+        let (
+            phase,
+            progress_bp,
+            lease_owner,
+            lease_expires_at_ms,
+            error_code,
+            remediation_code,
+            diagnostic_json,
+        ) = row.ok_or(Error::NotFound("import job"))?;
         Ok(ImportJob {
             id: id.clone(),
             phase: ImportPhase::parse(&phase)?,
@@ -1619,10 +1650,30 @@ impl Storage {
             lease_owner,
             lease_expires_at_ms,
             error_code,
+            remediation_code,
+            diagnostic_json,
         })
     }
     pub fn import_job_by_id(&self, id: &str) -> Result<ImportJob> {
         self.import_job(&ImportJobId(id.to_owned()))
+    }
+    pub fn import_attempts(&self, id: &ImportJobId) -> Result<Vec<ImportAttempt>> {
+        let mut statement = self.connection.prepare(
+            "SELECT attempt_number,started_at_ms,finished_at_ms,status,error_code,remediation_code,diagnostic_json FROM import_attempts WHERE import_job_id=? ORDER BY attempt_number",
+        )?;
+        let rows = statement.query_map([id.as_str()], |row| {
+            Ok(ImportAttempt {
+                attempt_number: row.get(0)?,
+                started_at_ms: row.get(1)?,
+                finished_at_ms: row.get(2)?,
+                status: row.get(3)?,
+                error_code: row.get(4)?,
+                remediation_code: row.get(5)?,
+                diagnostic_json: row.get(6)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::Database)
     }
     pub fn list_matches(&self) -> Result<Vec<MatchSummaryRecord>> {
         let mut statement = self.connection.prepare("SELECT id,map_name,imported_at_ms,status,canonical_run_id,local_steam_id FROM matches WHERE status<>'deleted' ORDER BY imported_at_ms DESC,id DESC")?;
@@ -1974,20 +2025,33 @@ impl Storage {
         remediation: Option<&str>,
         retry_at: Option<i64>,
     ) -> Result<()> {
+        self.finish_import_with_diagnostic(id, owner, phase, error, remediation, retry_at, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_import_with_diagnostic(
+        &self,
+        id: &ImportJobId,
+        owner: &str,
+        phase: ImportPhase,
+        error: Option<&str>,
+        remediation: Option<&str>,
+        retry_at: Option<i64>,
+        diagnostic_json: Option<&str>,
+    ) -> Result<()> {
         if !matches!(
             phase,
             ImportPhase::Succeeded | ImportPhase::Failed | ImportPhase::Cancelled
         ) {
             return Err(Error::Invalid("terminal phase"));
         }
-        let n=self.connection.execute("UPDATE import_jobs SET status=?,error_code=?,remediation_code=?,next_retry_at_ms=?,lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE id=? AND status='leased' AND lease_owner=?",params![phase.as_str(),error,remediation,retry_at,now_ms(),id.as_str(),owner])?;
+        let n=self.connection.execute("UPDATE import_jobs SET status=?,error_code=?,remediation_code=?,next_retry_at_ms=?,diagnostic_json=?,lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE id=? AND status='leased' AND lease_owner=?",params![phase.as_str(),error,remediation,retry_at,diagnostic_json,now_ms(),id.as_str(),owner])?;
         if n == 0 {
             return Err(Error::IllegalTransition("finish import"));
         }
         Ok(())
     }
     pub fn reset_import_retry(&self, id: &ImportJobId) -> Result<()> {
-        let n=self.connection.execute("UPDATE import_jobs SET status='queued',retry_budget=3,error_code=NULL,remediation_code=NULL,next_retry_at_ms=NULL,lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE id=? AND status IN ('failed','cancelled')",params![now_ms(),id.as_str()])?;
+        let n=self.connection.execute("UPDATE import_jobs SET status='queued',retry_budget=3,error_code=NULL,remediation_code=NULL,next_retry_at_ms=NULL,diagnostic_json=NULL,lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE id=? AND status IN ('failed','cancelled')",params![now_ms(),id.as_str()])?;
         if n == 0 {
             return Err(Error::IllegalTransition("manual retry"));
         }
@@ -2507,18 +2571,37 @@ mod tests {
             .update_import_progress(&job, "worker-a", Some(5), Some(10), 5000, 77)
             .unwrap();
         storage
-            .finish_import(
+            .finish_import_with_diagnostic(
                 &job,
                 "worker-a",
                 ImportPhase::Failed,
                 Some("network"),
                 Some("retry"),
                 Some(99),
+                Some(r#"{"category":"source_io"}"#),
             )
             .unwrap();
-        assert_eq!(storage.import_job(&job).unwrap().phase, ImportPhase::Failed);
+        let failed = storage.import_job(&job).unwrap();
+        assert_eq!(failed.phase, ImportPhase::Failed);
+        assert_eq!(failed.remediation_code.as_deref(), Some("retry"));
+        assert_eq!(
+            failed.diagnostic_json.as_deref(),
+            Some(r#"{"category":"source_io"}"#)
+        );
+        let attempts = storage.import_attempts(&job).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].attempt_number, 1);
+        assert_eq!(attempts[0].status, "failed");
+        assert_eq!(attempts[0].error_code.as_deref(), Some("network"));
+        assert_eq!(attempts[0].remediation_code.as_deref(), Some("retry"));
+        assert_eq!(
+            attempts[0].diagnostic_json.as_deref(),
+            Some(r#"{"category":"source_io"}"#)
+        );
         storage.reset_import_retry(&job).unwrap();
-        assert_eq!(storage.import_job(&job).unwrap().phase, ImportPhase::Queued);
+        let reset = storage.import_job(&job).unwrap();
+        assert_eq!(reset.phase, ImportPhase::Queued);
+        assert!(reset.diagnostic_json.is_none());
     }
     #[test]
     fn available_rating_public_seam_satisfies_canonical_invariant() {

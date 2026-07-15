@@ -2,8 +2,8 @@ use crate::first_pass::frameparser::{FrameParser, StartEndOffset, StartEndType};
 use crate::first_pass::parser::FirstPassOutput;
 use crate::first_pass::parser_settings::check_multithreadability;
 use crate::first_pass::parser_settings::{FirstPassParser, ParserInputs};
-use crate::first_pass::prop_controller::{PropController, NAME_ID, STEAMID_ID, TICK_ID};
-use crate::first_pass::read_bits::DemoParserError;
+use crate::first_pass::prop_controller::{NAME_ID, PropController, STEAMID_ID, TICK_ID};
+use crate::first_pass::read_bits::{DemoParserError, DemoParserErrorContext, DemoParserStage};
 use crate::second_pass::collect_data::ProjectileRecord;
 use crate::second_pass::game_events::{EventField, GameEvent};
 use crate::second_pass::parser::SecondPassOutput;
@@ -17,7 +17,7 @@ use itertools::Itertools;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::prelude::ParallelIterator;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 use std::time::Duration;
 
@@ -67,7 +67,17 @@ impl<'a> Parser<'a> {
         let _prof = std::env::var("CS2_PROF").is_ok();
         let _t = std::time::Instant::now();
         let mut first_pass_parser = FirstPassParser::new(&self.input);
-        let first_pass_output = first_pass_parser.parse_demo(demo_bytes, false)?;
+        let first_pass_output = match first_pass_parser.parse_demo(demo_bytes, false) {
+            Ok(output) => output,
+            Err(source) => {
+                return Err(source.with_context(DemoParserErrorContext {
+                    stage: DemoParserStage::FirstPass,
+                    byte_offset: Some(first_pass_parser.ptr),
+                    tick: Some(first_pass_parser.tick),
+                    game_build: first_pass_parser.header.get("patch_version").cloned(),
+                }));
+            }
+        };
         if _prof {
             eprintln!("[prof] first_pass: {:.3}s", _t.elapsed().as_secs_f64());
         }
@@ -109,43 +119,69 @@ impl<'a> Parser<'a> {
         Parser::remove_item_sold_events(&mut outputs.game_events);
         Ok(outputs)
     }
-    fn remove_duplicate_player_connects(events: &mut Vec<GameEvent>){
+    fn remove_duplicate_player_connects(events: &mut Vec<GameEvent>) {
         let mut v = events.iter().filter(|x| x.name == "player_first_connect").collect_vec();
         v.sort_by_key(|x| x.tick);
         let mut ids = AHashMap::default();
-        for x in v{
-            for f in &x.fields{
-                if f.name == "steamid"{
-                    if let Some(Variant::U64(s)) = f.data{
+        for x in v {
+            for f in &x.fields {
+                if f.name == "steamid" {
+                    if let Some(Variant::U64(s)) = f.data {
                         match ids.get(&s) {
-                            Some(_) => {},
+                            Some(_) => {}
                             None => {
                                 ids.insert(s, x.clone());
                             }
                         }
                     }
-                    }
                 }
             }
-        events.retain(|x|x.name != "player_first_connect");
+        }
+        events.retain(|x| x.name != "player_first_connect");
         events.extend(ids.values().map(|x| x.clone()));
     }
     fn second_pass_single_threaded(&self, outer_bytes: &[u8], first_pass_output: FirstPassOutput) -> Result<DemoOutput, DemoParserError> {
         let prof = std::env::var("CS2_PROF").is_ok();
         let mut t = std::time::Instant::now();
-        let mut parser = SecondPassParser::new(first_pass_output.clone(), 16, true, None)?;
-        parser.start(outer_bytes)?;
-        if prof { eprintln!("[prof] second_pass start(): {:.3}s", t.elapsed().as_secs_f64()); t = std::time::Instant::now(); }
+        let game_build = first_pass_output.header.get("patch_version").cloned();
+        let mut parser = SecondPassParser::new(first_pass_output.clone(), 16, true, None).map_err(|source| {
+            source.with_context(DemoParserErrorContext {
+                stage: DemoParserStage::SecondPass,
+                byte_offset: Some(16),
+                tick: None,
+                game_build: game_build.clone(),
+            })
+        })?;
+        if let Err(source) = parser.start(outer_bytes) {
+            return Err(source.with_context(DemoParserErrorContext {
+                stage: DemoParserStage::SecondPass,
+                byte_offset: Some(parser.ptr),
+                tick: Some(parser.last_tick),
+                game_build,
+            }));
+        }
+        if prof {
+            eprintln!("[prof] second_pass start(): {:.3}s", t.elapsed().as_secs_f64());
+            t = std::time::Instant::now();
+        }
         let second_pass_output = parser.create_output();
-        if prof { eprintln!("[prof] create_output: {:.3}s", t.elapsed().as_secs_f64()); t = std::time::Instant::now(); }
+        if prof {
+            eprintln!("[prof] create_output: {:.3}s", t.elapsed().as_secs_f64());
+            t = std::time::Instant::now();
+        }
         let mut outputs = self.combine_outputs(&mut vec![second_pass_output], first_pass_output);
-        if prof { eprintln!("[prof] combine_outputs: {:.3}s", t.elapsed().as_secs_f64()); t = std::time::Instant::now(); }
+        if prof {
+            eprintln!("[prof] combine_outputs: {:.3}s", t.elapsed().as_secs_f64());
+            t = std::time::Instant::now();
+        }
         if let Some(new_df) = self.rm_unwanted_ticks(&mut outputs.df) {
             outputs.df = new_df;
         }
         Parser::add_item_purchase_sell_column(&mut outputs.game_events);
         Parser::remove_item_sold_events(&mut outputs.game_events);
-        if prof { eprintln!("[prof] post-proc: {:.3}s", t.elapsed().as_secs_f64()); }
+        if prof {
+            eprintln!("[prof] post-proc: {:.3}s", t.elapsed().as_secs_f64());
+        }
         Ok(outputs)
     }
     fn second_pass_threaded_with_channels(

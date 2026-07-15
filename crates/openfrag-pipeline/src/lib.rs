@@ -3,7 +3,9 @@
 pub mod reconcile;
 
 use openfrag_analysis::{AnalysisReceipt, AnalysisUnavailable, analyze};
-use openfrag_import::{MAX_DEMO_BYTES, ParsedOutput};
+use openfrag_import::{
+    MAX_DEMO_BYTES, ParseDiagnostic, ParseDiagnosticCategory, ParseStage, ParsedOutput, ParserError,
+};
 use openfrag_storage::{AnalysisIdentity, ImportJobId, ImportPhase, Layout, Storage};
 use reconcile::{
     ReconciliationCandidate, ReconciliationDecision, ReconciliationPersistence,
@@ -18,7 +20,7 @@ pub trait ParserBackend {
     ///
     /// # Errors
     /// Returns a stable parser error description when evidence extraction fails.
-    fn parse(&self, path: &Path) -> Result<ParsedOutput, String>;
+    fn parse(&self, path: &Path) -> Result<ParsedOutput, ParserError>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -36,7 +38,7 @@ pub enum PipelineError {
     Size,
     InsufficientHeadroom,
     SourceChanged,
-    Parser(String),
+    Parser(Box<ParseDiagnostic>),
     Storage(String),
     Reconciliation(String),
 }
@@ -174,13 +176,15 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
         match self.run_leased(&job, &demo_sha256, request, hook) {
             Ok(outcome) => Ok(outcome),
             Err(error) => {
-                let _ = self.storage.finish_import(
+                let diagnostic_json = error.diagnostic_json();
+                let _ = self.storage.finish_import_with_diagnostic(
                     &job,
                     request.worker,
                     ImportPhase::Failed,
                     Some(error.code()),
-                    Some("manual_retry_or_quarantine"),
+                    Some(error.remediation_code()),
                     None,
+                    diagnostic_json.as_deref(),
                 );
                 Err(error)
             }
@@ -206,18 +210,20 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
             Ok(parsed) => parsed,
             Err(error) => {
                 self.storage
-                    .quarantine_artifact(demo_sha256, "parser_corrupt")
+                    .quarantine_artifact(demo_sha256, error.diagnostic.category.code())
                     .map_err(storage_error)?;
-                return Err(PipelineError::Parser(error));
+                return Err(PipelineError::Parser(error.diagnostic));
             }
         };
         if parsed.participants.is_empty() {
             self.storage
                 .quarantine_artifact(demo_sha256, "suspicious_empty_roster")
                 .map_err(storage_error)?;
-            return Err(PipelineError::Parser(
-                "empty participant roster quarantined".into(),
-            ));
+            return Err(PipelineError::Parser(Box::new(internal_parse_diagnostic(
+                ParseDiagnosticCategory::MissingEvidence,
+                ParseStage::Finalize,
+                "empty participant roster quarantined",
+            ))));
         }
         self.storage
             .update_import_progress(job, request.worker, None, None, 7_000, now_ms())
@@ -426,7 +432,13 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
         let rating_bp = analysis
             .rating_receipt
             .rating_bp
-            .ok_or(PipelineError::Parser("domain returned no rating".into()))?
+            .ok_or_else(|| {
+                PipelineError::Parser(Box::new(internal_parse_diagnostic(
+                    ParseDiagnosticCategory::InternalInvariant,
+                    ParseStage::Finalize,
+                    "domain returned no rating",
+                )))
+            })?
             .get();
         let payload = serde_json::json!({"rating_bp": rating_bp, "metrics": format!("{:?}", analysis.rating_input.metrics), "demo_sha256": demo_sha256}).to_string();
         let rating_receipt = self
@@ -576,10 +588,55 @@ impl PipelineError {
             Self::Size => "size",
             Self::InsufficientHeadroom => "headroom",
             Self::SourceChanged => "source_changed",
-            Self::Parser(_) => "parser",
+            Self::Parser(diagnostic) => diagnostic.category.code(),
             Self::Storage(_) => "storage",
             Self::Reconciliation(_) => "reconciliation",
         }
+    }
+
+    fn remediation_code(&self) -> &'static str {
+        match self {
+            Self::Parser(diagnostic) => match diagnostic.category {
+                ParseDiagnosticCategory::SourceIo => "retry_source_read",
+                ParseDiagnosticCategory::Truncated => "replace_truncated_demo",
+                ParseDiagnosticCategory::UnsupportedCommand => "unsupported_demo_version",
+                ParseDiagnosticCategory::SchemaDrift => "update_parser_or_quarantine",
+                ParseDiagnosticCategory::Corrupt => "replace_corrupt_demo",
+                ParseDiagnosticCategory::MissingEvidence => "inspect_missing_demo_evidence",
+                ParseDiagnosticCategory::InternalInvariant => "report_parser_invariant",
+            },
+            Self::InvalidSource | Self::UnsupportedDemo | Self::Size => "choose_valid_demo",
+            Self::InsufficientHeadroom => "free_storage_space",
+            Self::SourceChanged => "retry_stable_source",
+            Self::Storage(_) => "repair_local_storage",
+            Self::Reconciliation(_) => "retry_reconciliation",
+        }
+    }
+
+    fn diagnostic_json(&self) -> Option<String> {
+        match self {
+            Self::Parser(diagnostic) => Some(diagnostic.to_json().to_string()),
+            _ => None,
+        }
+    }
+}
+
+fn internal_parse_diagnostic(
+    category: ParseDiagnosticCategory,
+    stage: ParseStage,
+    source: &str,
+) -> ParseDiagnostic {
+    ParseDiagnostic {
+        category,
+        stage,
+        game_build: None,
+        byte_offset: None,
+        frame_index: None,
+        tick: None,
+        command: None,
+        required_item: None,
+        observed_counts: std::collections::BTreeMap::new(),
+        upstream_source: source.into(),
     }
 }
 
@@ -589,7 +646,7 @@ pub struct PinnedParser;
 
 #[cfg(feature = "demoparser")]
 impl ParserBackend for PinnedParser {
-    fn parse(&self, path: &Path) -> Result<ParsedOutput, String> {
-        openfrag_import::parse_with_pinned_demoparser(path).map_err(|error| format!("{error:?}"))
+    fn parse(&self, path: &Path) -> Result<ParsedOutput, ParserError> {
+        openfrag_import::parse_with_pinned_demoparser(path)
     }
 }

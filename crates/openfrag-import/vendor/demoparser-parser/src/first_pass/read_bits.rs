@@ -204,16 +204,30 @@ impl<'a> Bitreader<'a> {
         }
         let resol: f64 = 1.0 / (1 << 5) as f64;
         let result: f32 = (int_val as f64 + (frac_val as f64 * resol) as f64) as f32;
-        if sign {
-            Ok(-result)
-        } else {
-            Ok(result)
-        }
+        if sign { Ok(-result) } else { Ok(result) }
     }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum DemoParserStage {
+    FirstPass,
+    SecondPass,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct DemoParserErrorContext {
+    pub stage: DemoParserStage,
+    pub byte_offset: Option<usize>,
+    pub tick: Option<i32>,
+    pub game_build: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum DemoParserError {
+    Context {
+        context: DemoParserErrorContext,
+        source: Box<DemoParserError>,
+    },
     ClassMapperNotFoundFirstPass,
     FieldNoDecoder,
     OutOfBitsError,
@@ -249,6 +263,15 @@ pub enum DemoParserError {
     ImpossibleCmd,
     UnkVoiceFormat,
     MalformedVoicePacket,
+}
+
+impl DemoParserError {
+    pub fn with_context(self, context: DemoParserErrorContext) -> Self {
+        Self::Context {
+            context,
+            source: Box::new(self),
+        }
+    }
 }
 
 impl std::error::Error for DemoParserError {}

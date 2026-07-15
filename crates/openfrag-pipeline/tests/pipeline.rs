@@ -1,6 +1,7 @@
 use openfrag_import::{
-    CalculationIdentity, DemoMetadata, EventReceipt, ParsedEvent, ParsedOutput, ParsedRound,
-    Participant, PlayerSnapshot, SnapshotPhase,
+    CalculationIdentity, DemoMetadata, EventReceipt, ParseDiagnostic, ParseDiagnosticCategory,
+    ParseStage, ParsedEvent, ParsedOutput, ParsedRound, ParserError, Participant, PlayerSnapshot,
+    SnapshotPhase,
 };
 use openfrag_pipeline::{
     ImportOutcome, ImportRequest, ImportService, ParserBackend, PipelineError,
@@ -18,8 +19,19 @@ use std::{fs, path::Path};
 struct FixtureParser(ParsedOutput);
 
 impl ParserBackend for FixtureParser {
-    fn parse(&self, _: &Path) -> Result<ParsedOutput, String> {
+    fn parse(&self, _: &Path) -> Result<ParsedOutput, openfrag_import::ParserError> {
         Ok(self.0.clone())
+    }
+}
+
+#[derive(Clone)]
+struct FailingParser(ParseDiagnostic);
+
+impl ParserBackend for FailingParser {
+    fn parse(&self, _: &Path) -> Result<ParsedOutput, ParserError> {
+        Err(ParserError {
+            diagnostic: Box::new(self.0.clone()),
+        })
     }
 }
 
@@ -506,6 +518,124 @@ fn suspicious_empty_parser_output_is_quarantined_and_failed() {
 }
 
 #[test]
+fn parser_failure_persists_attempt_diagnostics_without_a_partial_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("schema-drift.dem");
+    fs::write(&source, b"PBDEMS2\0fixture").unwrap();
+    let diagnostic = ParseDiagnostic {
+        category: ParseDiagnosticCategory::SchemaDrift,
+        stage: ParseStage::SecondPass,
+        game_build: Some("fixture-build".into()),
+        byte_offset: Some(4_096),
+        frame_index: Some(17),
+        tick: Some(1_024.into()),
+        command: Some(7),
+        required_item: Some("CCSPlayerPawn.health".into()),
+        observed_counts: BTreeMap::from([("events".into(), 12)]),
+        upstream_source: "UnknownPropName(health)".into(),
+    };
+    let mut storage = Storage::open(Layout::at(dir.path().join("store"))).unwrap();
+    let result =
+        ImportService::new(&mut storage, FailingParser(diagnostic)).import(ImportRequest {
+            source: &source,
+            local_steam_id: 1,
+            worker: "diagnostic-worker",
+            lease_expires_at_ms: i64::MAX,
+        });
+    assert!(matches!(
+        result,
+        Err(PipelineError::Parser(diagnostic))
+            if diagnostic.category == ParseDiagnosticCategory::SchemaDrift
+    ));
+    drop(storage);
+
+    let db = rusqlite::Connection::open(dir.path().join("store/openfrag.sqlite3")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM matches", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let (job_error, remediation, job_diagnostic): (String, String, String) = db
+        .query_row(
+            "SELECT error_code,remediation_code,diagnostic_json FROM import_jobs WHERE status='failed'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(job_error, "schema_drift");
+    assert_eq!(remediation, "update_parser_or_quarantine");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&job_diagnostic).unwrap()["byte_offset"],
+        4_096
+    );
+    let (attempt_status, attempt_diagnostic): (String, String) = db
+        .query_row(
+            "SELECT status,diagnostic_json FROM import_attempts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(attempt_status, "failed");
+    assert_eq!(attempt_diagnostic, job_diagnostic);
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM artifacts WHERE availability='missing' AND missing_reason='quarantined:schema_drift'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[cfg(feature = "demoparser")]
+#[test]
+fn pinned_truncation_is_durable_and_never_creates_a_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("truncated.dem");
+    let mut bytes = [b"PBDEMS2\0".as_slice(), &[0_u8; 8]].concat();
+    bytes.extend([1, 5, 10, 0, 0]);
+    fs::write(&source, bytes).unwrap();
+    let mut storage = Storage::open(Layout::at(dir.path().join("store"))).unwrap();
+    let result =
+        ImportService::new(&mut storage, openfrag_pipeline::PinnedParser).import(ImportRequest {
+            source: &source,
+            local_steam_id: 1,
+            worker: "truncation-worker",
+            lease_expires_at_ms: i64::MAX,
+        });
+    assert!(matches!(
+        result,
+        Err(PipelineError::Parser(diagnostic))
+            if diagnostic.category == ParseDiagnosticCategory::Truncated
+                && diagnostic.stage == ParseStage::FrameScan
+                && diagnostic.byte_offset == Some(16)
+                && diagnostic.frame_index == Some(0)
+    ));
+    drop(storage);
+
+    let db = rusqlite::Connection::open(dir.path().join("store/openfrag.sqlite3")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM matches", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let diagnostic: String = db
+        .query_row(
+            "SELECT diagnostic_json FROM import_attempts WHERE status='failed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let diagnostic: serde_json::Value = serde_json::from_str(&diagnostic).unwrap();
+    assert_eq!(diagnostic["category"], "truncated");
+    assert_eq!(diagnostic["byte_offset"], 16);
+    assert_eq!(diagnostic["frame_index"], 0);
+}
+
+#[test]
 fn cancel_retry_and_expired_lease_recovery_follow_durable_state_machine() {
     let dir = tempfile::tempdir().unwrap();
     let mut storage = Storage::open(Layout::at(dir.path().join("store"))).unwrap();
@@ -522,6 +652,15 @@ fn cancel_retry_and_expired_lease_recovery_follow_durable_state_machine() {
     assert_eq!(
         storage.import_job(&job).unwrap().phase,
         openfrag_storage::ImportPhase::Queued
+    );
+    let attempts = storage.import_attempts(&job).unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].status, "failed");
+    assert_eq!(attempts[1].status, "failed");
+    assert_eq!(attempts[1].error_code.as_deref(), Some("lease_expired"));
+    assert_eq!(
+        attempts[1].remediation_code.as_deref(),
+        Some("automatic_retry")
     );
 }
 

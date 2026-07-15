@@ -1,4 +1,13 @@
 //! Durable local Demo import primitives. This crate owns orchestration, not parser output.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 
 use sha2::{Digest, Sha256};
 use std::{
@@ -332,7 +341,8 @@ impl ParsedOutput {
 }
 
 pub const DEMOPARSER_COMMIT: &str = "ba39cc44cd5abfd7f34df2b3c0a7dd3630048311";
-pub const DEMOPARSER_BUILD: &str = "parser-0.1.1+openfrag-typed-evidence-1/csgoproto-0.1.5";
+pub const DEMOPARSER_BUILD: &str =
+    "parser-0.1.1+openfrag-typed-evidence-diagnostics-1/csgoproto-0.1.5";
 pub const QUERY_PLAN_VERSION: &str = "openfrag-evidence-query-4";
 pub const NORMALIZED_SCHEMA_VERSION: &str = "openfrag-demo-evidence-1";
 pub const EVENT_QUERY: &[&str] = &[
@@ -545,11 +555,91 @@ pub fn query_plan_hash() -> String {
     format!("{:x}", Sha256::digest(canonical.as_bytes()))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseDiagnosticCategory {
+    SourceIo,
+    Truncated,
+    UnsupportedCommand,
+    SchemaDrift,
+    Corrupt,
+    MissingEvidence,
+    InternalInvariant,
+}
+
+impl ParseDiagnosticCategory {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::SourceIo => "source_io",
+            Self::Truncated => "truncated",
+            Self::UnsupportedCommand => "unsupported_command",
+            Self::SchemaDrift => "schema_drift",
+            Self::Corrupt => "corrupt",
+            Self::MissingEvidence => "missing_evidence",
+            Self::InternalInvariant => "internal_invariant",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseStage {
+    SourceRead,
+    FrameScan,
+    FirstPass,
+    SecondPass,
+    Normalize,
+    Finalize,
+}
+
+impl ParseStage {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::SourceRead => "source_read",
+            Self::FrameScan => "frame_scan",
+            Self::FirstPass => "first_pass",
+            Self::SecondPass => "second_pass",
+            Self::Normalize => "normalize",
+            Self::Finalize => "finalize",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ParserError {
-    Io(String),
-    Parse(String),
-    Quarantined { reason: &'static str },
+pub struct ParseDiagnostic {
+    pub category: ParseDiagnosticCategory,
+    pub stage: ParseStage,
+    pub game_build: Option<String>,
+    pub byte_offset: Option<u64>,
+    pub frame_index: Option<u64>,
+    pub tick: Option<DemoTick>,
+    pub command: Option<i32>,
+    pub required_item: Option<String>,
+    pub observed_counts: BTreeMap<String, u64>,
+    pub upstream_source: String,
+}
+
+impl ParseDiagnostic {
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "category": self.category.code(),
+            "stage": self.stage.code(),
+            "game_build": self.game_build,
+            "byte_offset": self.byte_offset,
+            "frame_index": self.frame_index,
+            "tick": self.tick.map(DemoTick::get),
+            "command": self.command,
+            "required_item": self.required_item,
+            "observed_counts": self.observed_counts,
+            "upstream_source": self.upstream_source,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParserError {
+    pub diagnostic: Box<ParseDiagnostic>,
 }
 
 pub fn parser_capability() -> ParserCapability {
@@ -626,16 +716,243 @@ fn normalize_event(
     }
 }
 
+fn parser_error(
+    category: ParseDiagnosticCategory,
+    stage: ParseStage,
+    source: impl Into<String>,
+) -> ParserError {
+    ParserError {
+        diagnostic: Box::new(ParseDiagnostic {
+            category,
+            stage,
+            game_build: None,
+            byte_offset: None,
+            frame_index: None,
+            tick: None,
+            command: None,
+            required_item: None,
+            observed_counts: BTreeMap::new(),
+            upstream_source: source.into(),
+        }),
+    }
+}
+
+fn missing_evidence_error(
+    required_item: &str,
+    game_build: Option<String>,
+    observed_counts: BTreeMap<String, u64>,
+) -> ParserError {
+    let mut error = parser_error(
+        ParseDiagnosticCategory::MissingEvidence,
+        ParseStage::Finalize,
+        format!("required canonical evidence is absent: {required_item}"),
+    );
+    error.diagnostic.game_build = game_build;
+    error.diagnostic.required_item = Some(required_item.into());
+    error.diagnostic.observed_counts = observed_counts;
+    error
+}
+
+#[cfg(feature = "demoparser")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameLocation {
+    index: u64,
+    byte_offset: u64,
+    tick: DemoTick,
+    command: i32,
+}
+
+#[cfg(feature = "demoparser")]
+fn scan_frame_locations(bytes: &[u8]) -> Result<Vec<FrameLocation>, ParserError> {
+    use demoparser_parser::{
+        first_pass::read_bits::{DemoParserError, read_varint},
+        maps::demo_cmd_type_from_int,
+    };
+
+    if bytes.len() < 16 {
+        let mut error = parser_error(
+            ParseDiagnosticCategory::Truncated,
+            ParseStage::FrameScan,
+            "file ended before the 16-byte Demo preamble",
+        );
+        error.diagnostic.byte_offset = Some(bytes.len() as u64);
+        return Err(error);
+    }
+    if bytes.get(..DEMO_MAGIC.len()) != Some(DEMO_MAGIC) {
+        return Err(parser_error(
+            ParseDiagnosticCategory::UnsupportedCommand,
+            ParseStage::FrameScan,
+            "unsupported Demo file signature",
+        ));
+    }
+
+    let mut ptr = 16_usize;
+    let mut frame_index = 0_u64;
+    let mut locations = Vec::new();
+    while ptr < bytes.len() {
+        let frame_start = ptr;
+        let command = read_varint(bytes, &mut ptr)
+            .map_err(|source| truncated_frame_error(frame_index, frame_start, None, source))?;
+        let tick = read_varint(bytes, &mut ptr)
+            .map_err(|source| truncated_frame_error(frame_index, frame_start, None, source))?;
+        let size = read_varint(bytes, &mut ptr).map_err(|source| {
+            truncated_frame_error(frame_index, frame_start, Some(tick as i32), source)
+        })?;
+        let command_number = (command & !64) as i32;
+        if let Err(source) = demo_cmd_type_from_int(command_number) {
+            let mut error = parser_error(
+                ParseDiagnosticCategory::UnsupportedCommand,
+                ParseStage::FrameScan,
+                format!("{source:?}"),
+            );
+            error.diagnostic.byte_offset = Some(frame_start as u64);
+            error.diagnostic.frame_index = Some(frame_index);
+            error.diagnostic.tick = Some(DemoTick::new(tick as i32));
+            error.diagnostic.command = Some(command_number);
+            return Err(error);
+        }
+        let payload_end = ptr.checked_add(size as usize).ok_or_else(|| {
+            truncated_frame_error(
+                frame_index,
+                frame_start,
+                Some(tick as i32),
+                DemoParserError::OutOfBytesError,
+            )
+        })?;
+        if payload_end > bytes.len() {
+            return Err(truncated_frame_error(
+                frame_index,
+                frame_start,
+                Some(tick as i32),
+                DemoParserError::DemoEndsEarly(format!(
+                    "declared frame payload ends at byte {payload_end}, file has {} bytes",
+                    bytes.len()
+                )),
+            ));
+        }
+        locations.push(FrameLocation {
+            index: frame_index,
+            byte_offset: frame_start as u64,
+            tick: DemoTick::new(tick as i32),
+            command: command_number,
+        });
+        ptr = payload_end;
+        frame_index = frame_index.saturating_add(1);
+    }
+    Ok(locations)
+}
+
+#[cfg(feature = "demoparser")]
+fn truncated_frame_error(
+    frame_index: u64,
+    byte_offset: usize,
+    tick: Option<i32>,
+    source: demoparser_parser::first_pass::read_bits::DemoParserError,
+) -> ParserError {
+    let mut error = parser_error(
+        ParseDiagnosticCategory::Truncated,
+        ParseStage::FrameScan,
+        format!("{source:?}"),
+    );
+    error.diagnostic.byte_offset = Some(byte_offset as u64);
+    error.diagnostic.frame_index = Some(frame_index);
+    error.diagnostic.tick = tick.map(DemoTick::new);
+    error
+}
+
+#[cfg(feature = "demoparser")]
+fn map_upstream_error(
+    error: demoparser_parser::first_pass::read_bits::DemoParserError,
+    frames: &[FrameLocation],
+) -> ParserError {
+    use demoparser_parser::first_pass::read_bits::{DemoParserError as Upstream, DemoParserStage};
+
+    let (context, source) = match error {
+        Upstream::Context { context, source } => (Some(context), *source),
+        source => (None, source),
+    };
+    let category = match &source {
+        Upstream::OutOfBitsError
+        | Upstream::OutOfBytesError
+        | Upstream::FailedByteRead(_)
+        | Upstream::DemoEndsEarly(_) => ParseDiagnosticCategory::Truncated,
+        Upstream::UnknownDemoCmd(_) | Upstream::Source1DemoError | Upstream::UnknownFile => {
+            ParseDiagnosticCategory::UnsupportedCommand
+        }
+        Upstream::ClassMapperNotFoundFirstPass
+        | Upstream::FieldNoDecoder
+        | Upstream::UnknownPathOP
+        | Upstream::ClassNotFound
+        | Upstream::StringTableNotFound
+        | Upstream::IncorrectMetaDataProp
+        | Upstream::UnknownPropName(_)
+        | Upstream::GameEventListNotSet
+        | Upstream::PropTypeNotFound(_)
+        | Upstream::GameEventUnknownId(_)
+        | Upstream::UnknownPawnPrefix(_)
+        | Upstream::UnknownEntityHandle(_)
+        | Upstream::ClsIdOutOfBounds
+        | Upstream::UnknownGameEventVariant(_)
+        | Upstream::NoSendTableMessage
+        | Upstream::IllegalPathOp => ParseDiagnosticCategory::SchemaDrift,
+        Upstream::MalformedMessage
+        | Upstream::DecompressionFailure(_)
+        | Upstream::MalformedVoicePacket => ParseDiagnosticCategory::Corrupt,
+        Upstream::NoEvents => ParseDiagnosticCategory::MissingEvidence,
+        Upstream::EntityNotFound
+        | Upstream::UserIdNotFound
+        | Upstream::EventListFallbackNotFound(_)
+        | Upstream::VoiceDataWriteError(_)
+        | Upstream::VectorResizeFailure
+        | Upstream::ImpossibleCmd
+        | Upstream::UnkVoiceFormat
+        | Upstream::FileNotFound(_) => ParseDiagnosticCategory::InternalInvariant,
+        Upstream::Context { .. } => ParseDiagnosticCategory::InternalInvariant,
+    };
+    let stage = context
+        .as_ref()
+        .map_or(ParseStage::FirstPass, |context| match context.stage {
+            DemoParserStage::FirstPass => ParseStage::FirstPass,
+            DemoParserStage::SecondPass => ParseStage::SecondPass,
+        });
+    let mut mapped = parser_error(category, stage, format!("{source:?}"));
+    if let Some(context) = context {
+        mapped.diagnostic.game_build = context.game_build;
+        mapped.diagnostic.byte_offset = context.byte_offset.map(|offset| offset as u64);
+        mapped.diagnostic.tick = context.tick.map(DemoTick::new);
+        if let Some(offset) = mapped.diagnostic.byte_offset
+            && let Some(frame) = frames
+                .iter()
+                .rev()
+                .find(|frame| frame.byte_offset <= offset)
+        {
+            mapped.diagnostic.frame_index = Some(frame.index);
+            mapped.diagnostic.command = Some(frame.command);
+            mapped.diagnostic.tick.get_or_insert(frame.tick);
+        }
+    }
+    if let Upstream::UnknownDemoCmd(command) = source {
+        mapped.diagnostic.command = Some(command);
+    }
+    mapped
+}
+
 #[cfg(feature = "demoparser")]
 pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserError> {
     use ahash::AHashMap;
     use demoparser_parser::second_pass::parser_settings::create_huffman_lookup_table;
     use demoparser_parser::{
-        first_pass::parser_settings::{EventSnapshotMode, ParserInputs},
+        first_pass::parser_settings::{EventSnapshotMode, FirstPassParser, ParserInputs},
         parse_demo::{Parser, ParsingMode},
         second_pass::variants::{OutputSerdeHelperStruct, soa_to_aos},
     };
-    let bytes = std::fs::read(path).map_err(|e| ParserError::Io(e.to_string()))?;
+    let bytes = std::fs::read(path).map_err(|source| {
+        parser_error(
+            ParseDiagnosticCategory::SourceIo,
+            ParseStage::SourceRead,
+            source.to_string(),
+        )
+    })?;
     let huf = create_huffman_lookup_table();
     let inputs = ParserInputs {
         real_name_to_og_name: AHashMap::new(),
@@ -662,10 +979,22 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
         list_props: false,
         fallback_bytes: None,
     };
+    let game_build = (bytes.len() >= 16)
+        .then(|| {
+            FirstPassParser::new(&inputs)
+                .parse_header_only(&bytes)
+                .ok()
+                .and_then(|header| header.get("patch_version").cloned())
+        })
+        .flatten();
+    let frame_locations = scan_frame_locations(&bytes).map_err(|mut error| {
+        error.diagnostic.game_build = game_build;
+        error
+    })?;
     let mut parser = Parser::new(inputs, ParsingMode::ForceSingleThreaded);
     let out = parser
         .parse_demo(&bytes)
-        .map_err(|e| ParserError::Parse(e.to_string()))?;
+        .map_err(|error| map_upstream_error(error, &frame_locations))?;
     let player_snapshots = soa_to_aos(OutputSerdeHelperStruct {
         prop_infos: out.prop_controller.prop_infos.clone(),
         inner: out.df.into(),
@@ -743,7 +1072,15 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
             })
             .collect();
         let normalized = normalize_event(&event.name, &raw_fields).ok_or_else(|| {
-            ParserError::Parse(format!("unrecognized requested event {}", event.name))
+            let mut error = parser_error(
+                ParseDiagnosticCategory::SchemaDrift,
+                ParseStage::Normalize,
+                format!("unrecognized requested event {}", event.name),
+            );
+            error.diagnostic.game_build = header.get("patch_version").cloned();
+            error.diagnostic.tick = Some(DemoTick::new(event.tick));
+            error.diagnostic.required_item = Some(event.name.clone());
+            error
         })?;
         let parsed = ParsedEvent {
             tick: DemoTick::new(event.tick),
@@ -753,7 +1090,14 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
         if event.name == "round_end" {
             round_no += 1;
             let NormalizedEvent::RoundEnd(round_end) = &parsed.event else {
-                unreachable!();
+                let mut error = parser_error(
+                    ParseDiagnosticCategory::InternalInvariant,
+                    ParseStage::Normalize,
+                    "round_end normalized to a different event variant",
+                );
+                error.diagnostic.game_build = header.get("patch_version").cloned();
+                error.diagnostic.tick = Some(DemoTick::new(event.tick));
+                return Err(error);
             };
             rounds.push(ParsedRound {
                 number: RoundNumber::new(round_no),
@@ -764,8 +1108,18 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
         let evidence_sha256 = format!(
             "{:x}",
             Sha256::digest(
-                serde_json::to_vec(&(ordinal, &event.name, event.tick, &raw_fields))
-                    .map_err(|e| ParserError::Parse(e.to_string()))?
+                serde_json::to_vec(&(ordinal, &event.name, event.tick, &raw_fields)).map_err(
+                    |source| {
+                        let mut error = parser_error(
+                            ParseDiagnosticCategory::InternalInvariant,
+                            ParseStage::Finalize,
+                            source.to_string(),
+                        );
+                        error.diagnostic.game_build = header.get("patch_version").cloned();
+                        error.diagnostic.tick = Some(DemoTick::new(event.tick));
+                        error
+                    }
+                )?
             )
         );
         receipts.push(EventReceipt {
@@ -783,38 +1137,42 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
         || !events
             .iter()
             .any(|event| event.kind() == NormalizedEventKind::PlayerDeath);
+    let observed_counts = BTreeMap::from([
+        ("participants".into(), participants.len() as u64),
+        ("rounds".into(), rounds.len() as u64),
+        ("events".into(), events.len() as u64),
+        ("receipts".into(), receipts.len() as u64),
+        ("player_snapshots".into(), player_snapshots.len() as u64),
+    ]);
+    let missing_evidence = |required_item: &str| {
+        missing_evidence_error(
+            required_item,
+            header.get("patch_version").cloned(),
+            observed_counts.clone(),
+        )
+    };
     if participants.is_empty() {
-        return Err(ParserError::Quarantined {
-            reason: "no participants",
-        });
+        return Err(missing_evidence("participants"));
     }
     if rounds.is_empty() {
-        return Err(ParserError::Quarantined {
-            reason: "no canonical round_end events",
-        });
+        return Err(missing_evidence("round_end"));
     }
     if !events
         .iter()
         .any(|event| event.kind() == NormalizedEventKind::PlayerDeath)
     {
-        return Err(ParserError::Quarantined {
-            reason: "no requested player_death events",
-        });
+        return Err(missing_evidence("player_death"));
     }
     for required in [
         NormalizedEventKind::RoundFreezeEnd,
         NormalizedEventKind::PlayerHurt,
     ] {
         if !events.iter().any(|event| event.kind() == required) {
-            return Err(ParserError::Quarantined {
-                reason: "missing required rating evidence event",
-            });
+            return Err(missing_evidence(required.name()));
         }
     }
     if player_snapshots.is_empty() {
-        return Err(ParserError::Quarantined {
-            reason: "no requested player snapshots",
-        });
+        return Err(missing_evidence("player_snapshots"));
     }
     let query_hash = query_plan_hash();
     let source_sha256 = format!("{:x}", Sha256::digest(&bytes));
@@ -1067,7 +1425,7 @@ pub fn hash_file(
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
+        hasher.update(buf.get(..n).ok_or(ErrorCode::Io)?);
         done += n as u64;
         progress(Progress {
             processed_bytes: done,
@@ -1125,8 +1483,9 @@ pub fn copy_content_addressed(
             if n == 0 {
                 break;
             }
-            h.update(&buf[..n]);
-            out.write_all(&buf[..n]).map_err(|_| ErrorCode::Io)?;
+            let read = buf.get(..n).ok_or(ErrorCode::Io)?;
+            h.update(read);
+            out.write_all(read).map_err(|_| ErrorCode::Io)?;
             done += n as u64;
             progress(Progress {
                 processed_bytes: done,
@@ -1186,8 +1545,9 @@ pub fn hash_and_copy(
             if n == 0 {
                 break;
             }
-            hasher.update(&buf[..n]);
-            output.write_all(&buf[..n]).map_err(|_| ErrorCode::Io)?;
+            let read = buf.get(..n).ok_or(ErrorCode::Io)?;
+            hasher.update(read);
+            output.write_all(read).map_err(|_| ErrorCode::Io)?;
             done += n as u64;
             progress(Progress {
                 processed_bytes: done,
@@ -1301,6 +1661,106 @@ mod tests {
         assert_eq!(event.attacker(), Some(SteamId::new(10)));
         assert_eq!(event.victim(), Some(SteamId::new(20)));
         assert_eq!(event.name(), "player_death");
+    }
+
+    #[test]
+    fn missing_evidence_diagnostic_preserves_required_item_and_counts() {
+        let error = missing_evidence_error(
+            "player_death",
+            Some("fixture-build".into()),
+            BTreeMap::from([("events".into(), 0), ("participants".into(), 10)]),
+        );
+        assert_eq!(
+            error.diagnostic.category,
+            ParseDiagnosticCategory::MissingEvidence
+        );
+        assert_eq!(error.diagnostic.stage, ParseStage::Finalize);
+        assert_eq!(
+            error.diagnostic.required_item.as_deref(),
+            Some("player_death")
+        );
+        assert_eq!(error.diagnostic.observed_counts["events"], 0);
+        assert_eq!(error.diagnostic.observed_counts["participants"], 10);
+    }
+
+    #[cfg(feature = "demoparser")]
+    #[test]
+    fn malformed_outer_frames_report_stable_locations() {
+        let directory = tempdir().unwrap();
+        let truncated_path = directory.path().join("truncated.dem");
+        let mut truncated = [DEMO_MAGIC, &[0_u8; 8]].concat();
+        truncated.extend([1, 5, 10, 0, 0]);
+        fs::write(&truncated_path, truncated).unwrap();
+        let error = parse_with_pinned_demoparser(&truncated_path).unwrap_err();
+        assert_eq!(
+            error.diagnostic.category,
+            ParseDiagnosticCategory::Truncated
+        );
+        assert_eq!(error.diagnostic.stage, ParseStage::FrameScan);
+        assert_eq!(error.diagnostic.byte_offset, Some(16));
+        assert_eq!(error.diagnostic.frame_index, Some(0));
+        assert_eq!(error.diagnostic.tick, Some(DemoTick::new(5)));
+
+        let unsupported_path = directory.path().join("unsupported.dem");
+        let mut unsupported = [DEMO_MAGIC, &[0_u8; 8]].concat();
+        unsupported.extend([63, 7, 0]);
+        fs::write(&unsupported_path, unsupported).unwrap();
+        let error = parse_with_pinned_demoparser(&unsupported_path).unwrap_err();
+        assert_eq!(
+            error.diagnostic.category,
+            ParseDiagnosticCategory::UnsupportedCommand
+        );
+        assert_eq!(error.diagnostic.command, Some(63));
+        assert_eq!(error.diagnostic.byte_offset, Some(16));
+        assert_eq!(error.diagnostic.tick, Some(DemoTick::new(7)));
+    }
+
+    #[cfg(feature = "demoparser")]
+    #[test]
+    fn upstream_failures_map_without_losing_parser_context() {
+        use demoparser_parser::first_pass::read_bits::{
+            DemoParserError as Upstream, DemoParserErrorContext, DemoParserStage,
+        };
+
+        let frames = vec![FrameLocation {
+            index: 9,
+            byte_offset: 4_000,
+            tick: DemoTick::new(1_024),
+            command: 7,
+        }];
+        let context = DemoParserErrorContext {
+            stage: DemoParserStage::SecondPass,
+            byte_offset: Some(4_096),
+            tick: Some(1_024),
+            game_build: Some("fixture-build".into()),
+        };
+        for (source, category) in [
+            (
+                Upstream::UnknownPropName("health".into()),
+                ParseDiagnosticCategory::SchemaDrift,
+            ),
+            (
+                Upstream::DecompressionFailure("snappy".into()),
+                ParseDiagnosticCategory::Corrupt,
+            ),
+            (
+                Upstream::ImpossibleCmd,
+                ParseDiagnosticCategory::InternalInvariant,
+            ),
+            (Upstream::NoEvents, ParseDiagnosticCategory::MissingEvidence),
+        ] {
+            let error = map_upstream_error(source.with_context(context.clone()), &frames);
+            assert_eq!(error.diagnostic.category, category);
+            assert_eq!(error.diagnostic.stage, ParseStage::SecondPass);
+            assert_eq!(
+                error.diagnostic.game_build.as_deref(),
+                Some("fixture-build")
+            );
+            assert_eq!(error.diagnostic.byte_offset, Some(4_096));
+            assert_eq!(error.diagnostic.frame_index, Some(9));
+            assert_eq!(error.diagnostic.tick, Some(DemoTick::new(1_024)));
+            assert!(!error.diagnostic.upstream_source.is_empty());
+        }
     }
 
     #[test]
