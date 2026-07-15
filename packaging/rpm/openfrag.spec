@@ -33,7 +33,7 @@ printf '%s  %s\n' '%{source_sha256}' '%{SOURCE0}' | sha256sum -c -
 cargo build --frozen --release -p openfragd
 
 %check
-cargo test --frozen -p openfragd
+cargo test --frozen -p openfragd -- --test-threads=1
 desktop-file-validate packaging/linux/io.github.ntrpydev.openfrag.desktop
 
 %install
