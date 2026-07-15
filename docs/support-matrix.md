@@ -20,14 +20,14 @@ Missing software or inaccessible hardware is a host state, not proof that a GPU 
 
 ## Current public headline
 
-No environment is release-qualified yet. The current implementation builds and its headless suite passes on PC1, while physical GSI, audio, and Global Shortcuts prototypes establish useful KDE Wayland evidence. No static, AUR, or COPR release artifact has passed the complete installed-package gates under the production application identity.
+No environment is release-qualified yet. The current implementation builds and its headless suite passes on PC1. Physical and read-only prototypes establish limited evidence on KDE and GNOME Wayland, but no static, AUR, or COPR release artifact has passed the complete installed-package gates under the production application identity.
 
 | Environment | Static release | AUR | COPR | Overall v1 claim |
 | --- | --- | --- | --- | --- |
 | PC1, AMD, KDE Plasma Wayland, native Steam | Not tested | Not tested | Not tested | Prototype only |
 | PC1, AMD, KDE Plasma Wayland, Flatpak Steam | Not tested | Not tested | Not tested | Not tested |
 | PC1, AMD, X11 | Not tested | Not tested | Not tested | Not tested |
-| PC2, NVIDIA | Not tested | Not tested | Not tested | Not tested |
+| PC2, NVIDIA RTX 3070 Ti, GNOME Wayland, no Steam | Not tested | Not tested | Not tested | Prototype only |
 
 The product must not say “supports AMD,” “supports NVIDIA,” “supports Wayland,” “supports X11,” “works on KDE,” “works with Flatpak Steam,” or “works on any distro” from this table. It may say that openfrag is being developed for Linux and link to the exact evidence here.
 
@@ -70,26 +70,51 @@ Collected 2026-07-14 on the local PC1 session.
 
 The PC1 result is therefore **Prototype only** for KDE Wayland GSI, synthetic audio routing, and Global Shortcuts behavior, with no release-qualified capture or package claim.
 
-## PC2 first-pass attempt
+## PC2 first pass
 
-PC2 answered on its configured network address on 2026-07-14, but both configured SSH identities were rejected before any host command ran. No current OS, kernel, NVIDIA GPU, driver, session, compositor, portal, Steam package, recorder, encoder, or openfrag artifact fact was collected. Network reachability is not product evidence, and the failed SSH authentication is not an openfrag failure.
+Collected 2026-07-14 through an authenticated SSH session as the active desktop user. Only the redacted facts below are published. No screen, microphone, personal media, Steam identifier, home path, filename, GSI marker, Demo, or Clip was collected.
 
-Every PC2 cell remains **Not tested**. Earlier documents that describe PC2 hardware are not substituted for a current redacted Doctor result.
+| Dimension | Observed value |
+| --- | --- |
+| Distribution and kernel | CachyOS, Linux `7.1.3-2-cachyos`, x86-64 |
+| GPU | NVIDIA GeForce RTX 3070 Ti using the proprietary `nvidia` driver `610.43.03` |
+| Desktop | GNOME `50.3`, Mutter `50.3`, active Wayland session |
+| Portal | xdg-desktop-portal `1.22.1`, GNOME backend `50.0`, Global Shortcuts version 1 |
+| Steam and CS2 | Neither native nor Flatpak Steam is installed; no CS2 cfg directory was found |
+| Media tools | FFmpeg and FFprobe `8.1.2` available; PipeWire `1.6.7` and WirePlumber `0.5.15` active |
+| Recorder | Neither native nor Flatpak gpu-screen-recorder installed |
+| Production package | No production desktop file, canonical user unit, static package, AUR package, or COPR package installed |
 
-### PC2 checklist required to complete the pass
+### PC2 results
 
-1. Restore the configured public-key SSH access for `pc2new`, or run the commands locally as the desktop user and return the outputs. Do not send a password or private key.
-2. Record `hostnamectl`, `uname -r`, the active session type and desktop, `lspci -nnk` display devices, `nvidia-smi` GPU and driver, portal backend versions, Steam packaging, and gpu-screen-recorder, FFmpeg, and FFprobe versions.
-3. From the exact candidate commit, run `scripts/hardware/verify-nvidia-host.sh --output-dir <existing-private-directory> --probe-nvenc`. This probe is read-only except for its caller-selected output directory and does not launch gpu-screen-recorder.
-4. Run the production Compatibility Doctor and retain only its redacted report. If the final Doctor is not implemented, mark its gates **Not tested** instead of treating the older boolean skeleton as proof.
-5. Install one exact candidate package through the channel under test. Verify the canonical desktop entry, canonical user unit, `app.slice`, explicit startup choice, idle behavior without capture, and no legacy identity files.
-6. Exercise native or Flatpak Steam discovery, including an external library when present. Confirm only `gamestate_integration_openfrag.cfg` is written after consent and that authenticated GSI delivery is observed after a CS2 restart or map reload.
-7. With explicit screen and audio consent, run the 60-second replay-mode test, save after warmup, inspect the Clip with FFprobe, preview it locally, and record the exact codec, video result, audio topology, and named limitations.
-8. Bind `manual_flag` under the production identity, test one press-and-hold, verify one validated Clip, restart the daemon, verify restoration without another bind, lock and unlock, then repeat with fullscreen CS2.
-9. Select and import a local Demo through the installed dashboard. Verify an explicit result, the Local Player proof, Match, Rating availability, and Receipts without any Steam authentication or outbound acquisition.
-10. Repeat the network-denied privacy gate and export only the redacted result. Never include SteamIDs, home paths, filenames, GSI markers, Demo bytes, Clip bytes, audio, or raw child output.
+| Gate | Result | Interpretation |
+| --- | --- | --- |
+| Exact candidate integrity | Passed transfer, not qualified | `openfragd 1.0.0` was built from commit `102b59a0161ecf34b8dd6c540a7078110a881c62`; the local and PC2 binaries matched SHA-256 `c566bde02955ee8a0a109edeb0d6c16957d84085f82ae397b7411ffe8678ba6d`. It ran from a private runtime directory and was not an installed package. |
+| Compatibility Doctor | Prototype only | The read-only Doctor reported temporary private storage, local Demo import, and FFprobe ready. GSI was blocked because no CS2 cfg directory exists. Capture was blocked because gpu-screen-recorder is absent, and Manual Flag was consequently blocked. |
+| NVIDIA host verifier | Failed due to verifier defect | The exact `--probe-nvenc` verifier reported the driver, FFmpeg, FFprobe, PipeWire, and output directory ready, but recorder and NVENC blocked. The NVENC failure came from its fixed `128x128` test frame, which driver `610.43.03` rejected as smaller than the supported minimum. This is not evidence that NVENC is unavailable. |
+| Direct NVENC control | Prototype only | Repeating the same bounded synthetic `h264_nvenc` test at `256x256` completed successfully. This proves encoder initialization on this exact stack, not screen capture or gpu-screen-recorder integration. |
+| Native and Flatpak Steam discovery | Not tested | Neither Steam package is installed, so app-730 discovery, external-library discovery, cfg writing, and authenticated GSI delivery cannot run. Missing host software is not a product failure. |
+| Recorder capability and validated test Clip | Not tested | gpu-screen-recorder is absent. No replay buffer, screen capture, codec integration, preview, or validated Clip was attempted. |
+| Audio routing | Prototype only, limited topology | A synthetic PipeWire null-sink monitor produced a verified 1.2-second stereo WAV with nonzero signal without selecting a real microphone. The probe found one non-monitor source and no active CS2 or voice-application candidates. Its `pw-record` process returned status 1 after producing the complete file, so the result does not qualify production recording. |
+| Global Shortcuts portal | Not tested | The host exposes Global Shortcuts version 1, but no production identity is installed and no approval, activation, restoration, lock and unlock, or fullscreen test was attempted over SSH. |
+| One hold to one validated Clip | Not tested | Both the production shortcut binding and replay recorder are absent. |
+| Service idle and startup behavior | Not tested | No canonical or legacy openfrag user service is installed. Login startup, explicit enable and disable, idle-no-capture, restart, and logout behavior were not exercised. |
+| Local Demo import through installed UI | Not tested | The headless Doctor says local import is available, but no installed dashboard, local Demo selection, Local Player proof, Match, Rating, or Receipt was exercised. |
+| Static, AUR, and COPR artifacts | Not tested | No release artifact is installed. A temporary candidate binary is not evidence for any package channel. |
+| Local-only and no-upload boundary | Not tested | The Doctor emitted only the expected redacted local facts, but no installed network-denied end-to-end gate was run. |
 
-Any step that needs a desktop portal or playback is a human-observed test. It must not be marked passed from SSH alone.
+The PC2 result is therefore **Prototype only** for read-only Doctor behavior, direct NVENC initialization, and synthetic audio routing. NVIDIA screen capture, GNOME Global Shortcuts activation, Steam integration, packages, services, and Clips remain **Not tested**.
+
+### PC2 work still required for qualification
+
+1. Install one exact candidate package through the channel under test. Verify the canonical desktop entry, canonical user unit, `app.slice`, explicit startup choice, idle behavior without capture, and no legacy identity files.
+2. Install the intended native or Flatpak Steam configuration and CS2. Exercise discovery, including an external library when present, then confirm only `gamestate_integration_openfrag.cfg` is written after consent and authenticated GSI delivery follows a CS2 restart or map reload.
+3. Install gpu-screen-recorder from a trusted package source. With explicit screen and audio consent, run the 60-second replay-mode test, save after warmup, inspect the Clip with FFprobe, preview it locally, and record the exact codec, video result, audio topology, and limitations.
+4. Bind `manual_flag` under the production identity, test one press-and-hold, verify one validated Clip, restart the daemon, verify restoration without another bind, lock and unlock, then repeat with fullscreen CS2.
+5. Select and import a local Demo through the installed dashboard. Verify an explicit result, Local Player proof, Match, Rating availability, and Receipts without Steam authentication or outbound acquisition.
+6. Repeat the network-denied privacy gate and export only the redacted result.
+
+Any step that needs a desktop portal, screen capture, audio capture, playback, or CS2 is a human-observed test. It must not be marked passed from SSH alone.
 
 ## Release qualification gates
 
