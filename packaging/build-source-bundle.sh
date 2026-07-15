@@ -74,5 +74,6 @@ archive_temporary=
 )
 mv -f -- "$checksum_temporary" "$checksum"
 checksum_temporary=
+chmod 0644 "$archive" "$checksum"
 
 printf 'Source archive: %s\nChecksum: %s\n' "$archive" "$checksum"
