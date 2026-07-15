@@ -4,11 +4,7 @@ mod live_runtime {
     pub trait CaptureRuntimePort: Send {
         fn readiness(&self) -> Result<(), String>;
         fn available_from_ms(&self) -> u64;
-        fn request_save(
-            &mut self,
-            request_id: &str,
-            provenance: SaveProvenance,
-        ) -> Result<SaveDisposition, String>;
+        fn request_save(&mut self, provenance: SaveProvenance) -> Result<SaveDisposition, String>;
         fn poll(&mut self) -> Result<Option<i32>, String>;
         fn discover_save(&mut self) -> Result<Option<SaveAcknowledgement>, String>;
         fn shutdown(&mut self) -> Result<(), String>;
@@ -157,7 +153,7 @@ fn missing_and_disabled_configs_never_reach_the_supervisor() {
     let mut disabled = runtime(directory.path(), log.clone(), None);
     assert_eq!(disabled.status(), RuntimeStatus::Disabled);
     assert_eq!(
-        disabled.request_save("manual-save", SaveProvenance::ManualFlag),
+        disabled.request_save(SaveProvenance::ManualFlag),
         Err(RuntimeError::Disabled)
     );
     assert!(log.lock().expect("process log").spawns.is_empty());
@@ -206,11 +202,7 @@ fn enabled_runtime_delegates_lifecycle_to_fakes_only() {
     assert_eq!(runtime.status(), RuntimeStatus::Running);
     assert_live_port_ready(&runtime);
     assert_eq!(
-        live_runtime::CaptureRuntimePort::request_save(
-            &mut runtime,
-            "manual-save",
-            SaveProvenance::ManualFlag,
-        )
+        live_runtime::CaptureRuntimePort::request_save(&mut runtime, SaveProvenance::ManualFlag)
         .expect("fake save"),
         SaveDisposition::Signalled
     );
@@ -218,7 +210,6 @@ fn enabled_runtime_delegates_lifecycle_to_fakes_only() {
         .expect("discover fake save")
         .expect("acknowledgement");
     assert_eq!(acknowledgement.path, output);
-    assert_eq!(acknowledgement.request_id, "manual-save");
     assert_eq!(acknowledgement.provenance, SaveProvenance::ManualFlag);
     assert_eq!(
         live_runtime::CaptureRuntimePort::poll(&mut runtime),

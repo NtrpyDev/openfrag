@@ -129,11 +129,10 @@ where
 
     pub fn request_save(
         &mut self,
-        request_id: &str,
         provenance: SaveProvenance,
     ) -> Result<SaveDisposition, RuntimeError> {
         self.supervisor_mut()?
-            .request_save(request_id, provenance)
+            .request_save(provenance)
             .map_err(RuntimeError::Supervisor)
     }
 
@@ -188,13 +187,8 @@ where
         self.available_from_ms.unwrap_or(0)
     }
 
-    fn request_save(
-        &mut self,
-        request_id: &str,
-        provenance: SaveProvenance,
-    ) -> Result<SaveDisposition, String> {
-        CaptureRuntime::request_save(self, request_id, provenance)
-            .map_err(|error| format!("{error:?}"))
+    fn request_save(&mut self, provenance: SaveProvenance) -> Result<SaveDisposition, String> {
+        CaptureRuntime::request_save(self, provenance).map_err(|error| format!("{error:?}"))
     }
 
     fn poll(&mut self) -> Result<Option<i32>, String> {
