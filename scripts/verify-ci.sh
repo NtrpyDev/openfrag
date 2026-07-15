@@ -23,24 +23,24 @@ for package in "${packages[@]}"; do
     cargo fmt --check --package "$package"
 done
 
-cargo metadata --no-deps --format-version 1 >/dev/null
+cargo metadata --locked --no-deps --format-version 1 >/dev/null
 for package in "${packages[@]}"; do
-    cargo test -p "$package"
-    cargo clippy -p "$package" --no-deps -- -D warnings
+    cargo test --locked -p "$package"
+    cargo clippy --locked -p "$package" --no-deps -- -D warnings
 done
-cargo test -p openfrag-import --features demoparser
-cargo test -p openfrag-pipeline --features demoparser
-cargo check -p openfrag-import --features demoparser --bin openfrag-parser-benchmark
-cargo run -q -p openfrag-import --bin openfrag-schema -- \
+cargo test --locked -p openfrag-import --features demoparser
+cargo test --locked -p openfrag-pipeline --features demoparser
+cargo check --locked -p openfrag-import --features demoparser --bin openfrag-parser-benchmark
+cargo run --locked -q -p openfrag-import --bin openfrag-schema -- \
     --check schema/openfrag-demo-evidence-1.schema.json
-cargo run -q -p openfrag-import --features demoparser --bin openfrag-compat-lab -- \
+cargo run --locked -q -p openfrag-import --features demoparser --bin openfrag-compat-lab -- \
     check-manifest benchmarks/parser-fixtures.json
 scripts/fuzz-demo-parser.sh check
 bash -n scripts/benchmark-parser.sh
 bash -n scripts/fuzz-demo-parser.sh
-cargo build -p openfragd --release
+cargo build --locked -p openfragd --release
 packaging/verify-linux-assets.sh
 scripts/hardware/tests/verify-nvidia-host-self-test.sh
 scripts/e2e/headless-smoke.sh
-cargo build -p openfragd --release --features acceptance-fixtures
+cargo build --locked -p openfragd --release --features acceptance-fixtures
 python3 scripts/e2e/installed_mvp.py --binary target/release/openfragd

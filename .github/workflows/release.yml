@@ -32,7 +32,7 @@ jobs:
           test "$tag" = "v$version"
           test "$(git cat-file -t "refs/tags/$tag")" = tag
           commit=$(git rev-parse "refs/tags/$tag^{}")
-          test "$commit" = "$GITHUB_SHA"
+          test "$commit" = "$(git rev-parse "$GITHUB_SHA^{}")"
           git fetch --no-tags origin main
           git merge-base --is-ancestor "$commit" origin/main
           test -z "$(git status --porcelain --untracked-files=all)"
