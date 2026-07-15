@@ -5,9 +5,11 @@ use crate::{
 use openfrag_capture::{SaveAcknowledgement, SaveProvenance};
 use openfrag_domain::CandidateTrigger;
 use openfrag_gsi::EvidenceReceipt;
-use openfrag_storage::{CaptureSessionId, LiveCandidateId, ManualFlagId, SaveAttemptId, Storage};
+use openfrag_storage::{
+    CaptureSessionId, DurableClipOriginInput, LiveCandidateId, ManualFlagId, SaveAttemptId, Storage,
+};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Mutex,
 };
 
@@ -29,6 +31,7 @@ struct SaveAttemptMetadata {
     id: SaveAttemptId,
     generation: u64,
     failed: bool,
+    capture: CaptureRecord,
 }
 
 struct State {
@@ -137,6 +140,7 @@ impl StorageEvidenceStore {
                 provenance,
             )
             .map_err(persistence)?;
+        complete_clip_metadata(&state, &attempt, clip.as_str(), acknowledgement)?;
         std::fs::remove_file(&acknowledgement.path).map_err(|error| {
             LiveDiagnostic::Persistence(format!("cannot remove captured source: {error}"))
         })?;
@@ -145,6 +149,93 @@ impl StorageEvidenceStore {
             recorder_request_id: acknowledgement.recorder_request_id.clone(),
         })
     }
+}
+
+fn complete_clip_metadata(
+    state: &State,
+    attempt: &SaveAttemptId,
+    clip_id: &str,
+    acknowledgement: &SaveAcknowledgement,
+) -> Result<(), LiveDiagnostic> {
+    match acknowledgement.provenance {
+        SaveProvenance::AutoRoundEnd => {
+            let mut evidence_receipts = BTreeSet::new();
+            let mut trigger_receipts = BTreeSet::new();
+            for metadata in state.save_attempts.values().filter(|metadata| {
+                &metadata.id == attempt && metadata.capture.kind == CaptureKind::AutoRoundEnd
+            }) {
+                evidence_receipts.extend(metadata.capture.source_receipt_ids.iter().cloned());
+                if let Some(candidate) = &metadata.capture.candidate {
+                    trigger_receipts.extend(candidate.receipt_ids.iter().cloned());
+                }
+            }
+            if trigger_receipts.is_empty() {
+                trigger_receipts.clone_from(&evidence_receipts);
+            }
+            let evidence_receipts = evidence_receipts.into_iter().collect::<Vec<_>>();
+            let trigger_receipts = trigger_receipts.into_iter().collect::<Vec<_>>();
+            state
+                .storage
+                .complete_clip_model_metadata(
+                    clip_id,
+                    acknowledgement.media.duration_ms,
+                    DurableClipOriginInput::Auto {
+                        trigger_receipts: &trigger_receipts,
+                        evidence_receipts: &evidence_receipts,
+                    },
+                )
+                .map_err(persistence)?;
+        }
+        SaveProvenance::ManualFlag => {
+            let mut manual_captures = state
+                .save_attempts
+                .iter()
+                .filter(|(_, metadata)| {
+                    &metadata.id == attempt && metadata.capture.kind == CaptureKind::ManualFlag
+                })
+                .map(|(capture_id, metadata)| {
+                    let flag_time_ms = metadata
+                        .capture
+                        .window
+                        .ok_or(LiveDiagnostic::Unsupported("capture window"))?
+                        .requested_at_ms;
+                    let flag = state
+                        .manual_flags
+                        .get(capture_id)
+                        .ok_or(LiveDiagnostic::Unsupported("manual flag metadata"))?;
+                    Ok((
+                        flag_time_ms,
+                        flag.as_str().to_owned(),
+                        metadata.capture.clone(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, LiveDiagnostic>>()?;
+            manual_captures
+                .sort_by(|left, right| (left.0, left.1.as_str()).cmp(&(right.0, right.1.as_str())));
+            let (flag_time_ms, flag_receipt_id, _) = manual_captures
+                .first()
+                .ok_or(LiveDiagnostic::Unsupported("capture metadata"))?;
+            let overlapping_auto_receipts = manual_captures
+                .iter()
+                .flat_map(|(_, _, capture)| capture.source_receipt_ids.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            state
+                .storage
+                .complete_clip_model_metadata(
+                    clip_id,
+                    acknowledgement.media.duration_ms,
+                    DurableClipOriginInput::Manual {
+                        flag_receipt_id,
+                        flag_time_ms: *flag_time_ms,
+                        overlapping_auto_receipts: &overlapping_auto_receipts,
+                    },
+                )
+                .map_err(persistence)?;
+        }
+    }
+    Ok(())
 }
 
 fn media_type(extension: &str) -> &'static str {
@@ -428,9 +519,10 @@ fn ensure_attempt(
     requested_at_ms: u64,
     recorder_request_id: Option<&str>,
 ) -> Result<SaveAttemptId, LiveDiagnostic> {
-    if let Some(existing) = state.save_attempts.get(&capture.id)
+    if let Some(existing) = state.save_attempts.get_mut(&capture.id)
         && !existing.failed
     {
+        existing.capture = capture.clone();
         return Ok(existing.id.clone());
     }
     let generation = state
@@ -457,6 +549,7 @@ fn ensure_attempt(
             id: attempt.clone(),
             generation,
             failed: false,
+            capture: capture.clone(),
         },
     );
     Ok(attempt)

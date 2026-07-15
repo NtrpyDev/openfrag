@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+acceptance-fixtures = ["openfrag-pipeline/acceptance-fixtures"]
+
 [dependencies]
 axum = { version = "0.8", features = ["json", "multipart"] }
 clap = { version = "4.5", features = ["derive"] }

@@ -362,7 +362,7 @@ fn one_acknowledged_recorder_request_finalizes_one_durable_clip() {
                 kind: CaptureKind::AutoRoundEnd,
                 round_id: None,
                 provenance: SaveProvenance::AutoRoundEnd,
-                source_receipt_ids: BTreeSet::new(),
+                source_receipt_ids: BTreeSet::from(["receipt-1".into()]),
                 candidate: None,
                 final_labels: BTreeSet::new(),
                 round_end_ms: Some(42_000),
@@ -392,12 +392,11 @@ fn one_acknowledged_recorder_request_finalizes_one_durable_clip() {
         .expect("finalized Clip");
     assert!(!finalized.clip_id.is_empty());
     assert!(!output.exists());
-    assert_eq!(
-        Storage::open(layout)
-            .expect("reopen storage")
-            .list_clips()
-            .expect("Clips")
-            .len(),
-        1
-    );
+    let storage = Storage::open(layout).expect("reopen storage");
+    assert_eq!(storage.list_clips().expect("Clips").len(), 1);
+    let model = storage
+        .durable_clip_model(&finalized.clip_id)
+        .expect("reviewable Clip model");
+    assert_eq!(model.duration_ms, 60_000);
+    assert_eq!(model.revision, 0);
 }

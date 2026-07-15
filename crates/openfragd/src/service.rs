@@ -7,6 +7,8 @@ use crate::api::{
     SetupResponse,
 };
 use crate::setup_runtime::SetupRuntime;
+#[cfg(feature = "acceptance-fixtures")]
+use openfrag_pipeline::AcceptanceParser;
 use openfrag_pipeline::{ImportOutcome, ImportRequest, ImportService, PinnedParser, PipelineError};
 use openfrag_storage::{ImportPhase, Storage, StoredRatingAvailability};
 use serde_json::{Value, json};
@@ -153,12 +155,20 @@ impl MutationPorts for PipelinePorts {
                 .storage
                 .lock()
                 .map_err(|_| unavailable("storage lock"))?;
-            ImportService::new(&mut storage, PinnedParser).import(ImportRequest {
+            let request = ImportRequest {
                 source: &source,
                 local_steam_id,
                 worker: "openfragd-http",
                 lease_expires_at_ms: i64::MAX,
-            })
+            };
+            #[cfg(feature = "acceptance-fixtures")]
+            if std::env::var("OPENFRAG_ACCEPTANCE_FIXTURE").as_deref() == Ok("complete-rating-v1") {
+                ImportService::new(&mut storage, AcceptanceParser).import(request)
+            } else {
+                ImportService::new(&mut storage, PinnedParser).import(request)
+            }
+            #[cfg(not(feature = "acceptance-fixtures"))]
+            ImportService::new(&mut storage, PinnedParser).import(request)
         };
         let _ = fs::remove_file(&source);
         let outcome = outcome.map_err(|error| pipeline_error(&error))?;

@@ -1,7 +1,6 @@
 use openfrag_import::{
-    CalculationIdentity, DemoMetadata, EventReceipt, ParseDiagnostic, ParseDiagnosticCategory,
-    ParseStage, ParsedEvent, ParsedOutput, ParsedRound, ParserError, ParserProgress,
-    ParserProgressPhase, Participant, PlayerSnapshot, SnapshotPhase,
+    ParseDiagnostic, ParseDiagnosticCategory, ParseStage, ParsedOutput, ParserError,
+    ParserProgress, ParserProgressPhase, Participant,
 };
 use openfrag_pipeline::{
     ImportOutcome, ImportRequest, ImportService, ParserBackend, PipelineError,
@@ -11,7 +10,6 @@ use openfrag_pipeline::{
     },
 };
 use openfrag_storage::{Layout, Storage};
-use serde_json::json;
 use std::collections::BTreeMap;
 use std::{fs, path::Path};
 
@@ -144,134 +142,8 @@ fn fixture_output() -> ParsedOutput {
     parsed
 }
 
-#[allow(clippy::too_many_lines)]
 fn available_output() -> ParsedOutput {
-    let local = 76_561_197_964_020_430_u64;
-    let participants = (0_u64..10)
-        .map(|index| Participant {
-            steam_id: (if index == 0 { local } else { local + index }).into(),
-            name: Some(format!("p{index}")),
-            team: Some(if index < 5 { 2 } else { 3 }),
-        })
-        .collect::<Vec<_>>();
-    let mut events = Vec::new();
-    let mut snapshots = Vec::new();
-    let mut rounds = Vec::new();
-    let mut ordinal = 0_u64;
-    let mut snapshot_ordinal = 0_u64;
-    for round in 0_i32..12 {
-        let base = round * 1_000;
-        for participant in &participants {
-            snapshots.push(PlayerSnapshot {
-                tick: (base + 10).into(),
-                ingestion_ordinal: snapshot_ordinal.into(),
-                phase: SnapshotPhase::RequestedTick,
-                steam_id: participant.steam_id,
-                entity_id: None,
-                team: participant.team,
-                health: Some(100),
-                alive: Some(true),
-                life_state: Some(0),
-                round_counter: Some(round),
-            });
-            snapshot_ordinal += 1;
-        }
-        let mut push = |name: &str, tick: i32, raw_fields: BTreeMap<String, serde_json::Value>| {
-            events.push(
-                ParsedEvent::from_raw(name, tick, ordinal, &raw_fields)
-                    .expect("fixture event must normalize"),
-            );
-            ordinal += 1;
-        };
-        push(
-            "round_freeze_end",
-            base + 10,
-            BTreeMap::from([("warmup".into(), json!(false))]),
-        );
-        push(
-            "player_hurt",
-            base + 20,
-            BTreeMap::from([
-                ("attacker_steamid".into(), json!(local.to_string())),
-                ("user_steamid".into(), json!((local + 5).to_string())),
-                ("dmg_health".into(), json!(80)),
-                ("weapon".into(), json!("ak47")),
-            ]),
-        );
-        push(
-            "player_death",
-            base + 30,
-            BTreeMap::from([
-                ("attacker_steamid".into(), json!((local + 6).to_string())),
-                ("user_steamid".into(), json!((local + 1).to_string())),
-                ("weapon".into(), json!("ak47")),
-                ("assistedflash".into(), json!(false)),
-            ]),
-        );
-        push(
-            "round_end",
-            base + 90,
-            BTreeMap::from([("winner".into(), json!(2))]),
-        );
-        for participant in &participants {
-            snapshots.push(PlayerSnapshot {
-                tick: (base + 90).into(),
-                ingestion_ordinal: snapshot_ordinal.into(),
-                phase: SnapshotPhase::RequestedTick,
-                steam_id: participant.steam_id,
-                entity_id: None,
-                team: participant.team,
-                health: Some(100),
-                alive: Some(true),
-                life_state: Some(0),
-                round_counter: Some(round + 1),
-            });
-            snapshot_ordinal += 1;
-        }
-        rounds.push(ParsedRound {
-            number: u64::try_from(round + 1).unwrap().into(),
-            end_tick: (base + 90).into(),
-            winner: Some(2),
-        });
-    }
-    let receipts = events
-        .iter()
-        .map(|event| EventReceipt {
-            ingestion_ordinal: event.ingestion_ordinal,
-            event_name: event.name().into(),
-            tick: event.tick,
-            fields: BTreeMap::new(),
-            raw_fields: BTreeMap::new(),
-            evidence_sha256: format!("evidence-{:04}", event.ingestion_ordinal.get()),
-        })
-        .collect();
-    ParsedOutput {
-        metadata: DemoMetadata {
-            map: Some("de_fixture".into()),
-            patch_build: Some("fixture-build".into()),
-            demo_stamp: None,
-            server: None,
-            game_directory: None,
-            tick_rate: Some("64".into()),
-            tick_rate_unavailable_reason: None,
-        },
-        participants,
-        rounds,
-        events,
-        receipts,
-        player_snapshots: snapshots,
-        suspicious_empty: false,
-        identity: CalculationIdentity {
-            source_sha256: "available-demo".into(),
-            parser_commit: "commit".into(),
-            parser_build: "parser".into(),
-            generated_proto_build: "proto".into(),
-            requested_schema_hash: "query".into(),
-            metric_definition_version: "metrics".into(),
-            formula_version: "ofr-1.0.0".into(),
-            evidence_semantics_epoch: "epoch".into(),
-        },
-    }
+    openfrag_analysis::fixtures::complete_parsed_output()
 }
 
 #[test]

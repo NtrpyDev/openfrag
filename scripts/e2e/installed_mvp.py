@@ -211,9 +211,11 @@ def exercise_dashboard(
     require(status == 200, f"Clip trim failed: {status} {body!r}")
     trim = json.loads(body)
     require((trim["start_ms"], trim["end_ms"]) == (1_000, 5_000), f"trim bounds drifted: {trim}")
-    status, _, preview = request(opener, f"{base_url}/api/clips/{clip_id}/preview")
+    derived_id = str(trim["clip_id"])
+    require(derived_id != clip_id, f"trim did not create a derived Clip: {trim}")
+    status, _, preview = request(opener, f"{base_url}/api/clips/{derived_id}/preview")
     require(status == 200 and preview == b"fake encoded media\n", "trimmed Clip preview drifted")
-    status, body = json_request(opener, f"{base_url}/api/clips/{clip_id}/export", method="POST")
+    status, body = json_request(opener, f"{base_url}/api/clips/{derived_id}/export", method="POST")
     require(status == 200, f"Clip export failed: {status} {body!r}")
     exported = Path(json.loads(body)["path"])
     require(exported.is_file() and exported.is_relative_to(data_directory / "exports"), "export escaped private storage")
@@ -243,7 +245,13 @@ def installed_mvp(binary: Path) -> None:
         write_live_recorder(recorder)
         fake_directory = repository / "tests/e2e/fakes"
         shutil.copy2(fake_directory / "ffmpeg", host_directory / "ffmpeg")
-        shutil.copy2(fake_directory / "ffprobe", host_directory / "ffprobe")
+        ffprobe = host_directory / "ffprobe"
+        ffprobe.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' '{\"streams\":[{\"codec_type\":\"video\"}],"
+            "\"format\":{\"duration\":\"30.000\"}}'\n"
+        )
+        ffprobe.chmod(0o755)
         environment = os.environ.copy()
         environment.update(
             {
@@ -254,6 +262,7 @@ def installed_mvp(binary: Path) -> None:
                 "XDG_SESSION_TYPE": "wayland",
                 "PATH": f"{host_directory}{os.pathsep}{environment.get('PATH', '')}",
                 "OPENFRAG_ACCEPTANCE_FIXTURE": "complete-rating-v1",
+                "OPENFRAG_E2E_FAKE_LOG": str(root / "host-tools.log"),
             }
         )
         for variable in ("DISPLAY", "WAYLAND_DISPLAY", "BROWSER", "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
@@ -301,7 +310,15 @@ def installed_mvp(binary: Path) -> None:
                 require(health["binding"] == "loopback", f"installed binding drifted: {health}")
                 require(health["telemetry"] is False and health["upload_path"] is False, f"local-only contract drifted: {health}")
                 assert_loopback_only(daemon, port)
-                exercise_dashboard(opener, base_url, data_directory, token)
+                try:
+                    exercise_dashboard(opener, base_url, data_directory, token)
+                except Exception:
+                    log.flush()
+                    print(daemon_log.read_text(errors="replace"), file=os.sys.stderr)
+                    host_log = root / "host-tools.log"
+                    if host_log.is_file():
+                        print(host_log.read_text(errors="replace"), file=os.sys.stderr)
+                    raise
             finally:
                 if daemon is not None and daemon.poll() is None:
                     daemon.terminate()

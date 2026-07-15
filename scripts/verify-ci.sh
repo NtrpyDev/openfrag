@@ -42,3 +42,5 @@ cargo build -p openfragd --release
 packaging/verify-linux-assets.sh
 scripts/hardware/tests/verify-nvidia-host-self-test.sh
 scripts/e2e/headless-smoke.sh
+cargo build -p openfragd --release --features acceptance-fixtures
+python3 scripts/e2e/installed_mvp.py --binary target/release/openfragd

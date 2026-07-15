@@ -697,6 +697,37 @@ impl ParserBackend for PinnedParser {
     }
 }
 
+#[cfg(feature = "acceptance-fixtures")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AcceptanceParser;
+
+#[cfg(feature = "acceptance-fixtures")]
+impl ParserBackend for AcceptanceParser {
+    fn parse(
+        &self,
+        path: &Path,
+        progress: &mut dyn FnMut(ParserProgress),
+    ) -> Result<ParsedOutput, ParserError> {
+        let total_bytes = std::fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(1);
+        for (phase, fraction, events_emitted) in [
+            (ParserProgressPhase::FirstPass, 1, 0),
+            (ParserProgressPhase::SecondPass, 2, 48),
+            (ParserProgressPhase::Finalize, 3, 48),
+        ] {
+            progress(ParserProgress {
+                phase,
+                bytes_consumed: total_bytes.saturating_mul(fraction) / 3,
+                total_bytes,
+                frames: 12,
+                events_emitted,
+            });
+        }
+        Ok(openfrag_analysis::fixtures::complete_parsed_output())
+    }
+}
+
 fn parser_progress_basis_points(progress: ParserProgress) -> i64 {
     let fraction = (progress.bytes_consumed.min(progress.total_bytes) * 1_000)
         .checked_div(progress.total_bytes)

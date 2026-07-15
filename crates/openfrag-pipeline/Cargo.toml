@@ -8,6 +8,7 @@ repository.workspace = true
 
 [features]
 default = []
+acceptance-fixtures = ["openfrag-analysis/acceptance-fixtures"]
 demoparser = ["openfrag-import/demoparser"]
 
 [dependencies]
@@ -19,6 +20,7 @@ openfrag-storage = { path = "../openfrag-storage" }
 serde_json = "1"
 
 [dev-dependencies]
+openfrag-analysis = { path = "../openfrag-analysis", features = ["acceptance-fixtures"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 
