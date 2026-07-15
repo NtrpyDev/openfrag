@@ -7,6 +7,7 @@ pkgdesc='Local CS2 demo analysis and highlight capture dashboard'
 arch=('x86_64')
 url='https://github.com/NtrpyDev/openfrag'
 license=('GPL-3.0-only')
+options=('!lto')
 depends=('bash' 'ffmpeg' 'systemd' 'xdg-utils')
 makedepends=('cargo' 'rust')
 checkdepends=('desktop-file-utils')
