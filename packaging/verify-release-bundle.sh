@@ -4,6 +4,12 @@ set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 source "$root/packaging/application-identity.sh"
+version=$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)"$/\1/p' "$root/Cargo.toml")
+if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf '%s\n' 'Cargo.toml must contain exactly one numeric workspace package version.' >&2
+    exit 1
+fi
+bundle_name="openfrag-v${version}-linux-x86_64"
 stage=$(mktemp -d "${TMPDIR:-/tmp}/openfrag-release-bundle.XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT HUP INT TERM
 
@@ -21,7 +27,7 @@ chmod 0755 "$fixture"
 "$root/packaging/build-release-bundle.sh" "$fixture" "$first"
 "$root/packaging/build-release-bundle.sh" "$fixture" "$second"
 
-archive_name=openfrag-v1.0.0-linux-x86_64.tar.gz
+archive_name="$bundle_name.tar.gz"
 checksum_name="$archive_name.sha256"
 cmp -s "$first/$archive_name" "$second/$archive_name"
 cmp -s "$first/$checksum_name" "$second/$checksum_name"
@@ -32,21 +38,20 @@ cmp -s "$first/$checksum_name" "$second/$checksum_name"
 
 expected="$stage/expected-files"
 actual="$stage/actual-files"
-cat >"$expected" <<'EOF'
-openfrag-v1.0.0-linux-x86_64/LICENSE
-openfrag-v1.0.0-linux-x86_64/THIRD_PARTY_NOTICES.md
-openfrag-v1.0.0-linux-x86_64/packaging/application-identity.sh
-openfrag-v1.0.0-linux-x86_64/packaging/install-user.sh
-openfrag-v1.0.0-linux-x86_64/packaging/linux/app-io.github.ntrpydev.openfrag.service
-openfrag-v1.0.0-linux-x86_64/packaging/linux/io.github.ntrpydev.openfrag.desktop
-openfrag-v1.0.0-linux-x86_64/packaging/linux/openfrag-launch
-openfrag-v1.0.0-linux-x86_64/target/release/openfragd
-EOF
+printf '%s\n' \
+    "$bundle_name/LICENSE" \
+    "$bundle_name/THIRD_PARTY_NOTICES.md" \
+    "$bundle_name/packaging/application-identity.sh" \
+    "$bundle_name/packaging/install-user.sh" \
+    "$bundle_name/packaging/linux/app-io.github.ntrpydev.openfrag.service" \
+    "$bundle_name/packaging/linux/io.github.ntrpydev.openfrag.desktop" \
+    "$bundle_name/packaging/linux/openfrag-launch" \
+    "$bundle_name/target/release/openfragd" >"$expected"
 tar -tzf "$first/$archive_name" | grep -v '/$' >"$actual"
 cmp -s "$expected" "$actual"
 
 tar -xzf "$first/$archive_name" -C "$extract"
-bundle="$extract/openfrag-v1.0.0-linux-x86_64"
+bundle="$extract/$bundle_name"
 cmp -s "$fixture" "$bundle/target/release/openfragd"
 cmp -s "$root/LICENSE" "$bundle/LICENSE"
 cmp -s "$root/packaging/linux/THIRD_PARTY_NOTICES.md" "$bundle/THIRD_PARTY_NOTICES.md"

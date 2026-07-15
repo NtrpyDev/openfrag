@@ -11,7 +11,12 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 source "$root/packaging/application-identity.sh"
 binary=$1
 output=$2
-bundle_name=openfrag-v1.0.0-linux-x86_64
+version=$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)"$/\1/p' "$root/Cargo.toml")
+if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf '%s\n' 'Cargo.toml must contain exactly one numeric workspace package version.' >&2
+    exit 1
+fi
+bundle_name="openfrag-v${version}-linux-x86_64"
 archive_name="$bundle_name.tar.gz"
 checksum_name="$archive_name.sha256"
 
