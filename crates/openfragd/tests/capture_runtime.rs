@@ -18,7 +18,7 @@ use capture_runtime::{CaptureRuntime, RuntimeError, RuntimeStatus, UnavailableRe
 use openfrag_capture::{
     Clock, Filesystem, MediaInfo, MediaProbe, Process, SaveDisposition, SaveProvenance, Signal,
 };
-use openfrag_setup::{write_capture_configuration, CaptureConfiguration, CaptureRecorder};
+use openfrag_setup::{CaptureConfiguration, CaptureRecorder, write_capture_configuration};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -203,7 +203,7 @@ fn enabled_runtime_delegates_lifecycle_to_fakes_only() {
     assert_live_port_ready(&runtime);
     assert_eq!(
         live_runtime::CaptureRuntimePort::request_save(&mut runtime, SaveProvenance::ManualFlag)
-        .expect("fake save"),
+            .expect("fake save"),
         SaveDisposition::Signalled
     );
     let acknowledgement = live_runtime::CaptureRuntimePort::discover_save(&mut runtime)

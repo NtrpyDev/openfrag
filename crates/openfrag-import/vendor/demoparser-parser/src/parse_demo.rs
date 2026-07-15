@@ -495,7 +495,7 @@ impl<'a> Parser<'a> {
 
         // Pre-group each chunk's columns into per-prop ordered buckets. This only MOVES the
         // PropColumn structs (no row-data copy) and preserves chunk (offset) order, so the
-        // first bucket entry is the seed and the rest are appended in order — identical to the
+        // first bucket entry is the seed and the rest are appended in order, identical to the
         // serial insert/extend_from it replaces.
         let mut groups: AHashMap<u32, Vec<PropColumn>> = AHashMap::default();
         for part_df in v {
