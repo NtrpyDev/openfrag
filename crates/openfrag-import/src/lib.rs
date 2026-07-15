@@ -106,71 +106,190 @@ pub struct DemoMetadata {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Participant {
-    pub steam_id: u64,
+    pub steam_id: SteamId,
     pub name: Option<String>,
     pub team: Option<i32>,
 }
+
+macro_rules! identifier_type {
+    ($name:ident, $inner:ty) => {
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name($inner);
+
+        impl $name {
+            #[must_use]
+            pub const fn new(value: $inner) -> Self {
+                Self(value)
+            }
+
+            #[must_use]
+            pub const fn get(self) -> $inner {
+                self.0
+            }
+        }
+
+        impl From<$inner> for $name {
+            fn from(value: $inner) -> Self {
+                Self(value)
+            }
+        }
+    };
+}
+
+identifier_type!(DemoTick, i32);
+identifier_type!(IngestionOrdinal, u64);
+identifier_type!(SteamId, u64);
+identifier_type!(EntityId, i32);
+identifier_type!(RoundNumber, u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NormalizedEventKind {
+    RoundFreezeEnd,
+    RoundEnd,
+    PlayerHurt,
+    PlayerDeath,
+    PlayerDisconnect,
+}
+
+impl NormalizedEventKind {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RoundFreezeEnd => "round_freeze_end",
+            Self::RoundEnd => "round_end",
+            Self::PlayerHurt => "player_hurt",
+            Self::PlayerDeath => "player_death",
+            Self::PlayerDisconnect => "player_disconnect",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoundFreezeEndEvent {
+    pub warmup: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoundEndEvent {
+    pub winner: Option<i32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerHurtEvent {
+    pub attacker: Option<SteamId>,
+    pub victim: Option<SteamId>,
+    pub damage_health: Option<i64>,
+    pub weapon: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerDeathEvent {
+    pub attacker: Option<SteamId>,
+    pub victim: Option<SteamId>,
+    pub assister: Option<SteamId>,
+    pub assisted_flash: bool,
+    pub weapon: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerDisconnectEvent {
+    pub player: Option<SteamId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NormalizedEvent {
+    RoundFreezeEnd(RoundFreezeEndEvent),
+    RoundEnd(RoundEndEvent),
+    PlayerHurt(PlayerHurtEvent),
+    PlayerDeath(PlayerDeathEvent),
+    PlayerDisconnect(PlayerDisconnectEvent),
+}
+
+impl NormalizedEvent {
+    #[must_use]
+    pub const fn kind(&self) -> NormalizedEventKind {
+        match self {
+            Self::RoundFreezeEnd(_) => NormalizedEventKind::RoundFreezeEnd,
+            Self::RoundEnd(_) => NormalizedEventKind::RoundEnd,
+            Self::PlayerHurt(_) => NormalizedEventKind::PlayerHurt,
+            Self::PlayerDeath(_) => NormalizedEventKind::PlayerDeath,
+            Self::PlayerDisconnect(_) => NormalizedEventKind::PlayerDisconnect,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedEvent {
-    pub name: String,
-    pub tick: i32,
-    pub ingestion_ordinal: u64,
-    pub fields: BTreeMap<String, String>,
-    pub raw_fields: BTreeMap<String, serde_json::Value>,
+    pub tick: DemoTick,
+    pub ingestion_ordinal: IngestionOrdinal,
+    pub event: NormalizedEvent,
 }
 impl ParsedEvent {
-    pub fn u64_field(&self, name: &str) -> Option<u64> {
-        let value = self.raw_fields.get(name)?;
-        value.as_u64().or_else(|| value.as_str()?.parse().ok())
+    #[must_use]
+    pub fn from_raw(
+        name: &str,
+        tick: i32,
+        ingestion_ordinal: u64,
+        fields: &BTreeMap<String, serde_json::Value>,
+    ) -> Option<Self> {
+        Some(Self {
+            tick: DemoTick::new(tick),
+            ingestion_ordinal: IngestionOrdinal::new(ingestion_ordinal),
+            event: normalize_event(name, fields)?,
+        })
     }
-    pub fn i64_field(&self, name: &str) -> Option<i64> {
-        self.raw_fields.get(name)?.as_i64()
+
+    #[must_use]
+    pub const fn kind(&self) -> NormalizedEventKind {
+        self.event.kind()
     }
-    pub fn bool_field(&self, name: &str) -> Option<bool> {
-        self.raw_fields.get(name)?.as_bool()
+
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.kind().name()
     }
-    pub fn string_field(&self, name: &str) -> Option<&str> {
-        self.raw_fields.get(name)?.as_str()
+
+    #[must_use]
+    pub const fn attacker(&self) -> Option<SteamId> {
+        match &self.event {
+            NormalizedEvent::PlayerHurt(event) => event.attacker,
+            NormalizedEvent::PlayerDeath(event) => event.attacker,
+            _ => None,
+        }
     }
-    pub fn attacker(&self) -> Option<u64> {
-        self.u64_field("attacker_steamid")
-            .or_else(|| self.u64_field("attacker"))
+
+    #[must_use]
+    pub const fn victim(&self) -> Option<SteamId> {
+        match &self.event {
+            NormalizedEvent::PlayerHurt(event) => event.victim,
+            NormalizedEvent::PlayerDeath(event) => event.victim,
+            _ => None,
+        }
     }
-    pub fn victim(&self) -> Option<u64> {
-        self.u64_field("user_steamid")
-            .or_else(|| self.u64_field("userid"))
-            .or_else(|| self.u64_field("victim"))
-    }
-    pub fn assister(&self) -> Option<u64> {
-        self.u64_field("assister")
-    }
-    pub fn assisted_flash(&self) -> Option<bool> {
-        self.bool_field("assistedflash")
-    }
-    pub fn damage_health(&self) -> Option<i64> {
-        self.i64_field("dmg_health")
-    }
+
+    #[must_use]
     pub fn weapon(&self) -> Option<&str> {
-        self.string_field("weapon")
-    }
-    pub fn winner(&self) -> Option<i64> {
-        self.i64_field("winner")
+        match &self.event {
+            NormalizedEvent::PlayerHurt(event) => event.weapon.as_deref(),
+            NormalizedEvent::PlayerDeath(event) => event.weapon.as_deref(),
+            _ => None,
+        }
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventReceipt {
-    pub ingestion_ordinal: u64,
+    pub ingestion_ordinal: IngestionOrdinal,
     pub event_name: String,
-    pub tick: i32,
+    pub tick: DemoTick,
     pub fields: BTreeMap<String, String>,
     pub raw_fields: BTreeMap<String, serde_json::Value>,
     pub evidence_sha256: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedRound {
-    pub number: u64,
-    pub end_tick: i32,
-    pub winner: Option<String>,
+    pub number: RoundNumber,
+    pub end_tick: DemoTick,
+    pub winner: Option<i32>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotPhase {
@@ -181,17 +300,16 @@ pub enum SnapshotPhase {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayerSnapshot {
-    pub tick: i32,
-    pub ingestion_ordinal: u64,
+    pub tick: DemoTick,
+    pub ingestion_ordinal: IngestionOrdinal,
     pub phase: SnapshotPhase,
-    pub steam_id: u64,
-    pub entity_id: Option<i32>,
+    pub steam_id: SteamId,
+    pub entity_id: Option<EntityId>,
     pub team: Option<i32>,
     pub health: Option<i32>,
     pub alive: Option<bool>,
     pub life_state: Option<i32>,
     pub round_counter: Option<i32>,
-    pub raw_properties: BTreeMap<String, serde_json::Value>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedOutput {
@@ -214,8 +332,9 @@ impl ParsedOutput {
 }
 
 pub const DEMOPARSER_COMMIT: &str = "ba39cc44cd5abfd7f34df2b3c0a7dd3630048311";
-pub const DEMOPARSER_BUILD: &str = "parser-0.1.1+openfrag-event-snapshots-1/csgoproto-0.1.5";
-pub const QUERY_PLAN_VERSION: &str = "openfrag-evidence-query-3";
+pub const DEMOPARSER_BUILD: &str = "parser-0.1.1+openfrag-typed-evidence-1/csgoproto-0.1.5";
+pub const QUERY_PLAN_VERSION: &str = "openfrag-evidence-query-4";
+pub const NORMALIZED_SCHEMA_VERSION: &str = "openfrag-demo-evidence-1";
 pub const EVENT_QUERY: &[&str] = &[
     "round_freeze_end",
     "round_end",
@@ -241,16 +360,187 @@ pub const PROPERTY_QUERY: &[&str] = &[
     "warmup_period",
 ];
 pub const SNAPSHOT_PHASE: &str = "after-event-packet";
-pub const EVIDENCE_SEMANTICS_EPOCH: &str = "openfrag-evidence-2";
+pub const EVIDENCE_SEMANTICS_EPOCH: &str = "openfrag-evidence-3";
 pub const GENERATED_PROTO_BUILD: &str = "csgoproto-0.1.5";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaScalar {
+    Boolean,
+    Integer,
+    String,
+    SteamId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NormalizedFieldSpec {
+    pub name: &'static str,
+    pub scalar: SchemaScalar,
+    pub required: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NormalizedEventSpec {
+    pub kind: NormalizedEventKind,
+    pub fields: &'static [NormalizedFieldSpec],
+}
+
+const ROUND_FREEZE_END_FIELDS: &[NormalizedFieldSpec] = &[NormalizedFieldSpec {
+    name: "warmup",
+    scalar: SchemaScalar::Boolean,
+    required: true,
+}];
+const ROUND_END_FIELDS: &[NormalizedFieldSpec] = &[NormalizedFieldSpec {
+    name: "winner",
+    scalar: SchemaScalar::Integer,
+    required: false,
+}];
+const PLAYER_HURT_FIELDS: &[NormalizedFieldSpec] = &[
+    NormalizedFieldSpec {
+        name: "attacker",
+        scalar: SchemaScalar::SteamId,
+        required: false,
+    },
+    NormalizedFieldSpec {
+        name: "victim",
+        scalar: SchemaScalar::SteamId,
+        required: false,
+    },
+    NormalizedFieldSpec {
+        name: "damage_health",
+        scalar: SchemaScalar::Integer,
+        required: false,
+    },
+    NormalizedFieldSpec {
+        name: "weapon",
+        scalar: SchemaScalar::String,
+        required: false,
+    },
+];
+const PLAYER_DEATH_FIELDS: &[NormalizedFieldSpec] = &[
+    NormalizedFieldSpec {
+        name: "attacker",
+        scalar: SchemaScalar::SteamId,
+        required: false,
+    },
+    NormalizedFieldSpec {
+        name: "victim",
+        scalar: SchemaScalar::SteamId,
+        required: false,
+    },
+    NormalizedFieldSpec {
+        name: "assister",
+        scalar: SchemaScalar::SteamId,
+        required: false,
+    },
+    NormalizedFieldSpec {
+        name: "assisted_flash",
+        scalar: SchemaScalar::Boolean,
+        required: true,
+    },
+    NormalizedFieldSpec {
+        name: "weapon",
+        scalar: SchemaScalar::String,
+        required: false,
+    },
+];
+const PLAYER_DISCONNECT_FIELDS: &[NormalizedFieldSpec] = &[NormalizedFieldSpec {
+    name: "player",
+    scalar: SchemaScalar::SteamId,
+    required: false,
+}];
+
+pub const NORMALIZED_EVENT_SPEC: &[NormalizedEventSpec] = &[
+    NormalizedEventSpec {
+        kind: NormalizedEventKind::RoundFreezeEnd,
+        fields: ROUND_FREEZE_END_FIELDS,
+    },
+    NormalizedEventSpec {
+        kind: NormalizedEventKind::RoundEnd,
+        fields: ROUND_END_FIELDS,
+    },
+    NormalizedEventSpec {
+        kind: NormalizedEventKind::PlayerHurt,
+        fields: PLAYER_HURT_FIELDS,
+    },
+    NormalizedEventSpec {
+        kind: NormalizedEventKind::PlayerDeath,
+        fields: PLAYER_DEATH_FIELDS,
+    },
+    NormalizedEventSpec {
+        kind: NormalizedEventKind::PlayerDisconnect,
+        fields: PLAYER_DISCONNECT_FIELDS,
+    },
+];
+
+/// Generates the public normalized evidence schema from the pinned event specification.
+#[must_use]
+pub fn normalized_event_schema() -> serde_json::Value {
+    let variants = NORMALIZED_EVENT_SPEC
+        .iter()
+        .map(|event| {
+            let properties = event
+                .fields
+                .iter()
+                .map(|field| {
+                    let schema = match field.scalar {
+                        SchemaScalar::Boolean => serde_json::json!({"type": "boolean"}),
+                        SchemaScalar::Integer => serde_json::json!({"type": "integer"}),
+                        SchemaScalar::String => serde_json::json!({"type": "string"}),
+                        SchemaScalar::SteamId => serde_json::json!({
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": u64::MAX,
+                            "x-openfrag-type": "SteamId"
+                        }),
+                    };
+                    (field.name.to_owned(), schema)
+                })
+                .collect::<serde_json::Map<_, _>>();
+            let required = event
+                .fields
+                .iter()
+                .filter(|field| field.required)
+                .map(|field| field.name)
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "type": {"const": event.kind.name()},
+                    "tick": {"type": "integer", "x-openfrag-type": "DemoTick"},
+                    "ingestion_ordinal": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": u64::MAX,
+                        "x-openfrag-type": "IngestionOrdinal"
+                    },
+                    "data": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": properties,
+                        "required": required
+                    }
+                },
+                "required": ["type", "tick", "ingestion_ordinal", "data"]
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": NORMALIZED_SCHEMA_VERSION,
+        "title": "OpenFrag normalized Demo evidence",
+        "oneOf": variants
+    })
+}
 
 pub fn query_plan_hash() -> String {
     let canonical = format!(
-        "{}\nevents:{}\nproperties:{}\nsnapshot-phase:{}",
+        "{}\nevents:{}\nproperties:{}\nsnapshot-phase:{}\nnormalized-schema:{}",
         QUERY_PLAN_VERSION,
         EVENT_QUERY.join(","),
         PROPERTY_QUERY.join(","),
         SNAPSHOT_PHASE,
+        NORMALIZED_SCHEMA_VERSION,
     );
     format!("{:x}", Sha256::digest(canonical.as_bytes()))
 }
@@ -276,6 +566,63 @@ pub fn parser_capability() -> ParserCapability {
         ParserCapability::Unavailable {
             reason: "demoparser feature is disabled".into(),
         }
+    }
+}
+
+fn raw_u64(fields: &BTreeMap<String, serde_json::Value>, names: &[&str]) -> Option<u64> {
+    names.iter().find_map(|name| {
+        let value = fields.get(*name)?;
+        value.as_u64().or_else(|| value.as_str()?.parse().ok())
+    })
+}
+
+fn normalize_event(
+    name: &str,
+    fields: &BTreeMap<String, serde_json::Value>,
+) -> Option<NormalizedEvent> {
+    let steam_id = |names: &[&str]| raw_u64(fields, names).map(SteamId::new);
+    match name {
+        "round_freeze_end" => Some(NormalizedEvent::RoundFreezeEnd(RoundFreezeEndEvent {
+            warmup: fields
+                .get("warmup")
+                .or_else(|| fields.get("warmup_period"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        })),
+        "round_end" => Some(NormalizedEvent::RoundEnd(RoundEndEvent {
+            winner: fields.get("winner").and_then(|value| {
+                value
+                    .as_i64()
+                    .or_else(|| value.as_str()?.parse::<i64>().ok())
+                    .and_then(|winner| i32::try_from(winner).ok())
+            }),
+        })),
+        "player_hurt" => Some(NormalizedEvent::PlayerHurt(PlayerHurtEvent {
+            attacker: steam_id(&["attacker_steamid", "attacker"]),
+            victim: steam_id(&["user_steamid", "userid", "victim"]),
+            damage_health: fields.get("dmg_health").and_then(serde_json::Value::as_i64),
+            weapon: fields
+                .get("weapon")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        })),
+        "player_death" => Some(NormalizedEvent::PlayerDeath(PlayerDeathEvent {
+            attacker: steam_id(&["attacker_steamid", "attacker"]),
+            victim: steam_id(&["user_steamid", "userid", "victim"]),
+            assister: steam_id(&["assister_steamid", "assister"]),
+            assisted_flash: fields
+                .get("assistedflash")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            weapon: fields
+                .get("weapon")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        })),
+        "player_disconnect" => Some(NormalizedEvent::PlayerDisconnect(PlayerDisconnectEvent {
+            player: steam_id(&["user_steamid", "userid", "player"]),
+        })),
+        _ => None,
     }
 }
 
@@ -337,11 +684,11 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
             .get("steamid")
             .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))?;
         Some(PlayerSnapshot {
-            tick: i64_value("tick")? as i32,
-            ingestion_ordinal: ordinal as u64,
+            tick: DemoTick::new(i64_value("tick")? as i32),
+            ingestion_ordinal: IngestionOrdinal::new(ordinal as u64),
             phase: SnapshotPhase::AfterEventPacket,
-            steam_id,
-            entity_id: i64_value("entity_id").map(|v| v as i32),
+            steam_id: SteamId::new(steam_id),
+            entity_id: i64_value("entity_id").map(|v| EntityId::new(v as i32)),
             team: i64_value("team_num").map(|v| v as i32),
             health: i64_value("health").map(|v| v as i32),
             alive: raw_properties
@@ -349,7 +696,6 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
                 .and_then(serde_json::Value::as_bool),
             life_state: i64_value("life_state").map(|v| v as i32),
             round_counter: i64_value("total_rounds_played").map(|v| v as i32),
-            raw_properties,
         })
     })
     .collect::<Vec<_>>();
@@ -359,7 +705,7 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
         .iter()
         .filter_map(|p| {
             p.steamid.map(|id| Participant {
-                steam_id: id,
+                steam_id: SteamId::new(id),
                 name: p.name.clone(),
                 team: p.team_number,
             })
@@ -396,19 +742,23 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
                 })
             })
             .collect();
+        let normalized = normalize_event(&event.name, &raw_fields).ok_or_else(|| {
+            ParserError::Parse(format!("unrecognized requested event {}", event.name))
+        })?;
         let parsed = ParsedEvent {
-            name: event.name.clone(),
-            tick: event.tick,
-            ingestion_ordinal: ordinal as u64,
-            fields: fields.clone(),
-            raw_fields: raw_fields.clone(),
+            tick: DemoTick::new(event.tick),
+            ingestion_ordinal: IngestionOrdinal::new(ordinal as u64),
+            event: normalized,
         };
         if event.name == "round_end" {
             round_no += 1;
+            let NormalizedEvent::RoundEnd(round_end) = &parsed.event else {
+                unreachable!();
+            };
             rounds.push(ParsedRound {
-                number: round_no,
-                end_tick: event.tick,
-                winner: fields.get("winner").cloned(),
+                number: RoundNumber::new(round_no),
+                end_tick: DemoTick::new(event.tick),
+                winner: round_end.winner,
             });
         }
         let evidence_sha256 = format!(
@@ -419,9 +769,9 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
             )
         );
         receipts.push(EventReceipt {
-            ingestion_ordinal: ordinal as u64,
+            ingestion_ordinal: IngestionOrdinal::new(ordinal as u64),
             event_name: event.name.clone(),
-            tick: event.tick,
+            tick: DemoTick::new(event.tick),
             fields: fields.clone(),
             raw_fields,
             evidence_sha256,
@@ -430,7 +780,9 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
     }
     let suspicious_empty = participants.is_empty()
         || rounds.is_empty()
-        || !events.iter().any(|e| e.name == "player_death");
+        || !events
+            .iter()
+            .any(|event| event.kind() == NormalizedEventKind::PlayerDeath);
     if participants.is_empty() {
         return Err(ParserError::Quarantined {
             reason: "no participants",
@@ -441,13 +793,19 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
             reason: "no canonical round_end events",
         });
     }
-    if !events.iter().any(|e| e.name == "player_death") {
+    if !events
+        .iter()
+        .any(|event| event.kind() == NormalizedEventKind::PlayerDeath)
+    {
         return Err(ParserError::Quarantined {
             reason: "no requested player_death events",
         });
     }
-    for required in ["round_freeze_end", "player_hurt"] {
-        if !events.iter().any(|event| event.name == required) {
+    for required in [
+        NormalizedEventKind::RoundFreezeEnd,
+        NormalizedEventKind::PlayerHurt,
+    ] {
+        if !events.iter().any(|event| event.kind() == required) {
             return Err(ParserError::Quarantined {
                 reason: "missing required rating evidence event",
             });
@@ -921,6 +1279,31 @@ mod tests {
         }
     }
     #[test]
+    fn normalized_schema_is_pinned_and_exhaustive() {
+        let schema = normalized_event_schema();
+        assert_eq!(schema["$id"], NORMALIZED_SCHEMA_VERSION);
+        assert_eq!(schema["oneOf"].as_array().unwrap().len(), EVENT_QUERY.len());
+        let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&schema).unwrap()));
+        assert_eq!(
+            hash,
+            "8f7f813904438aa2d1171b8ba67bd10efa7fe945b2abe1437b00eeebb61b1e5a"
+        );
+    }
+
+    #[test]
+    fn normalized_events_do_not_retain_raw_parser_keys() {
+        let raw = BTreeMap::from([
+            ("attacker_steamid".into(), serde_json::json!("10")),
+            ("user_steamid".into(), serde_json::json!("20")),
+            ("upstream_only".into(), serde_json::json!("receipt-sidecar")),
+        ]);
+        let event = ParsedEvent::from_raw("player_death", 12, 3, &raw).unwrap();
+        assert_eq!(event.attacker(), Some(SteamId::new(10)));
+        assert_eq!(event.victim(), Some(SteamId::new(20)));
+        assert_eq!(event.name(), "player_death");
+    }
+
+    #[test]
     fn validates_limit_and_headroom() {
         let d = tempdir().unwrap();
         let p = d.path().join("x.dem");
@@ -1050,7 +1433,7 @@ mod tests {
             parsed
                 .events
                 .iter()
-                .filter(|e| e.name == "player_hurt")
+                .filter(|event| event.kind() == NormalizedEventKind::PlayerHurt)
                 .count(),
             264
         );
@@ -1058,7 +1441,7 @@ mod tests {
             parsed
                 .events
                 .iter()
-                .filter(|e| e.name == "player_death")
+                .filter(|event| event.kind() == NormalizedEventKind::PlayerDeath)
                 .count(),
             73
         );
@@ -1066,32 +1449,37 @@ mod tests {
             parsed
                 .events
                 .iter()
-                .filter(|e| e.name == "round_freeze_end")
+                .filter(|event| event.kind() == NormalizedEventKind::RoundFreezeEnd)
                 .count(),
             9
         );
         let hurt = parsed
             .events
             .iter()
-            .find(|e| e.name == "player_hurt")
+            .find(|event| event.kind() == NormalizedEventKind::PlayerHurt)
             .unwrap();
-        assert_eq!(hurt.attacker(), Some(76561197964020430));
-        assert_eq!(hurt.victim(), Some(76561198073049527));
-        assert_eq!(hurt.damage_health(), Some(100));
+        assert_eq!(hurt.attacker(), Some(SteamId::new(76561197964020430)));
+        assert_eq!(hurt.victim(), Some(SteamId::new(76561198073049527)));
+        let NormalizedEvent::PlayerHurt(hurt_event) = &hurt.event else {
+            unreachable!();
+        };
+        assert_eq!(hurt_event.damage_health, Some(100));
         assert_eq!(hurt.weapon(), Some("p250"));
         let death = parsed
             .events
             .iter()
-            .find(|e| e.name == "player_death")
+            .find(|event| event.kind() == NormalizedEventKind::PlayerDeath)
             .unwrap();
-        assert_eq!(death.attacker(), Some(76561197964020430));
-        assert_eq!(death.victim(), Some(76561198073049527));
+        assert_eq!(death.attacker(), Some(SteamId::new(76561197964020430)));
+        assert_eq!(death.victim(), Some(SteamId::new(76561198073049527)));
         assert_eq!(death.weapon(), Some("p250"));
         assert!(!parsed.player_snapshots.is_empty());
-        assert!(parsed
-            .player_snapshots
-            .iter()
-            .all(|snapshot| snapshot.phase == SnapshotPhase::AfterEventPacket));
+        assert!(
+            parsed
+                .player_snapshots
+                .iter()
+                .all(|snapshot| snapshot.phase == SnapshotPhase::AfterEventPacket)
+        );
         assert!(parsed.player_snapshots.iter().all(|snapshot| {
             parsed
                 .participants
@@ -1113,18 +1501,22 @@ mod tests {
             snapshot_ticks_without_events.is_empty(),
             "snapshot ticks without requested events: {snapshot_ticks_without_events:?}"
         );
-        assert!(parsed
-            .events
-            .windows(2)
-            .any(|events| events[0].tick == events[1].tick));
+        assert!(
+            parsed
+                .events
+                .windows(2)
+                .any(|events| events[0].tick == events[1].tick)
+        );
         assert!(parsed.events.windows(2).all(|events| {
             events[0].tick != events[1].tick
                 || events[0].ingestion_ordinal < events[1].ingestion_ordinal
         }));
-        assert!(parsed
-            .player_snapshots
-            .windows(2)
-            .all(|snapshots| snapshots[0].ingestion_ordinal < snapshots[1].ingestion_ordinal));
+        assert!(
+            parsed
+                .player_snapshots
+                .windows(2)
+                .all(|snapshots| snapshots[0].ingestion_ordinal < snapshots[1].ingestion_ordinal)
+        );
         assert!(
             parsed.metadata.tick_rate.is_some()
                 || parsed.metadata.tick_rate_unavailable_reason.is_some()
@@ -1136,14 +1528,14 @@ mod tests {
         assert_eq!(parsed.identity.formula_version, "ofr-1.0.0");
         assert!(
             parsed
-                .events
+                .receipts
                 .iter()
-                .any(|e| e.name == "player_death" && !e.fields.is_empty())
+                .any(|receipt| receipt.event_name == "player_death" && !receipt.fields.is_empty())
         );
         let ordinals: Vec<u64> = parsed
             .receipts
             .iter()
-            .map(|r| r.ingestion_ordinal)
+            .map(|r| r.ingestion_ordinal.get())
             .collect();
         assert!(ordinals.windows(2).all(|w| w[0] < w[1]));
         let reparsed =

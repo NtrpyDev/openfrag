@@ -279,7 +279,7 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
         };
         if is_new {
             for participant in &parsed.participants {
-                let steam_id = participant.steam_id.to_string();
+                let steam_id = participant.steam_id.get().to_string();
                 self.storage
                     .upsert_player(&steam_id, participant.name.as_deref())
                     .map_err(storage_error)?;
@@ -339,12 +339,12 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
         reason: &AnalysisUnavailable,
     ) -> Result<(), PipelineError> {
         for round in &parsed.rounds {
-            let winner = normalize_winner(round.winner.as_deref());
+            let winner = normalize_winner(round.winner);
             self.storage
                 .add_round(
                     run,
-                    i64::try_from(round.number).map_err(|_| PipelineError::Size)?,
-                    i64::from(round.end_tick),
+                    i64::try_from(round.number.get()).map_err(|_| PipelineError::Size)?,
+                    i64::from(round.end_tick.get()),
                     winner,
                 )
                 .map_err(storage_error)?;
@@ -546,10 +546,10 @@ fn validate_source(path: &Path, layout: &Layout) -> Result<fs::Metadata, Pipelin
 fn storage_error(error: openfrag_storage::Error) -> PipelineError {
     PipelineError::Storage(format!("{error:?}"))
 }
-fn normalize_winner(winner: Option<&str>) -> Option<&'static str> {
+fn normalize_winner(winner: Option<i32>) -> Option<&'static str> {
     match winner {
-        Some("2" | "T") => Some("T"),
-        Some("3" | "CT") => Some("CT"),
+        Some(2) => Some("T"),
+        Some(3) => Some("CT"),
         _ => None,
     }
 }

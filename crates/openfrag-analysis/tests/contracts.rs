@@ -4,8 +4,8 @@ use openfrag_domain::{
     RatingStatus, ReceiptEvidenceSet,
 };
 use openfrag_import::{
-    CalculationIdentity as ImportIdentity, DemoMetadata, EventReceipt, ParsedEvent, ParsedOutput,
-    ParsedRound, Participant, PlayerSnapshot, SnapshotPhase,
+    CalculationIdentity as ImportIdentity, DemoMetadata, EventReceipt, NormalizedEvent,
+    ParsedEvent, ParsedOutput, ParsedRound, Participant, PlayerSnapshot, SnapshotPhase, SteamId,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -58,16 +58,7 @@ fn event(name: &str, tick: i32, ordinal: u64, fields: &[(&str, Value)]) -> Parse
         .iter()
         .map(|(name, value)| ((*name).into(), value.clone()))
         .collect::<BTreeMap<_, _>>();
-    ParsedEvent {
-        name: name.into(),
-        tick,
-        ingestion_ordinal: ordinal,
-        fields: raw_fields
-            .iter()
-            .map(|(name, value)| (name.clone(), value.to_string()))
-            .collect(),
-        raw_fields,
-    }
+    ParsedEvent::from_raw(name, tick, ordinal, &raw_fields).expect("fixture event must normalize")
 }
 
 #[allow(clippy::too_many_lines)]
@@ -78,12 +69,12 @@ fn golden_parsed_output() -> ParsedOutput {
     let participants = mates
         .iter()
         .map(|id| Participant {
-            steam_id: *id,
+            steam_id: (*id).into(),
             name: None,
             team: Some(2),
         })
         .chain(enemies.iter().map(|id| Participant {
-            steam_id: *id,
+            steam_id: (*id).into(),
             name: None,
             team: Some(3),
         }))
@@ -97,8 +88,8 @@ fn golden_parsed_output() -> ParsedOutput {
         let base = round * 1_000;
         for participant in &participants {
             snapshots.push(PlayerSnapshot {
-                tick: base + 10,
-                ingestion_ordinal: snapshot_ordinal,
+                tick: (base + 10).into(),
+                ingestion_ordinal: snapshot_ordinal.into(),
                 phase: SnapshotPhase::RequestedTick,
                 steam_id: participant.steam_id,
                 entity_id: None,
@@ -107,7 +98,6 @@ fn golden_parsed_output() -> ParsedOutput {
                 alive: Some(true),
                 life_state: Some(0),
                 round_counter: Some(round),
-                raw_properties: BTreeMap::new(),
             });
             snapshot_ordinal += 1;
         }
@@ -225,11 +215,11 @@ fn golden_parsed_output() -> ParsedOutput {
             ));
             event_ordinal += 1;
             for participant in &participants {
-                let alive =
-                    participant.steam_id == local || enemies.contains(&participant.steam_id);
+                let alive = participant.steam_id.get() == local
+                    || enemies.contains(&participant.steam_id.get());
                 snapshots.push(PlayerSnapshot {
-                    tick: base + 50,
-                    ingestion_ordinal: snapshot_ordinal,
+                    tick: (base + 50).into(),
+                    ingestion_ordinal: snapshot_ordinal.into(),
                     phase: SnapshotPhase::RequestedTick,
                     steam_id: participant.steam_id,
                     entity_id: None,
@@ -238,7 +228,6 @@ fn golden_parsed_output() -> ParsedOutput {
                     alive: Some(alive),
                     life_state: Some(i32::from(!alive)),
                     round_counter: Some(round),
-                    raw_properties: BTreeMap::new(),
                 });
                 snapshot_ordinal += 1;
             }
@@ -253,8 +242,8 @@ fn golden_parsed_output() -> ParsedOutput {
         event_ordinal += 1;
         for participant in &participants {
             snapshots.push(PlayerSnapshot {
-                tick: base + 90,
-                ingestion_ordinal: snapshot_ordinal,
+                tick: (base + 90).into(),
+                ingestion_ordinal: snapshot_ordinal.into(),
                 phase: SnapshotPhase::RequestedTick,
                 steam_id: participant.steam_id,
                 entity_id: None,
@@ -263,29 +252,28 @@ fn golden_parsed_output() -> ParsedOutput {
                 alive: Some(true),
                 life_state: Some(0),
                 round_counter: Some(round + 1),
-                raw_properties: BTreeMap::new(),
             });
             snapshot_ordinal += 1;
         }
         rounds.push(ParsedRound {
-            number: u64::try_from(round + 1).unwrap(),
-            end_tick: base + 90,
-            winner: Some(winner.to_string()),
+            number: u64::try_from(round + 1).unwrap().into(),
+            end_tick: (base + 90).into(),
+            winner: Some(winner),
         });
     }
     events.sort_by_key(|event| (event.tick, event.ingestion_ordinal));
     for (ordinal, event) in events.iter_mut().enumerate() {
-        event.ingestion_ordinal = ordinal as u64;
+        event.ingestion_ordinal = (ordinal as u64).into();
     }
     let receipts = events
         .iter()
         .map(|event| EventReceipt {
             ingestion_ordinal: event.ingestion_ordinal,
-            event_name: event.name.clone(),
+            event_name: event.name().into(),
             tick: event.tick,
-            fields: event.fields.clone(),
-            raw_fields: event.raw_fields.clone(),
-            evidence_sha256: format!("fixture-{:04}", event.ingestion_ordinal),
+            fields: BTreeMap::new(),
+            raw_fields: BTreeMap::new(),
+            evidence_sha256: format!("fixture-{:04}", event.ingestion_ordinal.get()),
         })
         .collect();
     ParsedOutput {
@@ -348,18 +336,18 @@ fn resequence(parsed: &mut ParsedOutput) {
         .events
         .sort_by_key(|event| (event.tick, event.ingestion_ordinal));
     for (ordinal, event) in parsed.events.iter_mut().enumerate() {
-        event.ingestion_ordinal = ordinal as u64;
+        event.ingestion_ordinal = (ordinal as u64).into();
     }
     parsed.receipts = parsed
         .events
         .iter()
         .map(|event| EventReceipt {
             ingestion_ordinal: event.ingestion_ordinal,
-            event_name: event.name.clone(),
+            event_name: event.name().into(),
             tick: event.tick,
-            fields: event.fields.clone(),
-            raw_fields: event.raw_fields.clone(),
-            evidence_sha256: format!("fixture-{:04}", event.ingestion_ordinal),
+            fields: BTreeMap::new(),
+            raw_fields: BTreeMap::new(),
+            evidence_sha256: format!("fixture-{:04}", event.ingestion_ordinal.get()),
         })
         .collect();
 }
@@ -370,7 +358,7 @@ fn duplicate_or_missing_round_end_is_rejected() {
     let end = duplicate
         .events
         .iter()
-        .find(|event| event.name == "round_end")
+        .find(|event| event.name() == "round_end")
         .unwrap()
         .clone();
     duplicate.events.push(end);
@@ -383,7 +371,7 @@ fn duplicate_or_missing_round_end_is_rejected() {
     let index = missing
         .events
         .iter()
-        .position(|event| event.name == "round_end")
+        .position(|event| event.name() == "round_end")
         .unwrap();
     missing.events.remove(index);
     resequence(&mut missing);
@@ -396,11 +384,11 @@ fn duplicate_or_missing_round_end_is_rejected() {
 #[test]
 fn stale_freeze_identity_snapshot_is_not_guessed() {
     let mut parsed = golden_parsed_output();
-    parsed
-        .player_snapshots
-        .retain(|snapshot| !(snapshot.steam_id == 76_561_198_000_000_001 && snapshot.tick == 10));
+    parsed.player_snapshots.retain(|snapshot| {
+        !(snapshot.steam_id.get() == 76_561_198_000_000_001 && snapshot.tick.get() == 10)
+    });
     for (ordinal, snapshot) in parsed.player_snapshots.iter_mut().enumerate() {
-        snapshot.ingestion_ordinal = ordinal as u64;
+        snapshot.ingestion_ordinal = (ordinal as u64).into();
     }
     let error =
         analyze(&parsed, 76_561_198_000_000_001).expect_err("stale state must exclude, not guess");
@@ -416,16 +404,19 @@ fn excess_damage_is_capped_and_team_self_world_damage_do_not_score() {
     let hurt = parsed
         .events
         .iter_mut()
-        .find(|event| event.name == "player_hurt")
+        .find(|event| event.name() == "player_hurt")
         .unwrap();
-    hurt.raw_fields.insert("dmg_health".into(), json!(200));
+    let NormalizedEvent::PlayerHurt(hurt_event) = &mut hurt.event else {
+        unreachable!();
+    };
+    hurt_event.damage_health = Some(200);
     let tick = hurt.tick;
     let ordinal = hurt.ingestion_ordinal;
     for attacker in [2_u64, 76_561_198_000_000_001, 0] {
         parsed.events.push(event(
             "player_hurt",
-            tick + 1,
-            ordinal + attacker,
+            tick.get() + 1,
+            ordinal.get() + attacker,
             &[
                 ("attacker_steamid", json!(attacker.to_string())),
                 ("user_steamid", json!(2_u64.to_string())),
@@ -448,13 +439,13 @@ fn trade_window_includes_exactly_five_seconds_and_excludes_over() {
     let deaths = over
         .events
         .iter_mut()
-        .filter(|event| event.name == "player_death" && event.tick / 1_000 == 5)
+        .filter(|event| event.name() == "player_death" && event.tick.get() / 1_000 == 5)
         .collect::<Vec<_>>();
     let local_kill = deaths
         .into_iter()
-        .find(|event| event.attacker() == Some(76_561_198_000_000_001))
+        .find(|event| event.attacker() == Some(SteamId::new(76_561_198_000_000_001)))
         .unwrap();
-    local_kill.tick += 321;
+    local_kill.tick = (local_kill.tick.get() + 321).into();
     resequence(&mut over);
     let analysis = analyze(&over, 76_561_198_000_000_001).unwrap();
     assert_eq!(analysis.rating_input.metrics.trade_kills, 3);
@@ -466,11 +457,14 @@ fn flash_assist_requires_teammate_attribution() {
     let flash = parsed
         .events
         .iter_mut()
-        .find(|event| event.assisted_flash() == Some(true))
+        .find(|event| {
+            matches!(&event.event, NormalizedEvent::PlayerDeath(death) if death.assisted_flash)
+        })
         .unwrap();
-    flash
-        .raw_fields
-        .insert("attacker_steamid".into(), json!(11_u64.to_string()));
+    let NormalizedEvent::PlayerDeath(flash_event) = &mut flash.event else {
+        unreachable!();
+    };
+    flash_event.attacker = Some(SteamId::new(11));
     assert_eq!(
         analyze(&parsed, 76_561_198_000_000_001),
         Err(AnalysisUnavailable::MalformedEvidence)
@@ -483,7 +477,7 @@ fn same_tick_deaths_use_ingestion_order_for_the_opening_duel() {
     let first_round_deaths = parsed
         .events
         .iter_mut()
-        .filter(|event| event.name == "player_death" && event.tick < 1_000)
+        .filter(|event| event.name() == "player_death" && event.tick.get() < 1_000)
         .collect::<Vec<_>>();
     let tick = first_round_deaths[0].tick;
     for death in first_round_deaths {
@@ -502,9 +496,12 @@ fn every_v1_utility_weapon_is_classified_as_utility() {
         let hurt = parsed
             .events
             .iter_mut()
-            .find(|event| event.name == "player_hurt" && event.weapon() == Some("ak47"))
+            .find(|event| event.name() == "player_hurt" && event.weapon() == Some("ak47"))
             .unwrap();
-        hurt.raw_fields.insert("weapon".into(), json!(weapon));
+        let NormalizedEvent::PlayerHurt(hurt_event) = &mut hurt.event else {
+            unreachable!();
+        };
+        hurt_event.weapon = Some(weapon.into());
         let analysis = analyze(&parsed, 76_561_198_000_000_001).unwrap();
         assert_eq!(analysis.rating_input.metrics.direct_damage, 1_520);
         assert_eq!(analysis.rating_input.metrics.utility_damage, 380);
@@ -537,23 +534,22 @@ fn disconnect_transition_and_post_death_bomb_win_preserve_clutch_conversion() {
     ));
     let ordinal = parsed.player_snapshots.len() as u64;
     parsed.player_snapshots.push(PlayerSnapshot {
-        tick: base + 60,
-        ingestion_ordinal: ordinal,
+        tick: (base + 60).into(),
+        ingestion_ordinal: ordinal.into(),
         phase: SnapshotPhase::RequestedTick,
-        steam_id: 76_561_198_000_000_001,
+        steam_id: 76_561_198_000_000_001.into(),
         entity_id: None,
         team: Some(2),
         health: Some(0),
         alive: Some(false),
         life_state: Some(1),
         round_counter: Some(18),
-        raw_properties: BTreeMap::new(),
     });
     parsed
         .player_snapshots
         .sort_by_key(|snapshot| (snapshot.tick, snapshot.ingestion_ordinal));
     for (ordinal, snapshot) in parsed.player_snapshots.iter_mut().enumerate() {
-        snapshot.ingestion_ordinal = ordinal as u64;
+        snapshot.ingestion_ordinal = (ordinal as u64).into();
     }
     resequence(&mut parsed);
     let analysis = analyze(&parsed, 76_561_198_000_000_001).unwrap();

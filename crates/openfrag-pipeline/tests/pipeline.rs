@@ -78,7 +78,7 @@ fn auto_candidate(id: &str, round: Option<u64>) -> ReconciliationCandidate {
 fn fixture_output() -> ParsedOutput {
     let mut parsed = openfrag_analysis::fixtures::minimal_parsed_output_without_tick_rate();
     parsed.participants.push(Participant {
-        steam_id: 76_561_197_964_020_430,
+        steam_id: 76_561_197_964_020_430.into(),
         name: Some("local".into()),
         team: Some(2),
     });
@@ -91,7 +91,7 @@ fn available_output() -> ParsedOutput {
     let local = 76_561_197_964_020_430_u64;
     let participants = (0_u64..10)
         .map(|index| Participant {
-            steam_id: if index == 0 { local } else { local + index },
+            steam_id: (if index == 0 { local } else { local + index }).into(),
             name: Some(format!("p{index}")),
             team: Some(if index < 5 { 2 } else { 3 }),
         })
@@ -105,8 +105,8 @@ fn available_output() -> ParsedOutput {
         let base = round * 1_000;
         for participant in &participants {
             snapshots.push(PlayerSnapshot {
-                tick: base + 10,
-                ingestion_ordinal: snapshot_ordinal,
+                tick: (base + 10).into(),
+                ingestion_ordinal: snapshot_ordinal.into(),
                 phase: SnapshotPhase::RequestedTick,
                 steam_id: participant.steam_id,
                 entity_id: None,
@@ -115,21 +115,14 @@ fn available_output() -> ParsedOutput {
                 alive: Some(true),
                 life_state: Some(0),
                 round_counter: Some(round),
-                raw_properties: BTreeMap::new(),
             });
             snapshot_ordinal += 1;
         }
         let mut push = |name: &str, tick: i32, raw_fields: BTreeMap<String, serde_json::Value>| {
-            events.push(ParsedEvent {
-                name: name.into(),
-                tick,
-                ingestion_ordinal: ordinal,
-                fields: raw_fields
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.to_string()))
-                    .collect(),
-                raw_fields,
-            });
+            events.push(
+                ParsedEvent::from_raw(name, tick, ordinal, &raw_fields)
+                    .expect("fixture event must normalize"),
+            );
             ordinal += 1;
         };
         push(
@@ -164,8 +157,8 @@ fn available_output() -> ParsedOutput {
         );
         for participant in &participants {
             snapshots.push(PlayerSnapshot {
-                tick: base + 90,
-                ingestion_ordinal: snapshot_ordinal,
+                tick: (base + 90).into(),
+                ingestion_ordinal: snapshot_ordinal.into(),
                 phase: SnapshotPhase::RequestedTick,
                 steam_id: participant.steam_id,
                 entity_id: None,
@@ -174,25 +167,24 @@ fn available_output() -> ParsedOutput {
                 alive: Some(true),
                 life_state: Some(0),
                 round_counter: Some(round + 1),
-                raw_properties: BTreeMap::new(),
             });
             snapshot_ordinal += 1;
         }
         rounds.push(ParsedRound {
-            number: u64::try_from(round + 1).unwrap(),
-            end_tick: base + 90,
-            winner: Some("2".into()),
+            number: u64::try_from(round + 1).unwrap().into(),
+            end_tick: (base + 90).into(),
+            winner: Some(2),
         });
     }
     let receipts = events
         .iter()
         .map(|event| EventReceipt {
             ingestion_ordinal: event.ingestion_ordinal,
-            event_name: event.name.clone(),
+            event_name: event.name().into(),
             tick: event.tick,
-            fields: event.fields.clone(),
-            raw_fields: event.raw_fields.clone(),
-            evidence_sha256: format!("evidence-{:04}", event.ingestion_ordinal),
+            fields: BTreeMap::new(),
+            raw_fields: BTreeMap::new(),
+            evidence_sha256: format!("evidence-{:04}", event.ingestion_ordinal.get()),
         })
         .collect();
     ParsedOutput {

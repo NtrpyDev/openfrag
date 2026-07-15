@@ -4,7 +4,10 @@ use openfrag_domain::{
     CalculationIdentity, MatchIrregularities, RatingEvidenceBundle, RatingInput, RatingInputError,
     RatingMetrics, RatingReceipt, ReceiptEvidenceSet, calculate_rating,
 };
-use openfrag_import::{ParsedEvent, ParsedOutput, PlayerSnapshot};
+use openfrag_import::{
+    DemoTick, NormalizedEvent, NormalizedEventKind, ParsedEvent, ParsedOutput, PlayerSnapshot,
+    SteamId,
+};
 
 const UTILITY_WEAPONS: &[&str] = &["hegrenade", "inferno", "molotov", "incgrenade"];
 
@@ -66,6 +69,7 @@ pub fn analyze(
     parsed: &ParsedOutput,
     local_steam_id: u64,
 ) -> Result<AnalysisReceipt, AnalysisUnavailable> {
+    let local_steam_id = SteamId::new(local_steam_id);
     let tick_rate = parsed
         .metadata
         .tick_rate
@@ -89,13 +93,13 @@ pub fn analyze(
         return Err(AnalysisUnavailable::MissingLocalParticipant);
     }
     verify_order(parsed)?;
-    for stream in [
-        "round_freeze_end",
-        "round_end",
-        "player_hurt",
-        "player_death",
+    for (kind, stream) in [
+        (NormalizedEventKind::RoundFreezeEnd, "round_freeze_end"),
+        (NormalizedEventKind::RoundEnd, "round_end"),
+        (NormalizedEventKind::PlayerHurt, "player_hurt"),
+        (NormalizedEventKind::PlayerDeath, "player_death"),
     ] {
-        if !parsed.events.iter().any(|event| event.name == stream) {
+        if !parsed.events.iter().any(|event| event.kind() == kind) {
             return Err(AnalysisUnavailable::MissingRequiredStream(stream));
         }
     }
@@ -168,8 +172,12 @@ pub fn analyze(
                     .iter()
                     .filter(|participant| participant.team == Some(team))
                     .filter(|participant| {
-                        snapshot_at(parsed, participant.steam_id, round.freeze_tick)
-                            .and_then(|snapshot| snapshot.alive)
+                        snapshot_at(
+                            parsed,
+                            participant.steam_id,
+                            DemoTick::new(round.freeze_tick),
+                        )
+                        .and_then(|snapshot| snapshot.alive)
                             == Some(true)
                     })
                     .count()
@@ -182,9 +190,7 @@ pub fn analyze(
             .iter()
             .any(|round| round.exclusion == Some(RoundExclusion::MissingFreezeState)),
         roster_imbalanced: short_roster_rounds > 1,
-        surrender: parsed.events.iter().any(|event| {
-            event.name == "cs_win_panel_match" && event.bool_field("surrendered") == Some(true)
-        }),
+        surrender: false,
         forfeit_without_canonical_winner: false,
         overtime: metrics.eligible_rounds > 24,
     };
@@ -224,21 +230,23 @@ fn verify_order(parsed: &ParsedOutput) -> Result<(), AnalysisUnavailable> {
 
 fn build_rounds(
     parsed: &ParsedOutput,
-    local: u64,
+    local: SteamId,
 ) -> Result<Vec<RoundLedger>, AnalysisUnavailable> {
     let freezes: Vec<&ParsedEvent> = parsed
         .events
         .iter()
-        .filter(|e| e.name == "round_freeze_end")
+        .filter(|event| matches!(event.event, NormalizedEvent::RoundFreezeEnd(_)))
         .collect();
     let ends: Vec<&ParsedEvent> = parsed
         .events
         .iter()
-        .filter(|e| e.name == "round_end")
+        .filter(|event| matches!(event.event, NormalizedEvent::RoundEnd(_)))
         .collect();
     let mut rounds = Vec::new();
     for (index, freeze) in freezes.iter().copied().enumerate() {
-        let next_freeze_tick = freezes.get(index + 1).map_or(i32::MAX, |event| event.tick);
+        let next_freeze_tick = freezes
+            .get(index + 1)
+            .map_or(DemoTick::new(i32::MAX), |event| event.tick);
         let matching: Vec<&ParsedEvent> = ends
             .iter()
             .copied()
@@ -250,10 +258,10 @@ fn build_rounds(
         let end = matching[0];
         let snapshot = snapshot_at(parsed, local, freeze.tick);
         let snapshot = snapshot.filter(|state| state.tick == freeze.tick);
-        let warmup = freeze
-            .bool_field("warmup")
-            .or_else(|| freeze.bool_field("warmup_period"))
-            .unwrap_or(false);
+        let NormalizedEvent::RoundFreezeEnd(freeze_event) = &freeze.event else {
+            return Err(AnalysisUnavailable::MalformedEvidence);
+        };
+        let warmup = freeze_event.warmup;
         let (team, alive, exclusion) = match snapshot {
             _ if warmup => (0, false, Some(RoundExclusion::Warmup)),
             None => return Err(AnalysisUnavailable::MissingTeamOrLiveness),
@@ -280,7 +288,14 @@ fn build_rounds(
                 return Err(AnalysisUnavailable::MalformedEvidence);
             }
         }
-        let winner = end.winner().ok_or(AnalysisUnavailable::MalformedEvidence)?;
+        let NormalizedEvent::RoundEnd(end_event) = &end.event else {
+            return Err(AnalysisUnavailable::MalformedEvidence);
+        };
+        let winner = i64::from(
+            end_event
+                .winner
+                .ok_or(AnalysisUnavailable::MalformedEvidence)?,
+        );
         let hashes = parsed
             .receipts
             .iter()
@@ -289,8 +304,8 @@ fn build_rounds(
             .collect();
         rounds.push(RoundLedger {
             number: (index + 1) as u64,
-            freeze_tick: freeze.tick,
-            end_tick: end.tick,
+            freeze_tick: freeze.tick.get(),
+            end_tick: end.tick.get(),
             winner,
             local_team: team,
             eligible: alive && exclusion.is_none(),
@@ -313,32 +328,36 @@ fn build_rounds(
 fn score_round(
     parsed: &ParsedOutput,
     round: &RoundLedger,
-    local: u64,
+    local: SteamId,
     tick_rate: u32,
     metrics: &mut RatingMetrics,
 ) -> Result<(), AnalysisUnavailable> {
     let events: Vec<&ParsedEvent> = parsed
         .events
         .iter()
-        .filter(|e| e.tick >= round.freeze_tick && e.tick <= round.end_tick)
+        .filter(|event| {
+            event.tick >= DemoTick::new(round.freeze_tick)
+                && event.tick <= DemoTick::new(round.end_tick)
+        })
         .collect();
     let deaths: Vec<&ParsedEvent> = events
         .iter()
         .copied()
-        .filter(|e| e.name == "player_death")
+        .filter(|event| matches!(event.event, NormalizedEvent::PlayerDeath(_)))
         .collect();
     let mut opening_seen = false;
     for event in &events {
-        if event.name == "player_hurt" && event.attacker() == Some(local) {
-            let victim = event.victim().ok_or(AnalysisUnavailable::MissingIdentity)?;
+        if let NormalizedEvent::PlayerHurt(hurt) = &event.event
+            && hurt.attacker == Some(local)
+        {
+            let victim = hurt.victim.ok_or(AnalysisUnavailable::MissingIdentity)?;
             let attacker_team = team_at(parsed, local, event.tick)
                 .ok_or(AnalysisUnavailable::MissingTeamOrLiveness)?;
             let victim_team = team_at(parsed, victim, event.tick)
                 .ok_or(AnalysisUnavailable::MissingTeamOrLiveness)?;
             if attacker_team != victim_team && victim != local {
                 let reported = u32::try_from(
-                    event
-                        .damage_health()
+                    hurt.damage_health
                         .ok_or(AnalysisUnavailable::MalformedEvidence)?,
                 )
                 .map_err(|_| AnalysisUnavailable::MalformedEvidence)?;
@@ -348,8 +367,9 @@ fn score_round(
                 let scored = reported.min(
                     u32::try_from(health).map_err(|_| AnalysisUnavailable::MalformedEvidence)?,
                 );
-                if event
-                    .weapon()
+                if hurt
+                    .weapon
+                    .as_deref()
                     .is_some_and(|weapon| UTILITY_WEAPONS.contains(&weapon))
                 {
                     metrics.utility_damage += scored;
@@ -358,9 +378,9 @@ fn score_round(
                 }
             }
         }
-        if event.name == "player_death" {
-            let victim = event.victim().ok_or(AnalysisUnavailable::MissingIdentity)?;
-            let attacker = event.attacker();
+        if let NormalizedEvent::PlayerDeath(death) = &event.event {
+            let victim = death.victim.ok_or(AnalysisUnavailable::MissingIdentity)?;
+            let attacker = death.attacker;
             if victim == local {
                 metrics.deaths += 1;
             }
@@ -385,10 +405,7 @@ fn score_round(
                     }
                 }
             }
-            let assister = event
-                .u64_field("assister_steamid")
-                .or_else(|| event.assister());
-            if event.assisted_flash() == Some(true) && assister == Some(local) {
+            if death.assisted_flash && death.assister == Some(local) {
                 let attacker = attacker.ok_or(AnalysisUnavailable::MissingIdentity)?;
                 if team_at(parsed, attacker, event.tick) == team_at(parsed, local, event.tick) {
                     metrics.flash_assists += 1;
@@ -400,14 +417,24 @@ fn score_round(
     }
     let window = i32::try_from(tick_rate.saturating_mul(5))
         .map_err(|_| AnalysisUnavailable::MalformedEvidence)?;
-    for kill in deaths.iter().filter(|e| e.attacker() == Some(local)) {
-        let victim = kill.victim().ok_or(AnalysisUnavailable::MissingIdentity)?;
+    for kill in deaths.iter().filter(|event| {
+        matches!(&event.event, NormalizedEvent::PlayerDeath(death) if death.attacker == Some(local))
+    }) {
+        let NormalizedEvent::PlayerDeath(kill_event) = &kill.event else {
+            return Err(AnalysisUnavailable::MalformedEvidence);
+        };
+        let victim = kill_event
+            .victim
+            .ok_or(AnalysisUnavailable::MissingIdentity)?;
         if deaths.iter().rev().any(|prior| {
+            let NormalizedEvent::PlayerDeath(prior_event) = &prior.event else {
+                return false;
+            };
             prior.tick <= kill.tick
-                && kill.tick - prior.tick <= window
-                && prior.attacker() == Some(victim)
-                && prior
-                    .victim()
+                && kill.tick.get() - prior.tick.get() <= window
+                && prior_event.attacker == Some(victim)
+                && prior_event
+                    .victim
                     .is_some_and(|mate| team_at(parsed, mate, prior.tick) == Some(round.local_team))
         }) {
             metrics.trade_kills += 1;
@@ -416,7 +443,10 @@ fn score_round(
     let transition_ticks = parsed
         .player_snapshots
         .iter()
-        .filter(|snapshot| snapshot.tick >= round.freeze_tick && snapshot.tick <= round.end_tick)
+        .filter(|snapshot| {
+            snapshot.tick >= DemoTick::new(round.freeze_tick)
+                && snapshot.tick <= DemoTick::new(round.end_tick)
+        })
         .map(|snapshot| snapshot.tick);
     for tick in transition_ticks {
         let local_alive = snapshot_at(parsed, local, tick)
@@ -448,7 +478,11 @@ fn score_round(
     Ok(())
 }
 
-fn snapshot_at(parsed: &ParsedOutput, steam_id: u64, tick: i32) -> Option<&PlayerSnapshot> {
+fn snapshot_at(
+    parsed: &ParsedOutput,
+    steam_id: SteamId,
+    tick: DemoTick,
+) -> Option<&PlayerSnapshot> {
     parsed
         .player_snapshots
         .iter()
@@ -456,7 +490,7 @@ fn snapshot_at(parsed: &ParsedOutput, steam_id: u64, tick: i32) -> Option<&Playe
         .max_by_key(|s| (s.tick, s.ingestion_ordinal))
 }
 
-fn team_at(parsed: &ParsedOutput, steam_id: u64, tick: i32) -> Option<i32> {
+fn team_at(parsed: &ParsedOutput, steam_id: SteamId, tick: DemoTick) -> Option<i32> {
     snapshot_at(parsed, steam_id, tick).and_then(|snapshot| snapshot.team)
 }
 

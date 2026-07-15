@@ -1,5 +1,7 @@
 use openfrag_domain::{DemoHighlightEvidence, FinalHighlightLabel, final_labels};
-use openfrag_import::{ParsedOutput, PlayerSnapshot};
+use openfrag_import::{
+    DemoTick, NormalizedEvent, ParsedOutput, PlayerSnapshot, RoundNumber, SteamId,
+};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +99,7 @@ fn evaluate(
     local: u64,
     candidate: &ReconciliationCandidate,
 ) -> ReconciliationDisposition {
+    let local = SteamId::new(local);
     if candidate.origin == CandidateOrigin::ManualFlag {
         return ReconciliationDisposition::ManualIndependent;
     }
@@ -108,7 +111,7 @@ fn evaluate(
     let matching_rounds = parsed
         .rounds
         .iter()
-        .filter(|round| round.number == round_number)
+        .filter(|round| round.number == RoundNumber::new(round_number))
         .collect::<Vec<_>>();
     let [round] = matching_rounds.as_slice() else {
         return ReconciliationDisposition::EvidenceUnavailable(
@@ -118,20 +121,22 @@ fn evaluate(
     let previous_end = parsed
         .rounds
         .iter()
-        .filter(|other| other.number < round_number)
+        .filter(|other| other.number < RoundNumber::new(round_number))
         .map(|other| other.end_tick)
         .max()
-        .unwrap_or(i32::MIN);
+        .unwrap_or(DemoTick::new(i32::MIN));
     let mut enemy_kills = 0_u8;
     let mut enemy_knife_kill = false;
     let mut partial = None;
     for death in parsed.events.iter().filter(|event| {
-        event.name == "player_death"
+        matches!(&event.event, NormalizedEvent::PlayerDeath(death) if death.attacker == Some(local))
             && event.tick > previous_end
             && event.tick <= round.end_tick
-            && event.attacker() == Some(local)
     }) {
-        let Some(victim) = death.victim() else {
+        let NormalizedEvent::PlayerDeath(death_event) = &death.event else {
+            continue;
+        };
+        let Some(victim) = death_event.victim else {
             partial.get_or_insert(UnavailableEvidence::VictimIdentityOrTeam);
             continue;
         };
@@ -145,7 +150,7 @@ fn evaluate(
             continue;
         }
         enemy_kills = enemy_kills.saturating_add(1);
-        match death.weapon() {
+        match death_event.weapon.as_deref() {
             Some(weapon) => enemy_knife_kill |= is_knife(weapon),
             None => {
                 partial.get_or_insert(UnavailableEvidence::KillWeapon);
@@ -161,8 +166,7 @@ fn evaluate(
         }
     };
     let team_won_round = if clutch_opponents_at_start.is_some() {
-        if let Some((local_team, winner)) = team_at(parsed, local, round.end_tick)
-            .zip(round.winner.as_deref().and_then(winner_team))
+        if let Some((local_team, winner)) = team_at(parsed, local, round.end_tick).zip(round.winner)
         {
             local_team == winner
         } else {
@@ -201,9 +205,9 @@ fn evaluate(
 
 fn clutch_opponents(
     parsed: &ParsedOutput,
-    local: u64,
-    start_tick: i32,
-    end_tick: i32,
+    local: SteamId,
+    start_tick: DemoTick,
+    end_tick: DemoTick,
 ) -> Result<Option<u8>, UnavailableEvidence> {
     let ticks = parsed
         .player_snapshots
@@ -246,7 +250,11 @@ fn clutch_opponents(
     Ok(None)
 }
 
-fn snapshot_at(parsed: &ParsedOutput, steam_id: u64, tick: i32) -> Option<&PlayerSnapshot> {
+fn snapshot_at(
+    parsed: &ParsedOutput,
+    steam_id: SteamId,
+    tick: DemoTick,
+) -> Option<&PlayerSnapshot> {
     parsed
         .player_snapshots
         .iter()
@@ -254,7 +262,7 @@ fn snapshot_at(parsed: &ParsedOutput, steam_id: u64, tick: i32) -> Option<&Playe
         .max_by_key(|snapshot| (snapshot.tick, snapshot.ingestion_ordinal))
 }
 
-fn team_at(parsed: &ParsedOutput, steam_id: u64, tick: i32) -> Option<i32> {
+fn team_at(parsed: &ParsedOutput, steam_id: SteamId, tick: DemoTick) -> Option<i32> {
     snapshot_at(parsed, steam_id, tick)
         .and_then(|snapshot| snapshot.team)
         .or_else(|| {
@@ -264,14 +272,6 @@ fn team_at(parsed: &ParsedOutput, steam_id: u64, tick: i32) -> Option<i32> {
                 .find(|participant| participant.steam_id == steam_id)
                 .and_then(|participant| participant.team)
         })
-}
-
-fn winner_team(value: &str) -> Option<i32> {
-    match value {
-        "2" | "T" => Some(2),
-        "3" | "CT" => Some(3),
-        _ => None,
-    }
 }
 
 fn is_knife(weapon: &str) -> bool {
@@ -327,47 +327,49 @@ mod tests {
             if let Some(weapon) = weapon {
                 raw_fields.insert("weapon".into(), Value::String(weapon.into()));
             }
-            events.push(ParsedEvent {
-                name: "player_death".into(),
-                tick: 20 + i32::try_from(index).unwrap(),
-                ingestion_ordinal: u64::try_from(index).unwrap(),
-                fields: BTreeMap::new(),
-                raw_fields,
-            });
+            events.push(
+                ParsedEvent::from_raw(
+                    "player_death",
+                    20 + i32::try_from(index).unwrap(),
+                    u64::try_from(index).unwrap(),
+                    &raw_fields,
+                )
+                .unwrap(),
+            );
         }
         let participants = vec![
             Participant {
-                steam_id: 10,
+                steam_id: 10.into(),
                 name: None,
                 team: Some(2),
             },
             Participant {
-                steam_id: 11,
+                steam_id: 11.into(),
                 name: None,
                 team: Some(2),
             },
             Participant {
-                steam_id: 20,
+                steam_id: 20.into(),
                 name: None,
                 team: Some(3),
             },
             Participant {
-                steam_id: 21,
+                steam_id: 21.into(),
                 name: None,
                 team: Some(3),
             },
             Participant {
-                steam_id: 22,
+                steam_id: 22.into(),
                 name: None,
                 team: Some(3),
             },
             Participant {
-                steam_id: 23,
+                steam_id: 23.into(),
                 name: None,
                 team: Some(3),
             },
             Participant {
-                steam_id: 24,
+                steam_id: 24.into(),
                 name: None,
                 team: Some(3),
             },
@@ -375,13 +377,13 @@ mod tests {
         let mut player_snapshots = Vec::new();
         for participant in &participants {
             let alive = if clutch {
-                participant.steam_id == 10 || matches!(participant.steam_id, 20 | 21)
+                participant.steam_id.get() == 10 || matches!(participant.steam_id.get(), 20 | 21)
             } else {
                 true
             };
             player_snapshots.push(PlayerSnapshot {
-                tick: 10,
-                ingestion_ordinal: participant.steam_id,
+                tick: 10.into(),
+                ingestion_ordinal: participant.steam_id.get().into(),
                 phase: SnapshotPhase::RequestedTick,
                 steam_id: participant.steam_id,
                 entity_id: None,
@@ -390,7 +392,6 @@ mod tests {
                 alive: Some(alive),
                 life_state: Some(i32::from(!alive)),
                 round_counter: Some(1),
-                raw_properties: BTreeMap::new(),
             });
         }
         ParsedOutput {
@@ -405,9 +406,9 @@ mod tests {
             },
             participants,
             rounds: vec![ParsedRound {
-                number: 1,
-                end_tick: 100,
-                winner: Some("T".into()),
+                number: 1.into(),
+                end_tick: 100.into(),
+                winner: Some(2),
             }],
             events,
             receipts: vec![],
