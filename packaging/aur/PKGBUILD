@@ -1,0 +1,44 @@
+# Maintainer: NtrpyDev <ntrpydev@users.noreply.github.com>
+
+pkgname=openfrag
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='Local CS2 demo analysis and highlight capture dashboard'
+arch=('x86_64')
+url='https://github.com/NtrpyDev/openfrag'
+license=('GPL-3.0-only')
+depends=('bash' 'ffmpeg' 'systemd' 'xdg-utils')
+makedepends=('cargo' 'rust')
+checkdepends=('desktop-file-utils')
+optdepends=(
+    'gpu-screen-recorder: automatic highlight capture'
+    'steam: Counter-Strike 2 integration'
+)
+source=("${pkgname}-v${pkgver}-source.tar.gz::https://github.com/NtrpyDev/openfrag/releases/download/v${pkgver}/${pkgname}-v${pkgver}-source.tar.gz")
+sha256sums=('9e109aa1a2205613ff0607111903a13a8497333e3b28cef1ae359b3b314531e4')
+
+build() {
+    cd "${pkgname}-v${pkgver}-source"
+    cargo build --frozen --release -p openfragd
+}
+
+check() {
+    cd "${pkgname}-v${pkgver}-source"
+    cargo test --frozen -p openfragd
+    desktop-file-validate packaging/linux/io.github.ntrpydev.openfrag.desktop
+}
+
+package() {
+    cd "${pkgname}-v${pkgver}-source"
+    install -Dm0755 target/release/openfragd "$pkgdir/usr/bin/openfragd"
+    install -Dm0755 packaging/linux/openfrag-launch "$pkgdir/usr/bin/openfrag-launch"
+    install -Dm0644 packaging/linux/io.github.ntrpydev.openfrag.desktop \
+        "$pkgdir/usr/share/applications/io.github.ntrpydev.openfrag.desktop"
+    install -Dm0644 packaging/linux/app-io.github.ntrpydev.openfrag.service \
+        "$pkgdir/usr/lib/systemd/user/app-io.github.ntrpydev.openfrag.service"
+    sed -i 's|ExecStart=%h/.local/bin/openfragd|ExecStart=/usr/bin/openfragd|' \
+        "$pkgdir/usr/lib/systemd/user/app-io.github.ntrpydev.openfrag.service"
+    install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/openfrag/LICENSE"
+    install -Dm0644 packaging/linux/THIRD_PARTY_NOTICES.md \
+        "$pkgdir/usr/share/licenses/openfrag/THIRD_PARTY_NOTICES.md"
+}
