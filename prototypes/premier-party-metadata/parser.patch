@@ -1,0 +1,280 @@
+diff --git a/src/parser/src/bin/party_probe.rs b/src/parser/src/bin/party_probe.rs
+new file mode 100644
+index 0000000..fa6abe6
+--- /dev/null
++++ b/src/parser/src/bin/party_probe.rs
+@@ -0,0 +1,104 @@
++//! Throwaway openfrag probe for CS_UM_ServerRankRevealAll.
++
++use ahash::AHashMap;
++use memmap2::MmapOptions;
++use parser::first_pass::parser_settings::ParserInputs;
++use parser::parse_demo::{Parser, ParsingMode};
++use parser::second_pass::parser_settings::create_huffman_lookup_table;
++use parser::second_pass::parser_settings::{ServerRankRevealAllRecord, ServerRankRevealAllStatus};
++use std::collections::BTreeMap;
++use std::env;
++use std::fs::File;
++
++fn settings<'a>(huffman_lookup_table: &'a Vec<(u8, u8)>) -> ParserInputs<'a> {
++    ParserInputs {
++        real_name_to_og_name: AHashMap::default(),
++        wanted_players: vec![],
++        wanted_player_props: vec![],
++        wanted_other_props: vec![],
++        wanted_prop_states: AHashMap::default(),
++        wanted_ticks: vec![],
++        wanted_events: vec![],
++        parse_ents: false,
++        parse_projectiles: false,
++        parse_grenades: false,
++        only_header: false,
++        only_convars: false,
++        huffman_lookup_table,
++        order_by_steamid: false,
++        list_props: false,
++        fallback_bytes: None,
++    }
++}
++
++fn main() {
++    let demo_paths: Vec<String> = env::args().skip(1).collect();
++    if demo_paths.is_empty() {
++        eprintln!("usage: party_probe <demo.dem> [demo.dem ...]");
++        std::process::exit(2);
++    }
++
++    let huffman_lookup_table = create_huffman_lookup_table();
++    for demo_path in demo_paths {
++        println!("OPENFRAG_DEMO_BEGIN path={demo_path}");
++        let file = File::open(&demo_path).expect("open Demo");
++        let mmap = unsafe { MmapOptions::new().map(&file).expect("map Demo") };
++        let mut parser = Parser::new(settings(&huffman_lookup_table), ParsingMode::ForceSingleThreaded);
++        let output = parser.parse_demo(&mmap).expect("parse Demo");
++        if output.server_rank_reveal_all.is_empty() {
++            println!("message_350=absent");
++        } else {
++            for (index, record) in output.server_rank_reveal_all.iter().enumerate() {
++                print_record(index, record);
++            }
++        }
++        println!("OPENFRAG_DEMO_END path={demo_path}");
++    }
++}
++
++fn print_record(index: usize, record: &ServerRankRevealAllRecord) {
++    match &record.status {
++        ServerRankRevealAllStatus::Malformed => {
++            println!("message_350[{index}] tick={} status=malformed", record.tick);
++        }
++        ServerRankRevealAllStatus::MissingReservation => {
++            println!("message_350[{index}] tick={} status=missing_reservation", record.tick);
++        }
++        ServerRankRevealAllStatus::Present(reservation) => {
++            let mut labels = BTreeMap::new();
++            let mut next_label = 1_usize;
++            let redacted_parties: Vec<String> = reservation
++                .party_ids
++                .iter()
++                .map(|id| {
++                    if *id == 0 {
++                        "0".to_string()
++                    } else {
++                        let label = labels.entry(*id).or_insert_with(|| {
++                            let current = next_label;
++                            next_label += 1;
++                            current
++                        });
++                        format!("P{label}")
++                    }
++                })
++                .collect();
++            let account_zero_positions: Vec<usize> = reservation
++                .account_ids
++                .iter()
++                .enumerate()
++                .filter_map(|(position, id)| (*id == 0).then_some(position))
++                .collect();
++            println!(
++                "message_350[{index}] tick={} status=present seconds={:?} accounts={{len:{},zero_positions:{account_zero_positions:?}}} parties={{len:{},labels:{redacted_parties:?}}} teammate_colors={{len:{},values:{:?}}} game_type={:?}",
++                record.tick,
++                record.seconds_till_shutdown,
++                reservation.account_ids.len(),
++                reservation.party_ids.len(),
++                reservation.teammate_colors.len(),
++                reservation.teammate_colors,
++                reservation.game_type,
++            );
++        }
++    }
++}
+diff --git a/src/parser/src/parse_demo.rs b/src/parser/src/parse_demo.rs
+index 3a20303..3299caa 100644
+--- a/src/parser/src/parse_demo.rs
++++ b/src/parser/src/parse_demo.rs
+@@ -43,6 +43,7 @@ pub struct DemoOutput {
+     pub voice_data: Vec<(i32, CsvcMsgVoiceData)>,
+     pub prop_controller: PropController,
+     pub df_per_player: AHashMap<u64, AHashMap<u32, PropColumn>>,
++    pub server_rank_reveal_all: Vec<ServerRankRevealAllRecord>,
+ }
+ 
+ pub struct Parser<'a> {
+@@ -350,6 +351,7 @@ impl<'a> Parser<'a> {
+                 voice_data: output.voice_data,
+                 df_per_player: pp,
+                 uniq_prop_names: all_prop_names,
++                server_rank_reveal_all: output.server_rank_reveal_all,
+             };
+         }
+ 
+@@ -366,6 +368,7 @@ impl<'a> Parser<'a> {
+         let mut convars = AHashMap::default();
+         let mut projectiles = Vec::new();
+         let mut voice_data = Vec::new();
++        let mut server_rank_reveal_all = Vec::new();
+ 
+         for output in outputs {
+             dfs.push(output.df);
+@@ -391,6 +394,7 @@ impl<'a> Parser<'a> {
+             convars.extend(output.convars);
+             projectiles.extend(output.projectiles);
+             voice_data.extend(output.voice_data);
++            server_rank_reveal_all.extend(output.server_rank_reveal_all);
+         }
+ 
+         let all_dfs_combined = self.combine_dfs(dfs, false);
+@@ -408,6 +412,9 @@ impl<'a> Parser<'a> {
+             pp.insert(steamid, combined);
+         }
+ 
++        server_rank_reveal_all.sort_by_key(|record| record.tick);
++        server_rank_reveal_all.dedup();
++
+         DemoOutput {
+             prop_controller: prop_controller,
+             chat_messages,
+@@ -426,6 +433,7 @@ impl<'a> Parser<'a> {
+             voice_data,
+             df_per_player: pp,
+             uniq_prop_names: all_prop_names,
++            server_rank_reveal_all,
+         }
+     }
+ 
+diff --git a/src/parser/src/second_pass/parser.rs b/src/parser/src/second_pass/parser.rs
+index a1e65fc..5006c66 100644
+--- a/src/parser/src/second_pass/parser.rs
++++ b/src/parser/src/second_pass/parser.rs
+@@ -21,6 +21,7 @@ use csgoproto::message_type::NetMessageType::{self, *};
+ use csgoproto::CDemoFullPacket;
+ use csgoproto::CDemoPacket;
+ use csgoproto::CnetMsgTick;
++use csgoproto::CcsUsrMsgServerRankRevealAll;
+ use csgoproto::CsgoUserCmdPb;
+ use csgoproto::CsvcMsgServerInfo;
+ use csgoproto::CsvcMsgUserCommands;
+@@ -71,6 +72,7 @@ pub struct SecondPassOutput {
+     pub df_per_player: AHashMap<u64, AHashMap<u32, PropColumn>>,
+     pub entities: Vec<Option<Entity>>,
+     pub last_tick: i32,
++    pub server_rank_reveal_all: Vec<ServerRankRevealAllRecord>,
+ }
+ impl<'a> SecondPassParser<'a> {
+     pub fn start(&mut self, demo_bytes: &'a [u8]) -> Result<(), DemoParserError> {
+@@ -266,6 +268,7 @@ impl<'a> SecondPassParser<'a> {
+                 net_SetConVar => self.create_custom_event_parse_convars(msg_bytes),
+                 CS_UM_PlayerStatsUpdate => self.parse_player_stats_update(msg_bytes),
+                 CS_UM_ServerRankUpdate => self.create_custom_event_rank_update(msg_bytes),
++                CS_UM_ServerRankRevealAll => self.parse_server_rank_reveal_all(msg_bytes),
+                 net_Tick => self.parse_net_tick(msg_bytes),
+                 svc_ClearAllStringTables => self.clear_stringtables(),
+                 svc_VoiceData => self.parse_voice_data(msg_bytes),
+@@ -282,6 +285,29 @@ impl<'a> SecondPassParser<'a> {
+         }
+         Ok(())
+     }
++    fn parse_server_rank_reveal_all(&mut self, bytes: &[u8]) -> Result<(), DemoParserError> {
++        let (seconds_till_shutdown, status) = match CcsUsrMsgServerRankRevealAll::decode(bytes) {
++            Ok(message) => {
++                let status = match message.reservation {
++                    Some(reservation) => ServerRankRevealAllStatus::Present(ServerRankReservation {
++                        account_ids: reservation.account_ids,
++                        party_ids: reservation.party_ids,
++                        teammate_colors: reservation.teammate_colors,
++                        game_type: reservation.game_type,
++                    }),
++                    None => ServerRankRevealAllStatus::MissingReservation,
++                };
++                (message.seconds_till_shutdown, status)
++            }
++            Err(_) => (None, ServerRankRevealAllStatus::Malformed),
++        };
++        self.server_rank_reveal_all.push(ServerRankRevealAllRecord {
++            tick: self.tick,
++            seconds_till_shutdown,
++            status,
++        });
++        Ok(())
++    }
+     pub fn parse_user_cmd(&mut self, bytes: &[u8]) -> Result<(), DemoParserError> {
+         // We simply inject the values into the entities as if they came from packet_ents like any other val.
+ 
+diff --git a/src/parser/src/second_pass/parser_settings.rs b/src/parser/src/second_pass/parser_settings.rs
+index a2613a6..b19c97b 100644
+--- a/src/parser/src/second_pass/parser_settings.rs
++++ b/src/parser/src/second_pass/parser_settings.rs
+@@ -66,6 +66,7 @@ pub struct SecondPassParser<'a> {
+     pub convars: AHashMap<String, String>,
+     pub chat_messages: Vec<ChatMessageRecord>,
+     pub player_end_data: Vec<PlayerEndMetaData>,
++    pub server_rank_reveal_all: Vec<ServerRankRevealAllRecord>,
+     // Settings
+     pub wanted_events: Vec<String>,
+     pub parse_entities: bool,
+@@ -128,6 +129,28 @@ pub struct PlayerEndMetaData {
+     pub team_number: Option<i32>,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ServerRankReservation {
++    pub account_ids: Vec<u32>,
++    pub party_ids: Vec<u32>,
++    pub teammate_colors: Vec<i32>,
++    pub game_type: Option<u32>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ServerRankRevealAllStatus {
++    Malformed,
++    MissingReservation,
++    Present(ServerRankReservation),
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ServerRankRevealAllRecord {
++    pub tick: i32,
++    pub seconds_till_shutdown: Option<i32>,
++    pub status: ServerRankRevealAllStatus,
++}
++
+ impl<'a> SecondPassParser<'a> {
+     pub fn create_output(self) -> SecondPassOutput {
+         SecondPassOutput {
+@@ -157,6 +180,7 @@ impl<'a> SecondPassParser<'a> {
+             df_per_player: self.df_per_player,
+             entities: self.entities,
+             last_tick: self.tick,
++            server_rank_reveal_all: self.server_rank_reveal_all,
+         }
+     }
+     pub fn new(
+@@ -225,6 +249,7 @@ impl<'a> SecondPassParser<'a> {
+             item_drops: vec![],
+             skins: vec![],
+             player_end_data: vec![],
++            server_rank_reveal_all: vec![],
+             huffman_lookup_table: &first_pass_output.settings.huffman_lookup_table,
+             header: HashMap::default(),
+             list_props: first_pass_output.list_props,
+
