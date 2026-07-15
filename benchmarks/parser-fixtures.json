@@ -1,14 +1,149 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "query_plan_hash": "e13da974e6aba0271959c3d606491e89e6261abbeeaebbb79a5b2221f3d9f957",
+  "normalized_schema_sha256": "8f7f813904438aa2d1171b8ba67bd10efa7fe945b2abe1437b00eeebb61b1e5a",
+  "resource_limits": {
+    "raw_fuzz_max_len_bytes": 16777216,
+    "normalizer_fuzz_max_len_bytes": 65536,
+    "per_input_timeout_seconds": 10,
+    "rss_limit_mb": 2048
+  },
+  "coverage_gaps": [
+    "Add owned fixtures for every active-duty map as they become available.",
+    "Add explicit overtime, surrender, disconnect-reconnect, team-kill, world-death, and zero-damage-round fixtures.",
+    "Add legally retained POV, community, and third-party Demo fixtures.",
+    "Reclassify locally cached Valve matchmaking fixtures as Premier or Competitive when direct evidence is available."
+  ],
   "fixtures": [
     {
-      "id": "mirage-premier-representative-1",
+      "id": "mirage-premier-previous-build",
+      "kind": "local_demo",
       "sha256": "84a1a4191302bdd2a3bbb5a727842093744b1fb1a228aeec630369e44b622cb2",
-      "participants": 10,
-      "rounds": 10,
-      "normalized_events": 366,
-      "player_snapshots": 2690
+      "bytes": 60601900,
+      "provenance": {
+        "source": "owned_valve_matchmaking_demo",
+        "redistributable": false
+      },
+      "cs2_build": "13984",
+      "build_cohort": "previous",
+      "map": "de_mirage",
+      "mode": "premier",
+      "edge_cases": ["same_tick_events"],
+      "expected": {
+        "participants": 10,
+        "rounds": 10,
+        "normalized_events": 366,
+        "receipts": 366,
+        "player_snapshots": 2690,
+        "normalized_evidence_sha256": "943879d453c8881d27cf64ff187d5281edcdb4751ae069696f78ad00af902e66",
+        "receipt_hashes_sha256": "aa98c66a8b1d574b0a3462045265cd5cdaad46611f68ee0038a454f2ecfcfab7"
+      },
+      "threading": {
+        "canonical_repeats": 2,
+        "experimental_parallel": "equivalent"
+      }
+    },
+    {
+      "id": "ancient-valve-current-build",
+      "kind": "local_demo",
+      "sha256": "5fa266aa62d9b5ee34deabfb07ca0240235c2ba7086bc31765001533948fdc8d",
+      "bytes": 212207776,
+      "provenance": {
+        "source": "local_cs2_replay_cache",
+        "redistributable": false
+      },
+      "cs2_build": "14169",
+      "build_cohort": "current",
+      "map": "de_ancient",
+      "mode": "valve_matchmaking_unclassified",
+      "edge_cases": ["regulation_match"],
+      "expected": {
+        "participants": 10,
+        "rounds": 19,
+        "normalized_events": 722,
+        "receipts": 722,
+        "player_snapshots": 5390,
+        "normalized_evidence_sha256": "6ecfd7ecd65e4d3d7d8c45a2f20c7e20c6dc74356b25f8aedade0fb7ada0c56e",
+        "receipt_hashes_sha256": "68ad84c6236b35fdc57e932829d742ae33fbe6156e9349d031cd46c6dcd0cff3"
+      },
+      "threading": {
+        "canonical_repeats": 2,
+        "experimental_parallel": "equivalent"
+      }
+    },
+    {
+      "id": "mirage-valve-current-build",
+      "kind": "local_demo",
+      "sha256": "15611f388610aa8e54d273346cd22681617f03bae3db8601d3d1ec22ab67f701",
+      "bytes": 234971573,
+      "provenance": {
+        "source": "local_cs2_replay_cache",
+        "redistributable": false
+      },
+      "cs2_build": "14169",
+      "build_cohort": "current",
+      "map": "de_mirage",
+      "mode": "valve_matchmaking_unclassified",
+      "edge_cases": ["regulation_match"],
+      "expected": {
+        "participants": 10,
+        "rounds": 20,
+        "normalized_events": 707,
+        "receipts": 707,
+        "player_snapshots": 5320,
+        "normalized_evidence_sha256": "ee8668d975807ceb201a2d8e61e7dfb1ae7e195e4a6dfe741c3ce7e8f6b1a0bb",
+        "receipt_hashes_sha256": "5546b877c2e3b8b245ca9af7710ef05ae6a342f89bd158a194111c13acca3569"
+      },
+      "threading": {
+        "canonical_repeats": 2,
+        "experimental_parallel": "equivalent"
+      }
+    },
+    {
+      "id": "cache-valve-current-build",
+      "kind": "local_demo",
+      "sha256": "d489e7dcfef4bae189461579b1a0155683d256fe4f7fa99e5278567d7b4facaa",
+      "bytes": 247374924,
+      "provenance": {
+        "source": "local_cs2_replay_cache",
+        "redistributable": false
+      },
+      "cs2_build": "14169",
+      "build_cohort": "current",
+      "map": "de_cache",
+      "mode": "valve_matchmaking_unclassified",
+      "edge_cases": ["regulation_match"],
+      "expected": {
+        "participants": 10,
+        "rounds": 21,
+        "normalized_events": 824,
+        "receipts": 824,
+        "player_snapshots": 6420,
+        "normalized_evidence_sha256": "1a01a53dffdb02b5ba1f891c835501913aabf0ed20df2ca93fae37dfe58bb6ce",
+        "receipt_hashes_sha256": "a20851a54532d5eb366f440ad0aa2bddaa3bc4571969e54b227bae3c3d8f288f"
+      },
+      "threading": {
+        "canonical_repeats": 2,
+        "experimental_parallel": "equivalent"
+      }
+    },
+    {
+      "id": "synthetic-truncated-frame",
+      "kind": "synthetic_invalid",
+      "generator": "truncated_frame",
+      "expected": {"category": "truncated"}
+    },
+    {
+      "id": "synthetic-unsupported-command",
+      "kind": "synthetic_invalid",
+      "generator": "unsupported_command",
+      "expected": {"category": "unsupported_command"}
+    },
+    {
+      "id": "synthetic-short-header",
+      "kind": "synthetic_invalid",
+      "generator": "short_header",
+      "expected": {"category": "truncated"}
     }
   ]
 }

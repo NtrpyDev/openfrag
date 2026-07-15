@@ -67,7 +67,7 @@ fn main() {
         ("player_snapshots", parsed.player_snapshots.len() as u64),
     ] {
         assert_eq!(
-            fixture[field].as_u64(),
+            fixture["expected"][field].as_u64(),
             Some(observed),
             "fixed fixture output count changed for {field}"
         );

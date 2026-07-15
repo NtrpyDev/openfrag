@@ -27,3 +27,12 @@ tempfile = "3"
 name = "openfrag-parser-benchmark"
 path = "src/bin/openfrag-parser-benchmark.rs"
 required-features = ["demoparser"]
+
+[[bin]]
+name = "openfrag-compat-lab"
+path = "src/bin/openfrag-compat-lab.rs"
+required-features = ["demoparser"]
+
+[[bin]]
+name = "openfrag-schema"
+path = "src/bin/openfrag-schema.rs"

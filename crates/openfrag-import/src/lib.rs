@@ -87,6 +87,12 @@ pub struct ParserProgress {
     pub events_emitted: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParserExecutionMode {
+    CanonicalSingleThreaded,
+    ExperimentalParallel,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CalculationIdentity {
     pub source_sha256: String,
@@ -365,6 +371,137 @@ impl ParsedOutput {
     pub fn event_count(&self) -> usize {
         self.events.len()
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompatibilityHashes {
+    pub normalized_evidence_sha256: String,
+    pub receipt_hashes_sha256: String,
+}
+
+#[must_use]
+pub fn compatibility_hashes(parsed: &ParsedOutput) -> CompatibilityHashes {
+    let participants = parsed
+        .participants
+        .iter()
+        .map(|participant| {
+            serde_json::json!({
+                "steam_id": participant.steam_id.get(),
+                "name": participant.name,
+                "team": participant.team,
+            })
+        })
+        .collect::<Vec<_>>();
+    let rounds = parsed
+        .rounds
+        .iter()
+        .map(|round| {
+            serde_json::json!({
+                "number": round.number.get(),
+                "end_tick": round.end_tick.get(),
+                "winner": round.winner,
+            })
+        })
+        .collect::<Vec<_>>();
+    let events = parsed
+        .events
+        .iter()
+        .map(normalized_event_json)
+        .collect::<Vec<_>>();
+    let snapshots = parsed
+        .player_snapshots
+        .iter()
+        .map(|snapshot| {
+            serde_json::json!({
+                "tick": snapshot.tick.get(),
+                "ingestion_ordinal": snapshot.ingestion_ordinal.get(),
+                "phase": match snapshot.phase {
+                    SnapshotPhase::RequestedTick => "requested_tick",
+                    SnapshotPhase::AfterEventPacket => "after_event_packet",
+                },
+                "steam_id": snapshot.steam_id.get(),
+                "entity_id": snapshot.entity_id.map(EntityId::get),
+                "team": snapshot.team,
+                "health": snapshot.health,
+                "alive": snapshot.alive,
+                "life_state": snapshot.life_state,
+                "round_counter": snapshot.round_counter,
+            })
+        })
+        .collect::<Vec<_>>();
+    let normalized_evidence = serde_json::json!({
+        "schema": NORMALIZED_SCHEMA_VERSION,
+        "evidence_semantics_epoch": parsed.identity.evidence_semantics_epoch,
+        "query_plan_hash": parsed.identity.requested_schema_hash,
+        "metadata": {
+            "map": parsed.metadata.map,
+            "patch_build": parsed.metadata.patch_build,
+            "demo_stamp": parsed.metadata.demo_stamp,
+            "server": parsed.metadata.server,
+            "game_directory": parsed.metadata.game_directory,
+            "tick_rate": parsed.metadata.tick_rate,
+            "tick_rate_unavailable_reason": parsed.metadata.tick_rate_unavailable_reason,
+        },
+        "participants": participants,
+        "rounds": rounds,
+        "events": events,
+        "player_snapshots": snapshots,
+        "suspicious_empty": parsed.suspicious_empty,
+    });
+    let receipt_hashes = parsed
+        .receipts
+        .iter()
+        .map(|receipt| {
+            serde_json::json!({
+                "ingestion_ordinal": receipt.ingestion_ordinal.get(),
+                "event_name": receipt.event_name,
+                "tick": receipt.tick.get(),
+                "evidence_sha256": receipt.evidence_sha256,
+            })
+        })
+        .collect::<Vec<_>>();
+    CompatibilityHashes {
+        normalized_evidence_sha256: json_sha256(&normalized_evidence),
+        receipt_hashes_sha256: json_sha256(&serde_json::Value::Array(receipt_hashes)),
+    }
+}
+
+fn normalized_event_json(event: &ParsedEvent) -> serde_json::Value {
+    let data = match &event.event {
+        NormalizedEvent::RoundFreezeEnd(value) => serde_json::json!({
+            "warmup": value.warmup,
+        }),
+        NormalizedEvent::RoundEnd(value) => serde_json::json!({
+            "winner": value.winner,
+        }),
+        NormalizedEvent::PlayerHurt(value) => serde_json::json!({
+            "attacker": value.attacker.map(SteamId::get),
+            "victim": value.victim.map(SteamId::get),
+            "damage_health": value.damage_health,
+            "weapon": value.weapon,
+        }),
+        NormalizedEvent::PlayerDeath(value) => serde_json::json!({
+            "attacker": value.attacker.map(SteamId::get),
+            "victim": value.victim.map(SteamId::get),
+            "assister": value.assister.map(SteamId::get),
+            "assisted_flash": value.assisted_flash,
+            "weapon": value.weapon,
+        }),
+        NormalizedEvent::PlayerDisconnect(value) => serde_json::json!({
+            "player": value.player.map(SteamId::get),
+        }),
+    };
+    serde_json::json!({
+        "type": event.name(),
+        "tick": event.tick.get(),
+        "ingestion_ordinal": event.ingestion_ordinal.get(),
+        "data": data,
+    })
+}
+
+fn json_sha256(value: &serde_json::Value) -> String {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 pub const DEMOPARSER_COMMIT: &str = "ba39cc44cd5abfd7f34df2b3c0a7dd3630048311";
@@ -974,13 +1111,6 @@ pub fn parse_with_pinned_demoparser_with_progress(
     path: &Path,
     progress: &mut dyn FnMut(ParserProgress),
 ) -> Result<ParsedOutput, ParserError> {
-    use ahash::AHashMap;
-    use demoparser_parser::second_pass::parser_settings::create_huffman_lookup_table;
-    use demoparser_parser::{
-        first_pass::parser_settings::{EventSnapshotMode, FirstPassParser, ParserInputs},
-        parse_demo::{Parser, ParsingMode},
-        second_pass::variants::{OutputSerdeHelperStruct, soa_to_aos},
-    };
     let bytes = std::fs::read(path).map_err(|source| {
         parser_error(
             ParseDiagnosticCategory::SourceIo,
@@ -988,6 +1118,35 @@ pub fn parse_with_pinned_demoparser_with_progress(
             source.to_string(),
         )
     })?;
+    parse_pinned_demoparser_bytes_with_progress(
+        &bytes,
+        ParserExecutionMode::CanonicalSingleThreaded,
+        progress,
+    )
+}
+
+#[cfg(feature = "demoparser")]
+pub fn parse_pinned_demoparser_bytes(bytes: &[u8]) -> Result<ParsedOutput, ParserError> {
+    parse_pinned_demoparser_bytes_with_progress(
+        bytes,
+        ParserExecutionMode::CanonicalSingleThreaded,
+        &mut |_| {},
+    )
+}
+
+#[cfg(feature = "demoparser")]
+pub fn parse_pinned_demoparser_bytes_with_progress(
+    bytes: &[u8],
+    mode: ParserExecutionMode,
+    progress: &mut dyn FnMut(ParserProgress),
+) -> Result<ParsedOutput, ParserError> {
+    use ahash::AHashMap;
+    use demoparser_parser::second_pass::parser_settings::create_huffman_lookup_table;
+    use demoparser_parser::{
+        first_pass::parser_settings::{EventSnapshotMode, FirstPassParser, ParserInputs},
+        parse_demo::{Parser, ParsingMode},
+        second_pass::variants::{OutputSerdeHelperStruct, soa_to_aos},
+    };
     let huf = create_huffman_lookup_table();
     let inputs = ParserInputs {
         real_name_to_og_name: AHashMap::new(),
@@ -1017,18 +1176,22 @@ pub fn parse_with_pinned_demoparser_with_progress(
     let game_build = (bytes.len() >= 16)
         .then(|| {
             FirstPassParser::new(&inputs)
-                .parse_header_only(&bytes)
+                .parse_header_only(bytes)
                 .ok()
                 .and_then(|header| header.get("patch_version").cloned())
         })
         .flatten();
-    let frame_locations = scan_frame_locations(&bytes).map_err(|mut error| {
+    let frame_locations = scan_frame_locations(bytes).map_err(|mut error| {
         error.diagnostic.game_build = game_build;
         error
     })?;
-    let mut parser = Parser::new(inputs, ParsingMode::ForceSingleThreaded);
+    let parsing_mode = match mode {
+        ParserExecutionMode::CanonicalSingleThreaded => ParsingMode::ForceSingleThreaded,
+        ParserExecutionMode::ExperimentalParallel => ParsingMode::ForceMultiThreaded,
+    };
+    let mut parser = Parser::new(inputs, parsing_mode);
     let out = parser
-        .parse_demo_with_progress(&bytes, &mut |upstream| {
+        .parse_demo_with_progress(bytes, &mut |upstream| {
             let phase = match upstream.phase {
                 demoparser_parser::progress::ParsePhase::FirstPass => {
                     ParserProgressPhase::FirstPass
@@ -1227,7 +1390,7 @@ pub fn parse_with_pinned_demoparser_with_progress(
         return Err(missing_evidence("player_snapshots"));
     }
     let query_hash = query_plan_hash();
-    let source_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let source_sha256 = format!("{:x}", Sha256::digest(bytes));
     Ok(ParsedOutput {
         metadata: DemoMetadata {
             map: header.get("map_name").cloned(),
@@ -2091,6 +2254,28 @@ mod tests {
         let reparsed =
             parse_with_pinned_demoparser(Path::new(&path)).expect("repeat parse must succeed");
         assert_eq!(parsed, reparsed, "canonical evidence must be deterministic");
+        let hashes = compatibility_hashes(&parsed);
+        assert_eq!(
+            hashes.normalized_evidence_sha256,
+            "943879d453c8881d27cf64ff187d5281edcdb4751ae069696f78ad00af902e66"
+        );
+        assert_eq!(
+            hashes.receipt_hashes_sha256,
+            "aa98c66a8b1d574b0a3462045265cd5cdaad46611f68ee0038a454f2ecfcfab7"
+        );
+        let bytes = fs::read(&path).expect("fixture bytes must be readable");
+        let from_bytes = parse_pinned_demoparser_bytes(&bytes).expect("byte path must parse");
+        assert_eq!(parsed, from_bytes, "file and byte paths must agree");
+        let parallel = parse_pinned_demoparser_bytes_with_progress(
+            &bytes,
+            ParserExecutionMode::ExperimentalParallel,
+            &mut |_| {},
+        )
+        .expect("experimental parallel parse must succeed for the fixture");
+        assert_eq!(
+            parsed, parallel,
+            "threading modes must produce equal evidence"
+        );
         eprintln!(
             "fixture={} participants={} rounds={} events={} snapshots={} elapsed_ms={} map={:?}",
             path,

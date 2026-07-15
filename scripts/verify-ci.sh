@@ -29,7 +29,13 @@ done
 cargo test -p openfrag-import --features demoparser
 cargo test -p openfrag-pipeline --features demoparser
 cargo check -p openfrag-import --features demoparser --bin openfrag-parser-benchmark
+cargo run -q -p openfrag-import --bin openfrag-schema -- \
+    --check schema/openfrag-demo-evidence-1.schema.json
+cargo run -q -p openfrag-import --features demoparser --bin openfrag-compat-lab -- \
+    check-manifest benchmarks/parser-fixtures.json
+scripts/fuzz-demo-parser.sh check
 bash -n scripts/benchmark-parser.sh
+bash -n scripts/fuzz-demo-parser.sh
 cargo build -p openfragd --release
 packaging/verify-linux-assets.sh
 scripts/hardware/tests/verify-nvidia-host-self-test.sh
