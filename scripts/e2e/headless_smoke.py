@@ -46,8 +46,10 @@ def run(command: list[str], environment: dict[str, str]) -> subprocess.Completed
 
 
 def reserve_loopback_port() -> int:
+    requested = os.environ.get("OPENFRAG_TEST_PORT")
+    port = int(requested) if requested is not None else 0
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
+        listener.bind(("127.0.0.1", port))
         return int(listener.getsockname()[1])
 
 
