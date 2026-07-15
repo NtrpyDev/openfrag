@@ -23,6 +23,10 @@ No environment is release-qualified yet. Physical and read-only prototypes have 
 
 Rust daemon plus a local web dashboard. Recording via [gpu-screen-recorder](https://git.dec05eba.com/gpu-screen-recorder/about/) (run as a separate process). Single-file SQLite metadata; demos and clips stored as ordinary files.
 
+## Verification
+
+Run `./scripts/verify-ci.sh fast` for the optimized developer subset or `./scripts/verify-ci.sh` for the complete v1 suite. The [whole-app verification guide](docs/testing.md) documents coverage, concurrency, clean package environments, timing budgets, and retained failure logs.
+
 ## License
 
 GPL-3.0. The code you install stays open and auditable.
