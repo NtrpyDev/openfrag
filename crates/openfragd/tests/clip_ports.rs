@@ -1,19 +1,21 @@
-pub use openfragd::{api, service};
-
-#[path = "../src/clip_ports.rs"]
-mod clip_ports;
-
-use clip_ports::{
-    ClipClock, ClipDirectories, ClipMutationDependencies, ClipMutationPorts, ClipPortError,
-    ClipStore,
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
 };
 use openfrag_clips::{
     ArtifactProvenance, CancellationToken, Clip, ClipId, ClipOrigin, ClipRepository,
     FileOperationError, LocalFileSystem, MediaInfo, MediaProbe, MediaProbeError, RepositoryError,
     TranscodeError, TranscodeRequest, Transcoder, TrimRange,
 };
+use openfrag_storage::{DurableClipOriginInput, Layout, Storage};
+use openfragd::clip_ports::{
+    ClipClock, ClipDirectories, ClipMutationDependencies, ClipMutationPorts, ClipPortError,
+    ClipStore,
+};
 use openfragd::{
+    AppConfig,
     api::{ClipDecision, ClipTrimRequest, ClipUpdate},
+    app,
     service::MutationPorts,
 };
 use std::{
@@ -21,6 +23,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+use tower::ServiceExt;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 #[derive(Clone)]
 struct MemoryRepository(Arc<Mutex<Clip>>);
@@ -373,4 +379,197 @@ fn failed_trim_removes_staging_output_and_leaves_repository_unchanged() {
         ClipPortError::Unavailable("offline".into()),
         ClipPortError::Unavailable(message) if message == "offline"
     ));
+}
+
+#[tokio::test]
+async fn shipped_clip_ports_review_preview_trim_and_export_durable_media() {
+    let root = tempfile::tempdir().unwrap();
+    let data_directory = root.path().join("data");
+    let clip_id = seed_durable_clip(&data_directory);
+    let (ffmpeg, ffprobe) = fake_clip_tools(root.path());
+    let router = app(&AppConfig::new(&data_directory).with_clip_tools(ffmpeg, ffprobe)).unwrap();
+
+    let preview = router
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/clips/{clip_id}/preview"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(preview.into_body(), 1024).await.unwrap(),
+        "immutable source media"
+    );
+    let preview_range = router
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/clips/{clip_id}/preview"))
+                .header("range", "bytes=10-15")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview_range.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(preview_range.headers()["content-range"], "bytes 10-15/22");
+    assert_eq!(
+        to_bytes(preview_range.into_body(), 1024).await.unwrap(),
+        &b"immutable source media"[10..=15]
+    );
+
+    let reviewed = router
+        .clone()
+        .oneshot(
+            Request::patch(format!("/api/clips/{clip_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"title":"My clutch","note":"B hold","tags":["mirage"],"decision":"keep"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reviewed.status(), StatusCode::OK);
+
+    let trimmed = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/clips/{clip_id}/trim"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"start_ms":5000,"end_ms":15000}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let trimmed_status = trimmed.status();
+    let trimmed_body = to_bytes(trimmed.into_body(), 16 * 1024).await.unwrap();
+    assert_eq!(
+        trimmed_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&trimmed_body)
+    );
+    let trimmed: serde_json::Value = serde_json::from_slice(&trimmed_body).unwrap();
+    let derived_id = trimmed["clip_id"].as_str().unwrap();
+    assert_ne!(derived_id, clip_id);
+    assert_eq!(
+        Storage::open(Layout::at(&data_directory))
+            .unwrap()
+            .list_clips()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let export = router
+        .oneshot(
+            Request::post(format!("/api/clips/{derived_id}/export"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(export.status(), StatusCode::OK);
+    let export: serde_json::Value =
+        serde_json::from_slice(&to_bytes(export.into_body(), 16 * 1024).await.unwrap()).unwrap();
+    assert_eq!(
+        std::fs::read(export["path"].as_str().unwrap()).unwrap(),
+        b"trimmed media"
+    );
+}
+
+#[tokio::test]
+async fn shipped_clip_ports_clean_partial_output_after_failed_transcode() {
+    let root = tempfile::tempdir().unwrap();
+    let data_directory = root.path().join("data");
+    let clip_id = seed_durable_clip(&data_directory);
+    let (ffmpeg, ffprobe) = fake_clip_tools(root.path());
+    std::fs::write(
+        &ffmpeg,
+        "#!/bin/sh\nfor output do :; done\nprintf 'partial media' > \"$output\"\nexit 1\n",
+    )
+    .unwrap();
+    let router = app(&AppConfig::new(&data_directory).with_clip_tools(ffmpeg, ffprobe)).unwrap();
+
+    let response = router
+        .oneshot(
+            Request::post(format!("/api/clips/{clip_id}/trim"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"start_ms":5000,"end_ms":15000}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        std::fs::read_dir(data_directory.join("staging/clip-derivatives"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_eq!(
+        Storage::open(Layout::at(&data_directory))
+            .unwrap()
+            .list_clips()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+fn seed_durable_clip(data_directory: &Path) -> String {
+    let storage = Storage::open(Layout::at(data_directory)).unwrap();
+    let artifact = storage
+        .commit_artifact(
+            storage.stage_artifact(b"immutable source media").unwrap(),
+            "mkv",
+            Some("video/x-matroska"),
+        )
+        .unwrap();
+    let session = storage.create_capture_session("76561198000000000").unwrap();
+    let attempt = storage
+        .request_save(&session, "production-clip", 1_000)
+        .unwrap();
+    storage
+        .complete_save(&attempt, &artifact, 1_000, 31_000)
+        .unwrap();
+    let clip = storage.create_clip(&attempt, "raw_manual").unwrap();
+    storage
+        .complete_clip_model_metadata(
+            clip.as_str(),
+            30_000,
+            DurableClipOriginInput::Manual {
+                flag_receipt_id: "manual-flag",
+                flag_time_ms: 31_000,
+                overlapping_auto_receipts: &[],
+            },
+        )
+        .unwrap();
+    clip.as_str().to_owned()
+}
+
+fn fake_clip_tools(root: &Path) -> (PathBuf, PathBuf) {
+    let tools = root.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let ffmpeg = tools.join("ffmpeg");
+    let ffprobe = tools.join("ffprobe");
+    std::fs::write(
+        &ffmpeg,
+        "#!/bin/sh\nfor output do :; done\nprintf 'trimmed media' > \"$output\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &ffprobe,
+        "#!/bin/sh\nprintf '%s\\n' '{\"format\":{\"duration\":\"10.000\"},\"streams\":[{\"codec_type\":\"video\",\"codec_name\":\"h264\",\"pix_fmt\":\"yuv420p\",\"width\":1280,\"height\":720,\"avg_frame_rate\":\"60/1\"}]}'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    for executable in [&ffmpeg, &ffprobe] {
+        std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    (ffmpeg, ffprobe)
 }

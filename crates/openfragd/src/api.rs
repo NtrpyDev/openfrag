@@ -3,13 +3,21 @@
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Multipart, Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header},
+    response::Response,
     routing::{get, patch, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{path::Path as FilePath, sync::Arc};
+use std::{
+    io::SeekFrom,
+    path::{Path as FilePath, PathBuf},
+    sync::Arc,
+};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_util::io::ReaderStream;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,6 +71,11 @@ pub struct Clip {
     pub title: Option<String>,
     pub note: Option<String>,
     pub tags: Vec<String>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipPreview {
+    pub path: PathBuf,
+    pub media_type: String,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct ClipUpdate {
@@ -132,6 +145,9 @@ pub trait LocalApi: Send + Sync + 'static {
     fn receipt(&self, id: &str) -> Result<Value, ApiError>;
     fn clips(&self) -> Result<Vec<Clip>, ApiError>;
     fn update_clip(&self, id: &str, update: ClipUpdate) -> Result<Clip, ApiError>;
+    fn preview_clip(&self, _: &str) -> Result<ClipPreview, ApiError> {
+        Err(ApiError::NotFound)
+    }
     fn trim_clip(&self, id: &str, request: ClipTrimRequest) -> Result<Value, ApiError>;
     fn export_clip(&self, id: &str) -> Result<Value, ApiError>;
     fn manual_flag(&self) -> Result<Value, ApiError>;
@@ -168,6 +184,7 @@ fn routes(service: Arc<dyn LocalApi>, include_health: bool) -> Router {
         .route("/api/receipts/{id}", get(receipt))
         .route("/api/clips", get(clips))
         .route("/api/clips/{id}", patch(update_clip))
+        .route("/api/clips/{id}/preview", get(preview_clip))
         .route("/api/clips/{id}/trim", post(trim_clip))
         .route("/api/clips/{id}/export", post(export_clip))
         .route("/api/manual-flag", post(manual_flag))
@@ -269,6 +286,90 @@ async fn update_clip(
         .map(Json)
         .map_err(|error| error.response())
 }
+async fn preview_clip(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let preview = state
+        .service
+        .preview_clip(&id)
+        .map_err(|error| error.response())?;
+    let mut file = tokio::fs::File::open(&preview.path)
+        .await
+        .map_err(|_| ApiError::NotFound.response())?;
+    let length = file
+        .metadata()
+        .await
+        .map_err(|_| ApiError::NotFound.response())?
+        .len();
+    let requested_range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| byte_range(value, length));
+    if headers.contains_key(header::RANGE) && requested_range.is_none() {
+        return Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{length}"))
+            .body(Body::empty())
+            .map_err(|error| ApiError::Unavailable(error.to_string()).response());
+    }
+    let (start, response_length) = requested_range.map_or((0, length), |(start, end)| {
+        (start, end.saturating_sub(start).saturating_add(1))
+    });
+    if start != 0 {
+        file.seek(SeekFrom::Start(start))
+            .await
+            .map_err(|error| ApiError::Unavailable(error.to_string()).response())?;
+    }
+    let mut response = Response::builder()
+        .status(if requested_range.is_some() {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
+        .header(header::CONTENT_TYPE, preview.media_type)
+        .header(header::CONTENT_LENGTH, response_length)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from_stream(ReaderStream::new(
+            file.take(response_length),
+        )))
+        .map_err(|error| ApiError::Unavailable(error.to_string()).response())?;
+    if let Some((start, end)) = requested_range {
+        response.headers_mut().insert(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{length}").parse().map_err(
+                |error: header::InvalidHeaderValue| {
+                    ApiError::Unavailable(error.to_string()).response()
+                },
+            )?,
+        );
+    }
+    Ok(response)
+}
+
+fn byte_range(value: &str, length: u64) -> Option<(u64, u64)> {
+    let range = value.strip_prefix("bytes=")?;
+    if range.contains(',') || length == 0 {
+        return None;
+    }
+    let (start, end) = range.split_once('-')?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?.min(length);
+        return (suffix != 0).then_some((length - suffix, length - 1));
+    }
+    let start = start.parse::<u64>().ok()?;
+    if start >= length {
+        return None;
+    }
+    let end = if end.is_empty() {
+        length - 1
+    } else {
+        end.parse::<u64>().ok()?.min(length - 1)
+    };
+    (start <= end).then_some((start, end))
+}
 async fn trim_clip(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -326,6 +427,9 @@ impl LocalApi for EmptyLocalApi {
         Ok(vec![])
     }
     fn update_clip(&self, _: &str, _: ClipUpdate) -> Result<Clip, ApiError> {
+        Err(ApiError::NotFound)
+    }
+    fn preview_clip(&self, _: &str) -> Result<ClipPreview, ApiError> {
         Err(ApiError::NotFound)
     }
     fn trim_clip(&self, _: &str, _: ClipTrimRequest) -> Result<Value, ApiError> {

@@ -13,7 +13,7 @@
     .row { display:flex; flex-wrap:wrap; gap:.8rem; align-items:center; justify-content:space-between; } .grid { display:grid; gap:1rem; grid-template-columns:repeat(auto-fit,minmax(15rem,1fr)); }
     section { margin:1.4rem 0; } .panel { border:1px solid #293846; border-radius:.7rem; padding:1rem; background:#101923; } .muted { color:#a5b6c6; }
     .hidden { display:none; } .list { display:grid; gap:.6rem; padding:0; list-style:none; } label { display:grid; gap:.35rem; } input,textarea { padding:.55rem; border-radius:.4rem; border:1px solid #425466; background:#0b1016; color:inherit; }
-    dialog { max-width:42rem; color:inherit; background:#101923; border:1px solid #425466; border-radius:.7rem; } .status { min-height:1.5rem; }
+    dialog { max-width:42rem; color:inherit; background:#101923; border:1px solid #425466; border-radius:.7rem; } video { width:100%; max-height:24rem; background:#05080c; } .status { min-height:1.5rem; }
     @media (max-width:700px) { .shell { grid-template-columns:1fr; } aside { border-right:0; border-bottom:1px solid #293846; } nav { grid-template-columns:repeat(5,1fr); overflow:auto; } main { padding:1rem; } }
   </style>
 </head>
@@ -34,7 +34,7 @@
       <section data-panel="setup" class="hidden"><h1>Setup status</h1><ul id="setup-output" class="panel list" aria-live="polite"><li>Select Setup to load local checks.</li></ul></section>
     </main>
   </div>
-  <dialog id="clip-editor" aria-labelledby="clip-editor-title"><form id="clip-form" method="dialog"><h2 id="clip-editor-title">Review clip</h2><input id="clip-id" type="hidden"><label for="clip-title">Title<input id="clip-title" required></label><label for="clip-note">Note<textarea id="clip-note"></textarea></label><label for="clip-tags">Tags (comma separated)<input id="clip-tags"></label><label for="clip-decision">Review decision<select id="clip-decision"><option value="keep">Keep</option><option value="reject">Reject</option></select></label><label for="clip-trim-start">Trim start in milliseconds<input id="clip-trim-start" type="number" min="0" step="1" value="0" required></label><label for="clip-trim-end">Trim end in milliseconds<input id="clip-trim-end" type="number" min="1" step="1" required></label><p class="muted">The local service validates the requested range against the source clip duration.</p><div class="row"><button class="button" value="cancel">Cancel</button><button id="clip-save" class="button primary" value="default">Save review</button><button id="clip-trim" class="button" type="button">Trim local clip</button><button id="clip-export" class="button" type="button">Export local file</button></div></form></dialog>
+  <dialog id="clip-editor" aria-labelledby="clip-editor-title"><form id="clip-form" method="dialog"><h2 id="clip-editor-title">Review clip</h2><video id="clip-preview" controls preload="metadata">Local Clip preview is unavailable in this browser.</video><input id="clip-id" type="hidden"><label for="clip-title">Title<input id="clip-title" required></label><label for="clip-note">Note<textarea id="clip-note"></textarea></label><label for="clip-tags">Tags (comma separated)<input id="clip-tags"></label><label for="clip-decision">Review decision<select id="clip-decision"><option value="keep">Keep</option><option value="reject">Reject</option></select></label><label for="clip-trim-start">Trim start in milliseconds<input id="clip-trim-start" type="number" min="0" step="1" value="0" required></label><label for="clip-trim-end">Trim end in milliseconds<input id="clip-trim-end" type="number" min="1" step="1" required></label><p class="muted">The local service validates the requested range against the source clip duration.</p><div class="row"><button class="button" value="cancel">Cancel</button><button id="clip-save" class="button primary" value="default">Save review</button><button id="clip-trim" class="button" type="button">Trim local clip</button><button id="clip-export" class="button" type="button">Export local file</button></div></form></dialog>
   <script>
     const $ = selector => document.querySelector(selector);
     const announce = message => { $('#announcements').textContent = message; };
@@ -172,6 +172,9 @@
 
     function editClip(clip) {
       selectedClip = clip;
+      const preview = $('#clip-preview');
+      preview.src = `/api/clips/${encodeURIComponent(clip.id)}/preview`;
+      preview.load();
       $('#clip-id').value = clip.id;
       $('#clip-title').value = clip.title ?? '';
       $('#clip-note').value = clip.note ?? '';
@@ -180,6 +183,12 @@
       $('#clip-trim-end').value = '';
       $('#clip-editor').showModal();
     }
+
+    $('#clip-editor').addEventListener('close', () => {
+      const preview = $('#clip-preview');
+      preview.removeAttribute('src');
+      preview.load();
+    });
 
     async function loadDiagnostics() {
       const output = $('#diagnostics-output');

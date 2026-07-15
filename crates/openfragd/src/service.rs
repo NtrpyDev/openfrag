@@ -2,8 +2,8 @@
 #![allow(clippy::missing_errors_doc)]
 
 use crate::api::{
-    ApiError, Clip, ClipTrimRequest, ClipUpdate, HealthResponse, ImportJob, ImportedFile, LocalApi,
-    MatchDetail, MatchSummary, RatingState, ReceiptRef, SetupResponse,
+    ApiError, Clip, ClipPreview, ClipTrimRequest, ClipUpdate, HealthResponse, ImportJob,
+    ImportedFile, LocalApi, MatchDetail, MatchSummary, RatingState, ReceiptRef, SetupResponse,
 };
 use openfrag_pipeline::{ImportOutcome, ImportRequest, ImportService, PinnedParser, PipelineError};
 use openfrag_storage::{ImportPhase, Storage, StoredRatingAvailability};
@@ -28,6 +28,11 @@ pub trait MutationPorts: Send + Sync + 'static {
     fn update_clip(&self, _: &str, _: ClipUpdate) -> Result<Clip, ApiError> {
         Err(ApiError::Unavailable(
             "clip review pipeline is not connected".into(),
+        ))
+    }
+    fn preview_clip(&self, _: &str) -> Result<ClipPreview, ApiError> {
+        Err(ApiError::Unavailable(
+            "clip preview pipeline is not connected".into(),
         ))
     }
     fn trim(&self, _: &str, _: ClipTrimRequest) -> Result<Value, ApiError> {
@@ -79,6 +84,10 @@ impl MutationPorts for CompositePorts {
 
     fn update_clip(&self, id: &str, update: ClipUpdate) -> Result<Clip, ApiError> {
         self.clips.update_clip(id, update)
+    }
+
+    fn preview_clip(&self, id: &str) -> Result<ClipPreview, ApiError> {
+        self.clips.preview_clip(id)
     }
 
     fn trim(&self, id: &str, request: ClipTrimRequest) -> Result<Value, ApiError> {
@@ -268,6 +277,9 @@ impl<P: MutationPorts> LocalApi for StorageApi<P> {
     }
     fn update_clip(&self, id: &str, update: ClipUpdate) -> Result<Clip, ApiError> {
         self.ports.update_clip(id, update)
+    }
+    fn preview_clip(&self, id: &str) -> Result<ClipPreview, ApiError> {
+        self.ports.preview_clip(id)
     }
     fn trim_clip(&self, id: &str, request: ClipTrimRequest) -> Result<Value, ApiError> {
         self.ports.trim(id, request)

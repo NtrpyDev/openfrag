@@ -63,6 +63,8 @@ fn dashboard_exposes_complete_local_flows_and_honest_failure_states() {
         "void trimClip()",
         "id=\"clip-trim-start\"",
         "id=\"clip-trim-end\"",
+        "id=\"clip-preview\"",
+        "/preview`",
         "JSON.stringify({ start_ms, end_ms })",
         "Trim end must be greater than trim start",
         "clipAction('export', 'Export')",

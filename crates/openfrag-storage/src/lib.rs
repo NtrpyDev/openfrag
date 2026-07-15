@@ -1309,7 +1309,7 @@ impl Storage {
                 ),
             };
             transaction.execute(
-                "INSERT INTO clips(id,artifact_sha256,capture_session_id,disposition,title,favorite,provenance,created_at_ms,recorded_at_ms,pre_roll_truncated,retention_class,note,review_decision,review_revision,origin_kind,manual_flag_time_ms,reviewed_at_ms) VALUES(?,?,?,'kept',?,?,'trim_derivative',?,?,?,?,?,'keep',0,?,?,?)",
+                "INSERT INTO clips(id,artifact_sha256,capture_session_id,disposition,title,favorite,provenance,created_at_ms,recorded_at_ms,pre_roll_truncated,retention_class,note,review_decision,review_revision,origin_kind,manual_flag_time_ms,reviewed_at_ms) VALUES(?,?,?,'kept',?,?,'trim_derivative',?,?,?,?,?,'keep',1,?,?,?)",
                 params![
                     derived.as_str(), request.staged.sha256, source.capture_session_id,
                     request.title, i64::from(request.favorite), now_ms(),
@@ -3434,7 +3434,7 @@ mod tests {
 
         let model = storage.durable_clip_model(derived.as_str()).unwrap();
         assert_eq!(model.duration_ms, 30_000);
-        assert_eq!(model.revision, 0);
+        assert_eq!(model.revision, 1);
         assert!(model.reviewed_at_ms.is_some());
         assert_eq!(model.detail.provenance, "trim_derivative");
         assert_eq!(model.detail.tags, ["trimmed"]);

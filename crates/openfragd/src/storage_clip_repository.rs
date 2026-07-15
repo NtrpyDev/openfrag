@@ -7,11 +7,12 @@ use openfrag_clips::{
     DurableClipSnapshot, RepositoryError, ReviewState,
 };
 use openfrag_storage::{
-    ClipDetailRecord, ClipExportRecord, ClipReviewDecision, DurableClipModelRecord,
-    DurableClipOriginRecord, Error as StorageError, ExportId, Storage,
+    ClipDetailRecord, ClipExportRecord, ClipReviewDecision, DerivativeClipCommit,
+    DurableClipModelRecord, DurableClipOriginRecord, Error as StorageError, ExportId, Storage,
 };
 use std::{
     collections::BTreeSet,
+    fs,
     sync::{Arc, Mutex},
 };
 
@@ -171,6 +172,57 @@ impl StorageClipRepository {
 impl ClipStore for StorageClipRepository {
     fn load(&mut self, clip_id: &str) -> Result<Clip, ClipPortError> {
         self.load_durable(clip_id).map_err(clip_port_error)
+    }
+
+    fn commit_derivative(
+        &mut self,
+        expected_revision: u64,
+        updated: &Clip,
+    ) -> Result<Clip, ClipPortError> {
+        let derivative = updated.derivative().ok_or_else(|| {
+            ClipPortError::Invalid("trim did not produce derivative provenance".into())
+        })?;
+        let source_id = updated.id().as_str();
+        let derivative_path = derivative.artifact().path();
+        let derived_id = {
+            let storage = self.lock().map_err(clip_port_error)?;
+            let source = storage
+                .durable_clip_model(source_id)
+                .map_err(storage_error)
+                .map_err(clip_port_error)?;
+            if source.revision != expected_revision {
+                return Err(ClipPortError::Unavailable(
+                    "clip changed while the derivative was prepared".into(),
+                ));
+            }
+            let mut derivative_file = fs::File::open(derivative_path).map_err(|error| {
+                ClipPortError::Unavailable(format!("cannot open prepared derivative: {error}"))
+            })?;
+            let staged = storage
+                .stage_from_reader(&mut derivative_file)
+                .map_err(storage_error)
+                .map_err(clip_port_error)?;
+            let tags = updated.tags().iter().cloned().collect::<Vec<_>>();
+            storage
+                .commit_clip_derivative(DerivativeClipCommit {
+                    source_clip_id: source_id,
+                    staged,
+                    extension: "mp4",
+                    media_type: Some("video/mp4"),
+                    duration_ms: derivative.artifact().duration_ms(),
+                    trim_start_ms: derivative.trim().start_ms(),
+                    trim_end_ms: derivative.trim().end_ms(),
+                    title: updated.title(),
+                    note: updated.note(),
+                    tags: &tags,
+                    favorite: updated.favorite(),
+                })
+                .map_err(storage_error)
+                .map_err(clip_port_error)?
+        };
+        let _ = fs::remove_file(derivative_path);
+        self.load_durable(derived_id.as_str())
+            .map_err(clip_port_error)
     }
 }
 

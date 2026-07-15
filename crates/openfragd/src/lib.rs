@@ -34,13 +34,24 @@ const DASHBOARD: &str = include_str!("dashboard.html");
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     data_directory: PathBuf,
+    ffmpeg: Option<PathBuf>,
+    ffprobe: Option<PathBuf>,
 }
 
 impl AppConfig {
     pub fn new(data_directory: impl Into<PathBuf>) -> Self {
         Self {
             data_directory: data_directory.into(),
+            ffmpeg: None,
+            ffprobe: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_clip_tools(mut self, ffmpeg: PathBuf, ffprobe: PathBuf) -> Self {
+        self.ffmpeg = Some(ffmpeg);
+        self.ffprobe = Some(ffprobe);
+        self
     }
 
     #[cfg(test)]
@@ -85,13 +96,33 @@ pub fn app(config: &AppConfig) -> Result<Router, AppError> {
     let storage = Storage::open(Layout::at(&config.data_directory))
         .map_err(|error| AppError::Storage(format!("{error:?}")))?;
     let storage = Arc::new(Mutex::new(storage));
+    let import_ports: Arc<dyn service::MutationPorts> = Arc::new(service::PipelinePorts::new(
+        storage.clone(),
+        config.data_directory.clone(),
+        local_steam_id,
+    ));
+    let clip_ports: Arc<dyn service::MutationPorts> = Arc::new(
+        clip_ports::production_clip_ports(
+            storage.clone(),
+            &config.data_directory,
+            config
+                .ffmpeg
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("ffmpeg")),
+            configured_ffprobe(config),
+        )
+        .map_err(|error| {
+            AppError::Configuration(format!("cannot compose local clip ports: {error:?}"))
+        })?,
+    );
+    let ports = service::CompositePorts::new(
+        import_ports,
+        clip_ports,
+        Arc::new(service::UnavailablePorts),
+    );
     let local_api = service::StorageApi::new(
         storage.clone(),
-        service::PipelinePorts::new(
-            storage.clone(),
-            config.data_directory.clone(),
-            local_steam_id,
-        ),
+        ports,
         setup_response(
             &config.data_directory,
             credentials.is_some(),
@@ -150,6 +181,18 @@ pub fn app(config: &AppConfig) -> Result<Router, AppError> {
         router = router.route("/gsi/router", post(gsi_unavailable));
     }
     Ok(router)
+}
+
+fn configured_ffprobe(config: &AppConfig) -> PathBuf {
+    config
+        .ffprobe
+        .clone()
+        .or_else(|| {
+            read_capture_configuration(&config.data_directory)
+                .ok()
+                .map(|configuration| configuration.ffprobe_path().to_path_buf())
+        })
+        .unwrap_or_else(|| PathBuf::from("ffprobe"))
 }
 
 async fn dashboard() -> Html<&'static str> {
