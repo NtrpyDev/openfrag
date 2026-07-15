@@ -1,70 +1,65 @@
-# Hotkey evdev spike (throwaway)
+# Device-scoped Manual Flag broker spike (throwaway)
 
-This prototype answers one question: can openfrag detect a chosen keyboard key or mouse button from `/dev/input` while a fullscreen Wayland game owns the normal application input, with a workable permission and hotplug story?
+This prototype asks whether a separate evdev broker can open exactly one user-selected stable device identity, accept only one allowlisted key code, and expose only a rate-limited one-bit Manual Flag message to the openfrag daemon. It specifically probes ambiguity, identity changes, hotplug loss, suspend/resume, `SYN_DROPPED`, permission failure, and local IPC peer authorization.
 
-This is throwaway code. It is not the production hotkey daemon, does not persist configuration, and should be deleted or absorbed after the go/no-go decision.
+This is throwaway code on a prototype branch. It is not production code and must not be merged into the application.
 
-## Run
+## State-machine simulator
 
-From the repository root, run:
+Run the complete in-memory state model with one command:
 
-```sh
-cargo run --release --manifest-path prototypes/hotkey-evdev/Cargo.toml
+```console
+cargo run --release --manifest-path prototypes/hotkey-evdev/Cargo.toml -- simulate
 ```
 
-The default binding is evdev code `66` (`F8`). Set `HOTKEY_CODE` to another numeric keyboard or mouse-button code, and optionally set `HOTKEY_DEVICE` to a case-sensitive substring of the device name or event path. For example:
+The simulator renders the full broker state after every command. It can select one device, create an ambiguous match, replace identity metadata, disconnect and reconnect, deny permission, connect or reject an IPC client, drive press/repeat/release and rate-limit cases, recover from `SYN_DROPPED` with the key held or released, and suspend/resume.
 
-```sh
-HOTKEY_DEVICE=Wooting HOTKEY_CODE=66 cargo run --release --manifest-path prototypes/hotkey-evdev/Cargo.toml
+## Live broker and client
+
+The live broker selects a keyboard by exact udev `ID_SERIAL` plus USB interface, rejects zero or multiple matches, validates the evdev name and fingerprint on every reopen, reads only the allowlisted code, and never grabs or writes the device. It authenticates a local Unix client with `SO_PEERCRED`. The only protocol message is the literal line `FLAG`; no raw file descriptor, event structure, code, timestamp, or device metadata crosses the socket.
+
+The tested Wooting command is:
+
+```console
+cargo run --release --manifest-path prototypes/hotkey-evdev/Cargo.toml -- \
+  broker Wooting_Wooting_Two_HE__ARM__A02B2442W043H25541 01 66 \
+  /tmp/openfrag-evdev-broker.sock 1000 'Wooting Wooting Two HE (ARM)'
 ```
 
-Without a device filter, more than one matching event node is shown as `Conflict` and the prototype deliberately disarms itself. There is no interactive device chooser. The display reports matching devices, flags, and state; it does not print every release event. The `r` rescan and `q` quit commands are read from stdin and require pressing Enter after each command. If the command fails because the manifest is absent, the spike has not been built in this checkout yet.
+In a second terminal, connect the daemon-side probe:
 
-## Interpreting the interaction
+```console
+cargo run --release --manifest-path prototypes/hotkey-evdev/Cargo.toml -- \
+  client /tmp/openfrag-evdev-broker.sock
+```
 
-- `Reading`: exactly one matching device is open and the chosen key or button is
-  armed.
-- `Conflict`: multiple matching event nodes were found, so the prototype is
-  deliberately disarmed until the filter selects one.
-- `PermissionDenied`: the process could not open an event node. The operating
-  system error is displayed.
-- `Disconnected`: a read failed after opening. The periodic rescan looks for the
-  device again.
-- `MANUAL FLAG`: one up-to-down transition was accepted. Releases and kernel
-  auto-repeat events do not increment the counter.
+`SIGUSR1` and `SIGUSR2` stand in for logind `PrepareForSleep(true)` and `PrepareForSleep(false)` during this spike. Resume always starts disarmed and requires udev identity plus evdev metadata revalidation.
 
-The spike makes keyboard and mouse selection explicit through its filter. A
-production implementation would need a stable device fingerprint rather than
-persisting the unstable `eventN` path.
+## Observed evidence
 
-## Safety finding
+Host: Noah's CachyOS KDE Plasma Wayland PC, Wooting Two HE keyboard interface `01`, event node `/dev/input/event4` at the time of the run.
 
-This PC can run the spike because Noah already belongs to the `input` group.
-That membership permits reading every group-readable keyboard and mouse, not
-only the configured hotkey, so it is not an acceptable production permission
-story. The production design should try the XDG Global Shortcuts portal first.
-The current KDE Wayland session exposes portal interface version 2. An evdev
-fallback would need a separately reviewed, device-scoped broker that sends only
-a rate-limited Manual Flag event to openfrag. The main daemon must never receive
-a raw input file descriptor or raw key stream.
+- The model rejected two matching candidates as ambiguous.
+- The model rejected a changed name or evdev fingerprint after reconnect.
+- Device disappearance disarmed the broker; the same fingerprint could re-arm on a different event path.
+- Suspend closed the reader. Resume returned to an awaiting state and re-armed only after the same identity was rediscovered.
+- `SYN_DROPPED` emitted no flag. Recovery with the key held required a release before a later press.
+- Key repeat and duplicate-down events emitted nothing. A 750 ms minimum interval suppressed rapid represses.
+- A Unix peer with UID 1000 was accepted; the same client was rejected when the configured UID was 65534.
+- `cargo check`, release build, and clippy with warnings denied passed.
+- The earlier physical evdev spike already established exactly-once F8 delivery, three-second hold suppression, unplug/replug recovery, and fullscreen CS2 delivery on this device. This spike does not reinterpret those observations as a permission proof.
 
-## Hands-on verification checklist
+For process isolation, the live broker was launched with Bubblewrap using a fresh `/dev` that contained only `/dev/input/event4`. Inside the namespace it ran as UID 1000 without the host `input` supplementary group and could not name any other input event node. The broker armed, authenticated the client, disarmed on the suspend signal, returned to awaiting-device on resume, and then revalidated and re-armed the same fingerprint.
 
-Run this checklist on the local KDE Wayland session with a fullscreen game or another input-grabbing client.
+## Security verdict
 
-1. Start the command from a terminal and record session type, selected device, event node, and whether the process is in the `input` group.
-2. Set `HOTKEY_DEVICE` to the intended keyboard substring and `HOTKEY_CODE` to a low-conflict key. Press it once, release it, and confirm exactly one `MANUAL FLAG` notice.
-3. Hold that key for at least three seconds. Confirm kernel key-repeat does not create repeated Manual Flag candidates.
-4. Set `HOTKEY_DEVICE` to the intended mouse substring and `HOTKEY_CODE` to a side-button code if available. Confirm one `MANUAL FLAG`, then confirm ordinary movement and left-click do not trigger the selected code.
-5. Launch the game in fullscreen Wayland mode so it grabs normal application input. Repeat steps 2 to 4 while focused on the game. Record whether evdev still receives events.
-6. While the prototype is armed, unplug the selected keyboard or mouse, then reconnect it. Confirm a disappearance/reconnect message, no crash, and return to `ARMED` without requiring a restart.
-7. If multiple keyboards or mice are present, select each one and verify the chosen physical device only. Check that an identical key on another device does not trigger the flag.
-8. Run once as the normal user and once without membership in the `input` group (or with a deliberately unreadable test node). Confirm the failure is an explicit `PERMISSION_DENIED` state naming the node, not a silent empty device list.
-9. While the game is focused, test the candidate key against its in-game binding. Record whether the key conflict is acceptable, remappable, or disqualifying.
-10. Stop with `q` and confirm all device handles are released so a second run can select the same device.
+No-go for an evdev fallback in openfrag v1.
 
-Linux evdev exposes input events through character devices such as `/dev/input/eventX`; access is governed by device-node permissions and the session's device policy ([kernel evdev documentation](https://docs.kernel.org/input/), [systemd-logind device access](https://www.freedesktop.org/software/systemd/man/latest/loginctl.html)). These links describe the permission and device model. They do not guarantee that a compositor or game will provide an application-level global shortcut.
+The broker process and one-bit IPC boundary can be constrained, but the required narrow host device permission was not demonstrated. On this PC `/dev/input/event4` remains `root:input` mode `0660`, and the launcher can bind it only because Noah belongs to the broad `input` group. Bubblewrap hides every other node after launch, but it does not replace that broad source authorization with a device-specific ACL. Granting a separate service identity one udev-selected node would require privileged account, group, udev-rule, hotplug, and packaging machinery that this spike did not validate.
 
-## Feedback required before go/no-go
+The ticket's acceptance rule says to reject the fallback when the complete boundary cannot be demonstrated. Therefore:
 
-Noah must report the exact device and key/button chosen, whether the process was in the `input` group, fullscreen Wayland result, repeat-key result, hotplug result, keyboard-versus-mouse result, and the permission-denied result. Include the prototype output and any relevant `journalctl` or `ls -l /dev/input/event*` evidence. The decision is **go** only if the chosen control is reliable under the focused fullscreen game, survives hotplug, avoids unacceptable in-game conflicts, and fails loudly when permission is missing. Otherwise record the failing case and choose a different mechanism or input control before production work.
+- XDG Global Shortcuts remains the only v1 global Manual Flag accelerator.
+- openfrag must not request `input` group membership, install an evdev broker, open raw input devices, or receive raw input file descriptors or events.
+- Unsupported desktops must report the global Manual Flag accelerator as unavailable instead of silently widening privileges.
+- A future evdev proposal requires a new security review and real proof of a device-specific host grant; this prototype is not reusable authorization evidence.
