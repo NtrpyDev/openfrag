@@ -51,7 +51,7 @@ Collected 2026-07-14 on the local PC1 session.
 
 | Gate | Result | Interpretation |
 | --- | --- | --- |
-| Current implementation CI | Passed | All first-party format, test, clippy, release build, staged static install, deterministic archive, packaging boundary, and headless end-to-end checks passed at local implementation commit `102b59a0161ecf34b8dd6c540a7078110a881c62`. Vendored parser warnings remain, but the first-party clippy gates passed. |
+| Current implementation CI | Passed | All first-party format, test, clippy, release build, staged static install, deterministic archive, packaging boundary, and headless end-to-end checks passed at local implementation commit `89b92ccd0184fe95e9ac8d51a81e03efffaa87dd`. The run includes the NVIDIA verifier regression test. Vendored parser warnings remain, but the first-party clippy gates passed. |
 | Static package scaffold | Passed headlessly, not qualified | The deterministic archive and temporary-home install passed without activating systemd. The scaffold still uses legacy `openfrag.desktop` and `openfragd.service`, so it fails the settled production identity contract and is not a release candidate. |
 | AUR and COPR artifacts | Not tested | Neither artifact exists in the inspected implementation tree. |
 | Storage and local Demo readiness | Prototype only | The current read-only Doctor skeleton reported a private temporary data directory and local Demo import ready. It does not yet implement the final storage, fingerprint, or remediation contract. |
@@ -72,7 +72,7 @@ The PC1 result is therefore **Prototype only** for KDE Wayland GSI, synthetic au
 
 ## PC2 first pass
 
-Collected 2026-07-14 through an authenticated SSH session as the active desktop user. Only the redacted facts below are published. No screen, microphone, personal media, Steam identifier, home path, filename, GSI marker, Demo, or Clip was collected.
+Collected 2026-07-14 through an authenticated SSH session as the active desktop user, with the corrected NVIDIA verifier rerun on 2026-07-15. Only the redacted facts below are published. No screen, microphone, personal media, Steam identifier, home path, filename, GSI marker, Demo, or Clip was collected.
 
 | Dimension | Observed value |
 | --- | --- |
@@ -91,8 +91,8 @@ Collected 2026-07-14 through an authenticated SSH session as the active desktop 
 | --- | --- | --- |
 | Exact candidate integrity | Passed transfer, not qualified | `openfragd 1.0.0` was built from commit `102b59a0161ecf34b8dd6c540a7078110a881c62`; the local and PC2 binaries matched SHA-256 `c566bde02955ee8a0a109edeb0d6c16957d84085f82ae397b7411ffe8678ba6d`. It ran from a private runtime directory and was not an installed package. |
 | Compatibility Doctor | Prototype only | The read-only Doctor reported temporary private storage, local Demo import, and FFprobe ready. GSI was blocked because no CS2 cfg directory exists. Capture was blocked because gpu-screen-recorder is absent, and Manual Flag was consequently blocked. |
-| NVIDIA host verifier | Failed due to verifier defect | The exact `--probe-nvenc` verifier reported the driver, FFmpeg, FFprobe, PipeWire, and output directory ready, but recorder and NVENC blocked. The NVENC failure came from its fixed `128x128` test frame, which driver `610.43.03` rejected as smaller than the supported minimum. This is not evidence that NVENC is unavailable. |
-| Direct NVENC control | Prototype only | Repeating the same bounded synthetic `h264_nvenc` test at `256x256` completed successfully. This proves encoder initialization on this exact stack, not screen capture or gpu-screen-recorder integration. |
+| NVIDIA host verifier | Prototype only | The corrected verifier at commit `89b92ccd0184fe95e9ac8d51a81e03efffaa87dd`, script SHA-256 `46fba7080daead09b587a874be8657b98ea535c95f0f319a6d436692a84c1a36`, uses a bounded `256x256` frame. On PC2 it reported the NVIDIA driver, NVENC runtime initialization, FFmpeg, FFprobe, PipeWire, and private output directory ready. Overall readiness remained false only because gpu-screen-recorder was unavailable. |
+| Direct NVENC control | Prototype only, reproduced | The initial bounded `256x256` `h264_nvenc` control and the corrected verifier both completed successfully. The regression test fixes the exact synthetic argv, distinguishes an unavailable encoder from a runtime initialization failure, and confirms that the verifier never launches gpu-screen-recorder. This proves encoder initialization on this exact stack, not screen capture or recorder integration. |
 | Native and Flatpak Steam discovery | Not tested | Neither Steam package is installed, so app-730 discovery, external-library discovery, cfg writing, and authenticated GSI delivery cannot run. Missing host software is not a product failure. |
 | Recorder capability and validated test Clip | Not tested | gpu-screen-recorder is absent. No replay buffer, screen capture, codec integration, preview, or validated Clip was attempted. |
 | Audio routing | Prototype only, limited topology | A synthetic PipeWire null-sink monitor produced a verified 1.2-second stereo WAV with nonzero signal without selecting a real microphone. The probe found one non-monitor source and no active CS2 or voice-application candidates. Its `pw-record` process returned status 1 after producing the complete file, so the result does not qualify production recording. |
@@ -103,7 +103,7 @@ Collected 2026-07-14 through an authenticated SSH session as the active desktop 
 | Static, AUR, and COPR artifacts | Not tested | No release artifact is installed. A temporary candidate binary is not evidence for any package channel. |
 | Local-only and no-upload boundary | Not tested | The Doctor emitted only the expected redacted local facts, but no installed network-denied end-to-end gate was run. |
 
-The PC2 result is therefore **Prototype only** for read-only Doctor behavior, direct NVENC initialization, and synthetic audio routing. NVIDIA screen capture, GNOME Global Shortcuts activation, Steam integration, packages, services, and Clips remain **Not tested**.
+The PC2 result is therefore **Prototype only** for read-only Doctor behavior, corrected-verifier NVENC initialization, and synthetic audio routing. NVIDIA screen capture, GNOME Global Shortcuts activation, Steam integration, packages, services, and Clips remain **Not tested**.
 
 ### PC2 work still required for qualification
 
