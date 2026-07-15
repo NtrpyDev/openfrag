@@ -4,6 +4,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
+Slice=app.slice
 Environment=XDG_STATE_HOME=%S
 Environment=XDG_CACHE_HOME=%C
 Environment=XDG_RUNTIME_DIR=%t
