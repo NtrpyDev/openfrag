@@ -66,8 +66,14 @@ jobs:
           restore-keys: release-verify-${{ runner.os }}-
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy && rustup default 1.96.0
-      - name: Run full CI mirror
-        run: ./scripts/verify-ci.sh
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install pinned browser harness
+        run: npm ci --ignore-scripts --no-audit --no-fund && npx playwright install --with-deps chromium
+      - name: Run complete whole-app verification
+        run: python3 scripts/test_suite.py complete
 
   build:
     needs: verify
