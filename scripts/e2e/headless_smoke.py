@@ -375,11 +375,23 @@ def smoke(binary: Path) -> None:
         root = Path(temporary)
         data_directory = root / "data"
         cfg_directory = root / "cfg"
+        home_directory = root / "home"
         runtime_directory = root / "runtime"
-        for directory in (data_directory, cfg_directory, runtime_directory):
+        for directory in (data_directory, cfg_directory, home_directory, runtime_directory):
             directory.mkdir()
+        steam_directory = home_directory / ".steam/steam"
+        discovered_cfg = (
+            steam_directory
+            / "steamapps/common/Counter-Strike Global Offensive/game/csgo/cfg"
+        )
+        discovered_cfg.mkdir(parents=True)
+        (discovered_cfg.parent / "gameinfo.gi").write_text("gameinfo\n")
+        (steam_directory / "steamapps/appmanifest_730.acf").write_text(
+            '"AppState" { "installdir" "Counter-Strike Global Offensive" }\n'
+        )
         (runtime_directory / "pipewire-0").touch()
         environment = os.environ.copy()
+        environment["HOME"] = str(home_directory)
         environment["PATH"] = f"{fake_directory}{os.pathsep}{environment.get('PATH', '')}"
         environment["XDG_RUNTIME_DIR"] = str(runtime_directory)
         environment["XDG_SESSION_TYPE"] = "wayland"
