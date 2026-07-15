@@ -36,10 +36,38 @@ pub struct SetupCheck {
     pub id: String,
     pub status: String,
     pub summary: String,
+    pub actions: Vec<SetupAction>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SetupAction {
+    pub id: String,
+    pub label: String,
+    pub requires_consent: bool,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SetupCandidate {
+    pub path: String,
+    pub source: String,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SetupResponse {
+    pub fingerprint: String,
+    pub complete: bool,
     pub checks: Vec<SetupCheck>,
+    pub cs2_cfg_candidates: Vec<SetupCandidate>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct SetupActionRequest {
+    pub action: String,
+    pub expected_fingerprint: String,
+    #[serde(default)]
+    pub consent: bool,
+    pub step: Option<String>,
+    pub path: Option<PathBuf>,
+    pub recorder: Option<String>,
+    pub capture_target: Option<String>,
+    pub output_directory: Option<PathBuf>,
+    pub ffprobe_path: Option<PathBuf>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ImportJob {
@@ -117,6 +145,7 @@ pub struct ImportedFile {
 pub enum ApiError {
     NotFound,
     Invalid(String),
+    Conflict(String),
     Unavailable(String),
 }
 impl ApiError {
@@ -124,11 +153,12 @@ impl ApiError {
         let status = match self {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Invalid(_) => StatusCode::BAD_REQUEST,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
         let message = match self {
             Self::NotFound => "not found",
-            Self::Invalid(value) | Self::Unavailable(value) => value,
+            Self::Invalid(value) | Self::Conflict(value) | Self::Unavailable(value) => value,
         };
         (status, Json(json!({"message":message})))
     }
@@ -138,6 +168,11 @@ impl ApiError {
 pub trait LocalApi: Send + Sync + 'static {
     fn health(&self) -> Result<HealthResponse, ApiError>;
     fn setup(&self) -> Result<SetupResponse, ApiError>;
+    fn setup_action(&self, _: SetupActionRequest) -> Result<SetupResponse, ApiError> {
+        Err(ApiError::Unavailable(
+            "setup actions are not connected".into(),
+        ))
+    }
     fn import(&self, file: ImportedFile) -> Result<ImportJob, ApiError>;
     fn import_status(&self, id: &str) -> Result<ImportJob, ApiError>;
     fn matches(&self) -> Result<Vec<MatchSummary>, ApiError>;
@@ -177,6 +212,7 @@ pub fn router_without_health(service: Arc<dyn LocalApi>) -> Router {
 fn routes(service: Arc<dyn LocalApi>, include_health: bool) -> Router {
     let router = Router::new()
         .route("/api/setup", get(setup))
+        .route("/api/setup/actions", post(setup_action))
         .route("/api/imports", post(import))
         .route("/api/imports/{id}", get(import_status))
         .route("/api/matches", get(matches))
@@ -216,6 +252,19 @@ get_handler!(matches, matches, Vec<MatchSummary>);
 get_handler!(clips, clips, Vec<Clip>);
 get_handler!(diagnostics, diagnostics, Value);
 get_handler!(manual_flag, manual_flag, Value);
+async fn setup_action(
+    State(state): State<ApiState>,
+    Json(request): Json<SetupActionRequest>,
+) -> Result<Json<SetupResponse>, (StatusCode, Json<Value>)> {
+    let service = state.service.clone();
+    tokio::task::spawn_blocking(move || service.setup_action(request))
+        .await
+        .map_err(|error| {
+            ApiError::Unavailable(format!("setup action worker failed: {error}")).response()
+        })?
+        .map(Json)
+        .map_err(|error| error.response())
+}
 async fn import(
     State(state): State<ApiState>,
     mut multipart: Multipart,
@@ -404,7 +453,12 @@ impl LocalApi for EmptyLocalApi {
         })
     }
     fn setup(&self) -> Result<SetupResponse, ApiError> {
-        Ok(SetupResponse { checks: vec![] })
+        Ok(SetupResponse {
+            fingerprint: "empty".into(),
+            complete: false,
+            checks: vec![],
+            cs2_cfg_candidates: vec![],
+        })
     }
     fn import(&self, _: ImportedFile) -> Result<ImportJob, ApiError> {
         Err(ApiError::Unavailable(

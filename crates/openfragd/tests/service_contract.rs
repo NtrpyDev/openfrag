@@ -10,7 +10,12 @@ fn unavailable_mutations_are_explicit_without_a_pipeline() {
     let api = StorageApi::new(
         Arc::new(Mutex::new(storage)),
         UnavailablePorts,
-        SetupResponse { checks: vec![] },
+        SetupResponse {
+            fingerprint: "test".into(),
+            complete: false,
+            checks: vec![],
+            cs2_cfg_candidates: vec![],
+        },
     );
     assert!(matches!(api.manual_flag(), Err(ApiError::Unavailable(_))));
     assert!(api.matches().unwrap().is_empty());

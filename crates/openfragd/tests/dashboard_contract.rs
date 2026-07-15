@@ -4,6 +4,7 @@ fn dashboard_wires_local_contracts_accessibly_without_remote_state() {
     for endpoint in [
         "/api/health",
         "/api/setup",
+        "/api/setup/actions",
         "/api/imports",
         "/api/matches",
         "/api/receipts",
@@ -57,6 +58,10 @@ fn dashboard_exposes_complete_local_flows_and_honest_failure_states() {
         "loadClips()",
         "loadDiagnostics()",
         "loadSetup()",
+        "runSetupAction(setup, check, action)",
+        "expected_fingerprint",
+        "setup-cfg-manual",
+        "setup-target",
         "pollImport(job.id)",
         "['completed', 'failed', 'cancelled']",
         "method: 'PATCH'",

@@ -6,6 +6,7 @@ pub mod capture_runtime;
 pub mod clip_ports;
 pub mod live_runtime;
 pub mod service;
+pub mod setup_runtime;
 pub mod storage_clip_repository;
 
 use axum::{
@@ -36,6 +37,7 @@ pub struct AppConfig {
     data_directory: PathBuf,
     ffmpeg: Option<PathBuf>,
     ffprobe: Option<PathBuf>,
+    setup_home: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -44,6 +46,7 @@ impl AppConfig {
             data_directory: data_directory.into(),
             ffmpeg: None,
             ffprobe: None,
+            setup_home: None,
         }
     }
 
@@ -51,6 +54,12 @@ impl AppConfig {
     pub fn with_clip_tools(mut self, ffmpeg: PathBuf, ffprobe: PathBuf) -> Self {
         self.ffmpeg = Some(ffmpeg);
         self.ffprobe = Some(ffprobe);
+        self
+    }
+
+    #[must_use]
+    pub fn with_setup_home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.setup_home = Some(home.into());
         self
     }
 
@@ -120,6 +129,7 @@ pub fn app(config: &AppConfig) -> Result<Router, AppError> {
         clip_ports,
         Arc::new(service::UnavailablePorts),
     );
+    let setup_runtime = compose_setup_runtime(config, credentials.is_some())?;
     let local_api = service::StorageApi::new(
         storage.clone(),
         ports,
@@ -128,7 +138,8 @@ pub fn app(config: &AppConfig) -> Result<Router, AppError> {
             credentials.is_some(),
             local_steam_id.is_some(),
         ),
-    );
+    )
+    .with_setup_runtime(setup_runtime);
     let mut gsi_service = None;
     let mut runtime_worker = None;
     if let Some((token, steam_id)) = &credentials {
@@ -181,6 +192,37 @@ pub fn app(config: &AppConfig) -> Result<Router, AppError> {
         router = router.route("/gsi/router", post(gsi_unavailable));
     }
     Ok(router)
+}
+
+fn compose_setup_runtime(
+    config: &AppConfig,
+    gsi_active: bool,
+) -> Result<Arc<setup_runtime::SetupRuntime>, AppError> {
+    let home_is_explicit = config.setup_home.is_some();
+    let home = config
+        .setup_home
+        .clone()
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(|| config.data_directory.clone());
+    let config_directory = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|_| !home_is_explicit)
+        .map_or_else(|| home.join(".config"), PathBuf::from)
+        .join("openfrag");
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME")
+        .filter(|_| !home_is_explicit)
+        .map(PathBuf::from);
+    setup_runtime::SetupRuntime::new(
+        Arc::new(setup_runtime::SystemSetupHost::new(
+            home,
+            config.data_directory.clone(),
+            config_directory.clone(),
+            xdg_data_home,
+            gsi_active,
+        )),
+        config_directory.join("setup-state.json"),
+    )
+    .map(Arc::new)
+    .map_err(|error| AppError::Configuration(format!("cannot compose setup runtime: {error:?}")))
 }
 
 fn configured_ffprobe(config: &AppConfig) -> PathBuf {
@@ -279,6 +321,8 @@ fn setup_response(
         ),
     });
     api::SetupResponse {
+        fingerprint: "legacy-setup".into(),
+        complete: flow.ready(),
         checks: flow
             .steps
             .into_iter()
@@ -296,9 +340,11 @@ fn setup_response(
                     }
                     .into(),
                     summary,
+                    actions: vec![],
                 }
             })
             .collect(),
+        cs2_cfg_candidates: vec![],
     }
 }
 
@@ -495,9 +541,9 @@ mod tests {
                 .and_then(|check| check["status"].as_str())
         };
         assert_eq!(status("storage"), Some("ready"));
-        assert_eq!(status("local_steam_identity"), Some("blocked"));
-        assert_eq!(status("gsi"), Some("skipped"));
-        assert_eq!(status("capture"), Some("blocked"));
+        assert_eq!(status("local_identity"), Some("needs_action"));
+        assert_eq!(status("gsi"), Some("needs_action"));
+        assert_eq!(status("capture"), Some("unavailable"));
     }
 
     #[tokio::test]

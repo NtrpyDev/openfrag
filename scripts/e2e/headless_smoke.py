@@ -217,15 +217,25 @@ def verify_mounted_api_contracts(
         checks
         == {
             "storage": "ready",
-            "local_steam_identity": "ready",
             "gsi": "ready",
-            "capture": "blocked",
-            "ffprobe": "blocked",
-            "test_capture": "skipped",
+            "local_identity": "ready",
+            "capture": "needs_action",
+            "ffprobe": "ready",
+            "test_capture": "not_tested",
             "demo_import": "ready",
-            "manual_flag": "skipped",
+            "manual_flag": "unavailable",
+            "background": "needs_action",
         },
         f"unexpected setup API response: {setup}",
+    )
+    require(
+        setup.get("fingerprint", "").startswith("setup-"),
+        "setup response lacks a fingerprint",
+    )
+    require(setup.get("complete") is False, "unfinished first run was marked complete")
+    require(
+        setup.get("cs2_cfg_candidates"),
+        "setup omitted the discovered CS2 cfg directory",
     )
 
     for route, name in (("/api/matches", "matches"), ("/api/clips", "clips")):
@@ -237,7 +247,7 @@ def verify_mounted_api_contracts(
     require(status == 200, f"diagnostics API returned {status}: {body!r}")
     diagnostics = json.loads(body)
     require(
-        diagnostics == {"capture": "blocked", "gsi": "ready"},
+        diagnostics == {"capture": "needs_action", "gsi": "ready"},
         f"unexpected diagnostics API response: {diagnostics}",
     )
 

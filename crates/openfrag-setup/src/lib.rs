@@ -12,7 +12,7 @@ use serde::Serialize;
 use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -23,6 +23,9 @@ const GSI_FILE: &str = "gamestate_integration_openfrag.cfg";
 const TOKEN_FILE: &str = "gsi-token";
 const LOCAL_STEAM_ID_FILE: &str = "local-steam-id";
 const GSI_URI: &str = "http://127.0.0.1:7130/gsi/router";
+const BASE64_URL_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const MAX_STEAM_METADATA_BYTES: u64 = 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -326,6 +329,180 @@ fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), InstallError> {
     result.map_err(InstallError::Io)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionableGsiInstallation {
+    pub config_path: PathBuf,
+    pub marker_path: PathBuf,
+}
+
+/// Finds validated native, external, and Flatpak CS2 cfg directories without launching Steam.
+#[must_use]
+pub fn discover_cs2_cfg_directories(home: &Path, xdg_data_home: Option<&Path>) -> Vec<PathBuf> {
+    let steam_roots = vec![
+        xdg_data_home
+            .map_or_else(|| home.join(".local/share"), Path::to_path_buf)
+            .join("Steam"),
+        home.join(".steam/steam"),
+        home.join(".var/app/com.valvesoftware.Steam/data/Steam"),
+    ];
+    let mut libraries = Vec::new();
+    for root in &steam_roots {
+        libraries.push(root.clone());
+        if let Ok(vdf) = read_bounded_text(
+            &root.join("steamapps/libraryfolders.vdf"),
+            MAX_STEAM_METADATA_BYTES,
+        ) {
+            libraries.extend(vdf_values(&vdf, "path").into_iter().map(PathBuf::from));
+        }
+    }
+    libraries.sort();
+    libraries.dedup();
+    let mut candidates = Vec::new();
+    for library in libraries {
+        let manifest = library.join("steamapps/appmanifest_730.acf");
+        let Ok(manifest) = read_bounded_text(&manifest, MAX_STEAM_METADATA_BYTES) else {
+            continue;
+        };
+        for install_dir in vdf_values(&manifest, "installdir") {
+            let cfg = library
+                .join("steamapps/common")
+                .join(install_dir)
+                .join("game/csgo/cfg");
+            if validate_cs2_cfg_directory(&cfg).is_ok() {
+                candidates.push(cfg);
+            }
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+pub fn validate_cs2_cfg_directory(path: &Path) -> Result<(), InstallError> {
+    require_real_directory(path, "CS2 cfg directory")?;
+    if path.file_name().and_then(|part| part.to_str()) != Some("cfg")
+        || path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|part| part.to_str())
+            != Some("csgo")
+        || path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .and_then(|part| part.to_str())
+            != Some("game")
+    {
+        return Err(InstallError::InvalidDirectory("CS2 cfg directory"));
+    }
+    let Some(parent) = path.parent() else {
+        return Err(InstallError::InvalidDirectory("CS2 cfg directory"));
+    };
+    let gameinfo = parent.join("gameinfo.gi");
+    let metadata = fs::symlink_metadata(gameinfo).map_err(InstallError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || has_symlink_component(path)? {
+        return Err(InstallError::UnsafeTarget("CS2 cfg directory"));
+    }
+    Ok(())
+}
+
+/// Installs only the loopback GSI file and its private random marker. Identity is learned later.
+pub fn install_actionable_gsi(
+    cs2_cfg_directory: &Path,
+    config_directory: &Path,
+) -> Result<ActionableGsiInstallation, InstallError> {
+    validate_cs2_cfg_directory(cs2_cfg_directory)?;
+    fs::create_dir_all(config_directory)?;
+    require_real_directory(config_directory, "config directory")?;
+    if has_symlink_component(config_directory)? {
+        return Err(InstallError::UnsafeTarget("config directory"));
+    }
+    fs::set_permissions(config_directory, fs::Permissions::from_mode(0o700))?;
+    let config_path = cs2_cfg_directory.join(GSI_FILE);
+    let marker_path = config_directory.join("gsi-marker");
+    require_safe_target(&config_path, "GSI config")?;
+    require_safe_target(&marker_path, "GSI marker")?;
+    let marker = match fs::read_to_string(&marker_path) {
+        Ok(value) if valid_marker(value.trim()) => value.trim().to_owned(),
+        Ok(_) => return Err(InstallError::InvalidToken),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => random_marker()?,
+        Err(error) => return Err(InstallError::Io(error)),
+    };
+    atomic_write_private(&marker_path, format!("{marker}\n").as_bytes())?;
+    atomic_write_private(&config_path, gsi_config(&marker).as_bytes())?;
+    Ok(ActionableGsiInstallation {
+        config_path,
+        marker_path,
+    })
+}
+
+fn vdf_values(input: &str, wanted: &str) -> Vec<String> {
+    let quoted = input
+        .split('"')
+        .enumerate()
+        .filter_map(|(index, value)| (index % 2 == 1).then_some(value))
+        .collect::<Vec<_>>();
+    quoted
+        .windows(2)
+        .filter(|pair| pair[0].eq_ignore_ascii_case(wanted))
+        .map(|pair| pair[1].replace("\\\\", "\\"))
+        .collect()
+}
+
+fn read_bounded_text(path: &Path, limit: u64) -> Result<String, std::io::Error> {
+    let mut contents = String::new();
+    fs::File::open(path)?
+        .take(limit.saturating_add(1))
+        .read_to_string(&mut contents)?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Steam metadata exceeds the setup discovery limit",
+        ));
+    }
+    Ok(contents)
+}
+
+fn has_symlink_component(path: &Path) -> Result<bool, InstallError> {
+    let mut current = Some(path);
+    while let Some(component) = current {
+        match fs::symlink_metadata(component) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) => return Err(InstallError::Io(error)),
+        }
+        current = component.parent();
+    }
+    Ok(false)
+}
+
+fn valid_marker(marker: &str) -> bool {
+    marker.len() == 43
+        && marker
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn random_marker() -> Result<String, InstallError> {
+    let mut bytes = [0_u8; 32];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let mut output = String::with_capacity(43);
+    for chunk in bytes.chunks(3) {
+        let value = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        output.push(BASE64_URL_ALPHABET[((value >> 18) & 63) as usize] as char);
+        output.push(BASE64_URL_ALPHABET[((value >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(BASE64_URL_ALPHABET[((value >> 6) & 63) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            output.push(BASE64_URL_ALPHABET[(value & 63) as usize] as char);
+        }
+    }
+    Ok(output)
+}
+
 /// Headless discovery is deliberately separate from the stable setup facts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Discovery {
@@ -584,5 +761,38 @@ mod discovery_tests {
         assert!(matches!(host.ffprobe, Discovery::Missing(_)));
         assert!(matches!(host.data_directory, Discovery::Unknown(_)));
         assert!(!HostFacts::from(&host).global_shortcuts_portal);
+    }
+
+    #[test]
+    fn external_steam_library_is_discovered_and_installs_identity_free_gsi() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let steamapps = home.join(".local/share/Steam/steamapps");
+        let library = temp.path().join("external");
+        let cfg = library.join("steamapps/common/CS2/game/csgo/cfg");
+        fs::create_dir_all(&steamapps).unwrap();
+        fs::create_dir_all(&cfg).unwrap();
+        fs::write(cfg.parent().unwrap().join("gameinfo.gi"), "gameinfo").unwrap();
+        fs::write(
+            steamapps.join("libraryfolders.vdf"),
+            format!(
+                r#""libraryfolders" {{ "4" {{ "path" "{}" }} }}"#,
+                library.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            library.join("steamapps/appmanifest_730.acf"),
+            r#""AppState" { "installdir" "CS2" }"#,
+        )
+        .unwrap();
+
+        assert_eq!(discover_cs2_cfg_directories(&home, None), vec![cfg.clone()]);
+        let installed = install_actionable_gsi(&cfg, &home.join(".config/openfrag")).unwrap();
+        let marker = fs::read_to_string(installed.marker_path).unwrap();
+        assert_eq!(marker.trim().len(), 43);
+        let config = fs::read_to_string(installed.config_path).unwrap();
+        assert!(config.contains(GSI_URI));
+        assert!(!home.join(".config/openfrag/local-steam-id").exists());
     }
 }

@@ -23,8 +23,8 @@ fn emits_the_complete_ordered_v1_flow_and_explicit_exclusions() {
         flow.steps.iter().map(|step| step.id).collect::<Vec<_>>(),
         vec![
             SetupStepId::Storage,
-            SetupStepId::LocalSteamIdentity,
             SetupStepId::GsiConfig,
+            SetupStepId::LocalSteamIdentity,
             SetupStepId::CaptureRecorder,
             SetupStepId::Ffprobe,
             SetupStepId::TestCapture,
@@ -134,4 +134,25 @@ fn independent_gsi_demo_and_capture_failures_keep_their_own_exact_actions() {
 fn reevaluation_is_deterministic_and_has_no_external_actions() {
     let facts = all_ready();
     assert_eq!(evaluate_setup_flow(&facts), evaluate_setup_flow(&facts));
+}
+
+#[test]
+fn storage_is_the_only_completion_gate_and_identity_does_not_block_gsi_or_demo() {
+    let mut facts = all_ready();
+    facts.local_steam_identity = SetupFact::blocked(
+        "identity not observed",
+        "Wait for verified GSI or Demo evidence.",
+    );
+    facts.capture_recorder = SetupFact::blocked("capture absent", "Configure capture later.");
+    let flow = evaluate_setup_flow(&facts);
+
+    assert!(flow.ready());
+    assert_eq!(
+        flow.step(SetupStepId::GsiConfig).unwrap().status,
+        SetupStepStatus::Ready
+    );
+    assert_eq!(
+        flow.step(SetupStepId::LocalDemoValidation).unwrap().status,
+        SetupStepStatus::Ready
+    );
 }

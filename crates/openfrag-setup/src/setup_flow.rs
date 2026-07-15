@@ -118,9 +118,8 @@ impl SetupFlow {
 
     #[must_use]
     pub fn ready(&self) -> bool {
-        self.steps
-            .iter()
-            .all(|step| step.status == SetupStepStatus::Ready)
+        self.step(SetupStepId::Storage)
+            .is_some_and(|step| step.status == SetupStepStatus::Ready)
     }
 }
 
@@ -131,15 +130,15 @@ pub fn evaluate_setup_flow(facts: &SetupFacts) -> SetupFlow {
     push_step(&mut steps, SetupStepId::Storage, &facts.storage, &[]);
     push_step(
         &mut steps,
-        SetupStepId::LocalSteamIdentity,
-        &facts.local_steam_identity,
+        SetupStepId::GsiConfig,
+        &facts.gsi_config,
         &[SetupStepId::Storage],
     );
     push_step(
         &mut steps,
-        SetupStepId::GsiConfig,
-        &facts.gsi_config,
-        &[SetupStepId::Storage, SetupStepId::LocalSteamIdentity],
+        SetupStepId::LocalSteamIdentity,
+        &facts.local_steam_identity,
+        &[SetupStepId::Storage],
     );
     push_step(
         &mut steps,
@@ -162,7 +161,7 @@ pub fn evaluate_setup_flow(facts: &SetupFacts) -> SetupFlow {
         &mut steps,
         SetupStepId::LocalDemoValidation,
         &facts.local_demo_validation,
-        &[SetupStepId::Storage, SetupStepId::LocalSteamIdentity],
+        &[SetupStepId::Storage],
     );
     push_step(
         &mut steps,

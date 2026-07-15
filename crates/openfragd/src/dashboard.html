@@ -31,7 +31,9 @@
       <section data-panel="matches" class="hidden"><h1>Matches</h1><ul id="match-list" class="list" aria-live="polite"></ul><article id="match-detail" class="panel" aria-live="polite"><p class="muted">Select a local match.</p></article></section>
       <section data-panel="clips" class="hidden"><h1>Clip review</h1><ul id="clip-list" class="list" aria-live="polite"></ul></section>
       <section data-panel="diagnostics" class="hidden"><h1>Capture and GSI diagnostics</h1><pre id="diagnostics-output" class="panel" aria-live="polite">Select Diagnostics to load local status.</pre></section>
-      <section data-panel="setup" class="hidden"><h1>Setup status</h1><ul id="setup-output" class="panel list" aria-live="polite"><li>Select Setup to load local checks.</li></ul></section>
+      <section data-panel="setup" class="hidden"><h1>First-run setup</h1><p class="muted">Each capability is independent. You can defer optional steps and return later.</p>
+        <div class="panel grid"><label for="setup-cfg">CS2 cfg directory<select id="setup-cfg"><option value="">Enter a path below</option></select></label><label for="setup-cfg-manual">Manual game/csgo/cfg path<input id="setup-cfg-manual" autocomplete="off"></label><label for="setup-recorder">Recorder<select id="setup-recorder"><option value="native">Native</option><option value="flatpak">Flatpak</option></select></label><label for="setup-recorder-path">Native recorder path<input id="setup-recorder-path" autocomplete="off"></label><label for="setup-target">Capture target<input id="setup-target" placeholder="screen" autocomplete="off"></label><label for="setup-output-dir">Capture output directory<input id="setup-output-dir" autocomplete="off"></label><label for="setup-ffprobe">ffprobe path<input id="setup-ffprobe" autocomplete="off"></label></div>
+        <p id="setup-completion" class="muted" role="status"></p><ul id="setup-output" class="panel list" aria-live="polite"><li>Select Setup to load local checks.</li></ul></section>
     </main>
   </div>
   <dialog id="clip-editor" aria-labelledby="clip-editor-title"><form id="clip-form" method="dialog"><h2 id="clip-editor-title">Review clip</h2><video id="clip-preview" controls preload="metadata">Local Clip preview is unavailable in this browser.</video><input id="clip-id" type="hidden"><label for="clip-title">Title<input id="clip-title" required></label><label for="clip-note">Note<textarea id="clip-note"></textarea></label><label for="clip-tags">Tags (comma separated)<input id="clip-tags"></label><label for="clip-decision">Review decision<select id="clip-decision"><option value="keep">Keep</option><option value="reject">Reject</option></select></label><label for="clip-trim-start">Trim start in milliseconds<input id="clip-trim-start" type="number" min="0" step="1" value="0" required></label><label for="clip-trim-end">Trim end in milliseconds<input id="clip-trim-end" type="number" min="1" step="1" required></label><p class="muted">The local service validates the requested range against the source clip duration.</p><div class="row"><button class="button" value="cancel">Cancel</button><button id="clip-save" class="button primary" value="default">Save review</button><button id="clip-trim" class="button" type="button">Trim local clip</button><button id="clip-export" class="button" type="button">Export local file</button></div></form></dialog>
@@ -108,10 +110,59 @@
       output.setAttribute('aria-busy', 'true');
       try {
         const setup = await api('/api/setup');
-        output.replaceChildren(...setup.checks.map(check => emptyItem(`${check.id}: ${check.status}. ${check.summary}`)));
+        renderSetup(setup);
         if (!setup.checks.length) output.replaceChildren(emptyItem('No setup checks were returned.'));
       } catch (error) { output.replaceChildren(emptyItem(`Setup status unavailable: ${error.message}`)); announce(`Setup status unavailable: ${error.message}`); }
       finally { output.removeAttribute('aria-busy'); }
+    }
+
+    function renderSetup(setup) {
+      const output = $('#setup-output');
+      $('#setup-completion').textContent = setup.complete ? 'First-run choices are complete.' : 'Choose an action or defer each optional capability.';
+      const cfg = $('#setup-cfg');
+      cfg.replaceChildren(new Option('Enter a path below', ''), ...(setup.cs2_cfg_candidates ?? []).map(candidate => new Option(candidate.path, candidate.path)));
+      output.replaceChildren(...setup.checks.map(check => {
+        const item = document.createElement('li');
+        const status = document.createElement('p');
+        status.textContent = `${check.id}: ${check.status}. ${check.summary}`;
+        item.append(status);
+        for (const action of check.actions ?? []) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'button';
+          button.textContent = action.label;
+          button.onclick = () => void runSetupAction(setup, check, action);
+          item.append(button);
+        }
+        return item;
+      }));
+    }
+
+    async function runSetupAction(setup, check, action) {
+      const consent = action.requires_consent
+        ? window.confirm(`${action.label}? openfrag will only change the local paths shown here.`)
+        : action.id === 'set_background' && action.label.startsWith('Enable');
+      if (action.requires_consent && !consent) return;
+      const selectedCfg = $('#setup-cfg').value || $('#setup-cfg-manual').value.trim();
+      const request = {
+        action: action.id,
+        step: action.id === 'skip' ? check.id : null,
+        expected_fingerprint: setup.fingerprint,
+        consent,
+        path: action.id === 'install_gsi' ? selectedCfg : ($('#setup-recorder-path').value.trim() || null),
+        recorder: $('#setup-recorder').value,
+        capture_target: $('#setup-target').value.trim() || null,
+        output_directory: $('#setup-output-dir').value.trim() || null,
+        ffprobe_path: $('#setup-ffprobe').value.trim() || null
+      };
+      try {
+        const updated = await api('/api/setup/actions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request) });
+        renderSetup(updated);
+        announce(`${action.label} completed.`);
+      } catch (error) {
+        announce(`Setup action unavailable: ${error.message}`);
+        if (error.message.includes('reload')) void loadSetup();
+      }
     }
 
     async function loadMatches() {

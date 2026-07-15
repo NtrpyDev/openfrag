@@ -3,8 +3,10 @@
 
 use crate::api::{
     ApiError, Clip, ClipPreview, ClipTrimRequest, ClipUpdate, HealthResponse, ImportJob,
-    ImportedFile, LocalApi, MatchDetail, MatchSummary, RatingState, ReceiptRef, SetupResponse,
+    ImportedFile, LocalApi, MatchDetail, MatchSummary, RatingState, ReceiptRef, SetupActionRequest,
+    SetupResponse,
 };
+use crate::setup_runtime::SetupRuntime;
 use openfrag_pipeline::{ImportOutcome, ImportRequest, ImportService, PinnedParser, PipelineError};
 use openfrag_storage::{ImportPhase, Storage, StoredRatingAvailability};
 use serde_json::{Value, json};
@@ -176,6 +178,7 @@ pub struct StorageApi<P> {
     storage: Arc<Mutex<Storage>>,
     ports: P,
     setup: SetupResponse,
+    setup_runtime: Option<Arc<SetupRuntime>>,
 }
 impl<P> StorageApi<P> {
     #[must_use]
@@ -184,7 +187,14 @@ impl<P> StorageApi<P> {
             storage,
             ports,
             setup,
+            setup_runtime: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_setup_runtime(mut self, setup_runtime: Arc<SetupRuntime>) -> Self {
+        self.setup_runtime = Some(setup_runtime);
+        self
     }
 }
 impl<P: MutationPorts> LocalApi for StorageApi<P> {
@@ -195,7 +205,15 @@ impl<P: MutationPorts> LocalApi for StorageApi<P> {
         })
     }
     fn setup(&self) -> Result<SetupResponse, ApiError> {
-        Ok(self.setup.clone())
+        self.setup_runtime
+            .as_ref()
+            .map_or_else(|| Ok(self.setup.clone()), |runtime| runtime.response())
+    }
+    fn setup_action(&self, request: SetupActionRequest) -> Result<SetupResponse, ApiError> {
+        self.setup_runtime
+            .as_ref()
+            .ok_or_else(|| ApiError::Unavailable("setup actions are not connected".into()))?
+            .act(request)
     }
     fn import(&self, file: ImportedFile) -> Result<ImportJob, ApiError> {
         self.ports.import(file)
@@ -291,8 +309,9 @@ impl<P: MutationPorts> LocalApi for StorageApi<P> {
         self.ports.manual_flag()
     }
     fn diagnostics(&self) -> Result<Value, ApiError> {
+        let setup = self.setup()?;
         let status = |id: &str| {
-            self.setup
+            setup
                 .checks
                 .iter()
                 .find(|check| check.id == id)
