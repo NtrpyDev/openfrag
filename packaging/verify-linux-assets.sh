@@ -13,6 +13,8 @@ release_builder="$root/build-release-bundle.sh"
 release_verifier="$root/verify-release-bundle.sh"
 source_builder="$root/build-source-bundle.sh"
 channel_verifier="$root/verify-channel-packages.sh"
+aur_verifier="$root/aur/verify-package.sh"
+rpm_verifier="$root/rpm/verify-package.sh"
 verification_root=$(mktemp -d "${TMPDIR:-/tmp}/openfrag-systemd-verify.XXXXXXXX")
 trap 'rm -rf -- "$verification_root"' EXIT HUP INT TERM
 
@@ -76,6 +78,8 @@ bash -n "$release_builder"
 bash -n "$release_verifier"
 bash -n "$source_builder"
 bash -n "$channel_verifier"
+bash -n "$aur_verifier"
+bash -n "$rpm_verifier"
 command -v desktop-file-validate >/dev/null 2>&1 || {
     printf '%s\n' 'desktop-file-validate is required for package verification' >&2
     exit 1

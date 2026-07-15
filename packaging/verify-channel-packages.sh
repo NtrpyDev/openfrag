@@ -2,72 +2,76 @@
 # Verifies native channel recipes and optionally an extracted package filesystem.
 set -euo pipefail
 
-if (( $# != 0 && $# != 2 )) || (( $# == 2 )) && [[ $1 != --root ]]; then
-    printf '%s\n' 'Usage: packaging/verify-channel-packages.sh [--root <package-root>]' >&2
+if (( $# != 0 && $# != 2 )) || (( $# == 2 )) && [[ $1 != --root && $1 != --root-only ]]; then
+    printf '%s\n' 'Usage: packaging/verify-channel-packages.sh [--root|--root-only <package-root>]' >&2
     exit 2
 fi
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 aur="$repo/packaging/aur"
 spec="$repo/packaging/rpm/openfrag.spec"
-version=$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)"$/\1/p' "$repo/Cargo.toml")
-source_name="openfrag-v${version}-source.tar.gz"
-expected_sha=$(sed -n "s/^sha256sums=('\([0-9a-f]\{64\}\)')$/\1/p" "$aur/PKGBUILD")
-spec_sha=$(sed -n 's/^%global source_sha256 \([0-9a-f]\{64\}\)$/\1/p' "$spec")
-
-test "$version" = 1.0.0
-test ${#expected_sha} -eq 64
-test "$expected_sha" = "$spec_sha"
-grep -Fqx "pkgver=$version" "$aur/PKGBUILD"
-grep -Fqx "Version:        $version" "$spec"
-grep -Fq "releases/download/v\${pkgver}/\${pkgname}-v\${pkgver}-source.tar.gz" "$aur/PKGBUILD"
-grep -Fq 'releases/download/v%{version}/%{name}-v%{version}-source.tar.gz' "$spec"
-grep -Fq 'cargo build --frozen --release -p openfragd' "$aur/PKGBUILD"
-grep -Fq 'cargo build --frozen --release -p openfragd' "$spec"
-
-if grep -E '^depends=.*(steam|gpu-screen-recorder)' "$aur/PKGBUILD"; then
-    printf '%s\n' 'AUR package has an optional host capability as a hard dependency.' >&2
-    exit 1
-fi
-if grep -Ei '^Requires:.*(steam|gpu-screen-recorder)' "$spec"; then
-    printf '%s\n' 'RPM package has an optional host capability as a hard dependency.' >&2
-    exit 1
-fi
-if grep -Ei '(systemctl|%systemd_user_(post|preun|postun))' "$aur/PKGBUILD" "$spec"; then
-    printf '%s\n' 'Native package recipes must not enable, start, stop, or disable the user service.' >&2
-    exit 1
-fi
-
-generated=$(mktemp)
+generated=
 stage=$(mktemp -d "${TMPDIR:-/tmp}/openfrag-channel-verify.XXXXXXXX")
 cleanup() {
     rm -f -- "$generated"
     rm -rf -- "$stage"
 }
 trap cleanup EXIT HUP INT TERM
-(
-    cd "$aur"
-    makepkg --printsrcinfo
-) >"$generated"
-cmp "$generated" "$aur/.SRCINFO"
-if command -v namcap >/dev/null 2>&1; then
-    namcap "$aur/PKGBUILD"
-fi
-if command -v rpmspec >/dev/null 2>&1; then
-    rpmspec -P "$spec" >/dev/null
-fi
 
-if ! "$repo/packaging/build-source-bundle.sh" "$stage" >"$stage/builder.log" 2>&1; then
-    cat "$stage/builder.log" >&2
-    exit 1
+if (( $# == 0 )) || [[ $1 == --root ]]; then
+    version=$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)"$/\1/p' "$repo/Cargo.toml")
+    source_name="openfrag-v${version}-source.tar.gz"
+    expected_sha=$(sed -n "s/^sha256sums=('\([0-9a-f]\{64\}\)')$/\1/p" "$aur/PKGBUILD")
+    spec_sha=$(sed -n 's/^%global source_sha256 \([0-9a-f]\{64\}\)$/\1/p' "$spec")
+
+    test "$version" = 1.0.0
+    test ${#expected_sha} -eq 64
+    test "$expected_sha" = "$spec_sha"
+    grep -Fqx "pkgver=$version" "$aur/PKGBUILD"
+    grep -Fqx "Version:        $version" "$spec"
+    grep -Fq "releases/download/v\${pkgver}/\${pkgname}-v\${pkgver}-source.tar.gz" "$aur/PKGBUILD"
+    grep -Fq 'releases/download/v%{version}/%{name}-v%{version}-source.tar.gz' "$spec"
+    grep -Fq 'cargo build --frozen --release -p openfragd' "$aur/PKGBUILD"
+    grep -Fq 'cargo build --frozen --release -p openfragd' "$spec"
+
+    if grep -E '^depends=.*(steam|gpu-screen-recorder)' "$aur/PKGBUILD"; then
+        printf '%s\n' 'AUR package has an optional host capability as a hard dependency.' >&2
+        exit 1
+    fi
+    if grep -Ei '^Requires:.*(steam|gpu-screen-recorder)' "$spec"; then
+        printf '%s\n' 'RPM package has an optional host capability as a hard dependency.' >&2
+        exit 1
+    fi
+    if grep -Ei '(systemctl|%systemd_user_(post|preun|postun))' "$aur/PKGBUILD" "$spec"; then
+        printf '%s\n' 'Native package recipes must not enable, start, stop, or disable the user service.' >&2
+        exit 1
+    fi
+
+    generated=$(mktemp)
+    (
+        cd "$aur"
+        makepkg --printsrcinfo
+    ) >"$generated"
+    cmp "$generated" "$aur/.SRCINFO"
+    if command -v namcap >/dev/null 2>&1; then
+        namcap "$aur/PKGBUILD"
+    fi
+    if command -v rpmspec >/dev/null 2>&1; then
+        rpmspec -P "$spec" >/dev/null
+    fi
+
+    if ! "$repo/packaging/build-source-bundle.sh" "$stage" >"$stage/builder.log" 2>&1; then
+        cat "$stage/builder.log" >&2
+        exit 1
+    fi
+    actual_sha=$(sha256sum "$stage/$source_name")
+    actual_sha=${actual_sha%% *}
+    test "$actual_sha" = "$expected_sha"
+    (
+        cd "$stage"
+        sha256sum -c "$source_name.sha256"
+    )
 fi
-actual_sha=$(sha256sum "$stage/$source_name")
-actual_sha=${actual_sha%% *}
-test "$actual_sha" = "$expected_sha"
-(
-    cd "$stage"
-    sha256sum -c "$source_name.sha256"
-)
 
 if (( $# == 0 )); then
     printf '%s\n' 'AUR and COPR recipes match the deterministic vendored source contract.'
