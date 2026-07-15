@@ -17,7 +17,7 @@ V1 implementation is in progress from the decisions on the [wayfinder map](../..
 
 ## Support status
 
-No environment is release-qualified yet. Physical prototypes have established limited KDE Wayland evidence, while installed-package, recorder, and cross-machine gates remain open. See the exact [support matrix](docs/support-matrix.md).
+No environment is release-qualified yet. Physical and read-only prototypes have established limited KDE and GNOME Wayland evidence, while installed-package and recorder gates remain open. See the exact [support matrix](docs/support-matrix.md).
 
 ## Stack
 
