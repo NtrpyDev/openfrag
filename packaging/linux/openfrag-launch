@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Starts the canonical user service and opens the loopback dashboard.
+set -eu
+
+host=127.0.0.1
+port=7130
+url="http://${host}:${port}/"
+service=app-io.github.ntrpydev.openfrag.service
+
+if ! command -v systemctl >/dev/null 2>&1; then
+    printf '%s\n' 'OpenFrag requires a systemd user service on this package.' >&2
+    exit 1
+fi
+if ! systemctl --user start "$service"; then
+    printf 'Could not start %s.\n' "$service" >&2
+    exit 1
+fi
+
+attempt=0
+while ! (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; do
+    attempt=$((attempt + 1))
+    if (( attempt >= 50 )); then
+        break
+    fi
+    sleep 0.1
+done
+if (( attempt >= 50 )); then
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send --app-name=OpenFrag 'OpenFrag did not start' 'Check the openfrag user service, then try again.'
+    else
+        printf '%s\n' 'OpenFrag did not start; check the openfrag user service.' >&2
+    fi
+    exit 1
+fi
+exec 3>&-
+exec xdg-open "${url}"
