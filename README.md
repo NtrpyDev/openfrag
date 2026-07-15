@@ -17,7 +17,7 @@ Pre-development. Planning happens in the open on the [wayfinder map](../../issue
 
 ## Support status
 
-No environment is release-qualified yet. Physical prototypes have established limited KDE Wayland evidence, while installed-package, recorder, and cross-machine gates remain open. See the exact [support matrix](docs/support-matrix.md).
+No environment is release-qualified yet. Physical and read-only prototypes have established limited KDE and GNOME Wayland evidence, while installed-package and recorder gates remain open. See the exact [support matrix](docs/support-matrix.md).
 
 ## Stack
 
