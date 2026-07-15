@@ -500,6 +500,7 @@ async fn authenticated_gsi_deadline_finalizes_one_clip_and_shuts_down_capture() 
     );
     let worker = RuntimeWorker::start(driver, gsi.clone()).expect("runtime worker");
     let router = openfrag_gsi::router(gsi);
+    let inspector = Storage::open(layout.clone()).expect("inspection storage");
     for (round, timestamp) in [(1, 1), (2, 2)] {
         let payload = format!(
             r#"{{"provider":{{"appid":730,"timestamp":{timestamp}}},"map":{{"name":"de_mirage","mode":"competitive","round":{round}}},"player":{{"steamid":"76561198000000000","state":{{"health":100,"round_kills":0}},"match_stats":{{"kills":0,"deaths":0}}}},"auth":{{"token":"private-test-token"}}}}"#
@@ -519,11 +520,7 @@ async fn authenticated_gsi_deadline_finalizes_one_clip_and_shuts_down_capture() 
     clock.0.store(50_000, Ordering::SeqCst);
     let mut clip_count = 0;
     for _ in 0..100 {
-        clip_count = Storage::open(layout.clone())
-            .expect("reopen storage")
-            .list_clips()
-            .expect("Clips")
-            .len();
+        clip_count = inspector.list_clips().expect("Clips").len();
         if clip_count == 1 {
             break;
         }
@@ -575,6 +572,7 @@ fn production_manual_flag_boundary_restores_reconnects_and_closes_without_a_desk
         runtime.clone(),
     );
     let runtime_worker = RuntimeWorker::start(driver, gsi).expect("runtime worker");
+    let inspector = Storage::open(layout.clone()).expect("inspection storage");
     let (portal, signals) = BoundaryPortal::new();
     let shortcut_worker = ManualFlagWorker::start(
         portal.clone(),
@@ -610,20 +608,13 @@ fn production_manual_flag_boundary_restores_reconnects_and_closes_without_a_desk
         .send(PortalSignal::Activated(MANUAL_FLAG_ID.into()))
         .expect("held activation");
     for _ in 0..200 {
-        if Storage::open(layout.clone())
-            .and_then(|storage| storage.list_clips())
-            .is_ok_and(|clips| clips.len() == 1)
-        {
+        if inspector.list_clips().is_ok_and(|clips| clips.len() == 1) {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
-        Storage::open(layout.clone())
-            .expect("clip storage")
-            .list_clips()
-            .expect("clips")
-            .len(),
+        inspector.list_clips().expect("clips").len(),
         1,
         "worker status: {:?}; runtime diagnostics: {:?}",
         shortcut_worker.status(),

@@ -16,6 +16,6 @@ pkgbase = openfrag
 	optdepends = steam: Counter-Strike 2 integration
 	options = !lto
 	source = openfrag-v1.0.0-source.tar.gz::https://github.com/NtrpyDev/openfrag/releases/download/v1.0.0/openfrag-v1.0.0-source.tar.gz
-	sha256sums = 9e109aa1a2205613ff0607111903a13a8497333e3b28cef1ae359b3b314531e4
+	sha256sums = 84a415c33eaaee072479c350f43361a1c5009d38015e736060aafcfac25490d6
 
 pkgname = openfrag

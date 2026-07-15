@@ -8,7 +8,7 @@ URL:            https://github.com/NtrpyDev/openfrag
 Source0:        %{url}/releases/download/v%{version}/%{name}-v%{version}-source.tar.gz
 ExclusiveArch:  x86_64
 
-%global source_sha256 9e109aa1a2205613ff0607111903a13a8497333e3b28cef1ae359b3b314531e4
+%global source_sha256 84a415c33eaaee072479c350f43361a1c5009d38015e736060aafcfac25490d6
 
 BuildRequires:  cargo >= 1.96
 BuildRequires:  desktop-file-utils
