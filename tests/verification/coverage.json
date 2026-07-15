@@ -1,0 +1,367 @@
+{
+  "version": 1,
+  "requirements": [
+    {
+      "id": "daemon.cli-contract",
+      "surface": "daemon_cli",
+      "behavior": "The openfragd CLI exposes version, Doctor, GSI setup, serving, and explicit local data paths.",
+      "failure_modes": [
+        "Invalid arguments fail without mutating user state.",
+        "Doctor reports unavailable host capabilities instead of fabricating readiness."
+      ],
+      "verifiers": ["rust-daemon", "e2e-headless"],
+      "evidence": [
+        "crates/openfragd/tests/cli.rs::public CLI contracts",
+        "scripts/e2e/headless_smoke.py::verify_doctor"
+      ]
+    },
+    {
+      "id": "daemon.loopback-api",
+      "surface": "loopback_api",
+      "behavior": "The HTTP API serves health, setup, imports, Matches, Receipts, Clips, diagnostics, and Manual Flag only on loopback.",
+      "failure_modes": [
+        "Invalid routes, payloads, and state return explicit local errors.",
+        "The daemon owns no non-loopback listener or remote connection."
+      ],
+      "verifiers": ["rust-daemon", "e2e-headless", "e2e-installed"],
+      "evidence": [
+        "crates/openfragd/tests/api_contract.rs::API contract",
+        "scripts/e2e/installed_mvp.py::assert_loopback_only"
+      ]
+    },
+    {
+      "id": "daemon.gsi-authorization",
+      "surface": "loopback_api",
+      "behavior": "GSI ingestion accepts only authenticated, bounded, correctly typed local snapshots.",
+      "failure_modes": [
+        "Wrong tokens, wrong player identity, malformed JSON, oversized bodies, and duplicate snapshots do not emit false evidence."
+      ],
+      "verifiers": ["rust-domain", "e2e-headless"],
+      "evidence": [
+        "crates/openfrag-gsi/tests/gsi_router.rs::authorization and input boundaries",
+        "scripts/e2e/headless_smoke.py::smoke"
+      ]
+    },
+    {
+      "id": "dashboard.local-ui",
+      "surface": "dashboard",
+      "behavior": "A real browser can navigate Tonight, Matches, Clips, Diagnostics, and Setup through the embedded local dashboard.",
+      "failure_modes": [
+        "Unavailable local capabilities render honest accessible failure states.",
+        "No remote asset or request is permitted."
+      ],
+      "verifiers": ["rust-daemon", "browser-dashboard"],
+      "evidence": [
+        "crates/openfragd/tests/dashboard_contract.rs::dashboard public contract",
+        "tests/browser/dashboard.spec.mjs::real browser journey"
+      ]
+    },
+    {
+      "id": "setup.first-run-flow",
+      "surface": "setup",
+      "behavior": "The Setup Wizard evaluates independent storage, GSI, Demo, capture, and Manual Flag choices with exact remediation.",
+      "failure_modes": [
+        "Dependency failures skip only dependent steps.",
+        "Stale actions and actions without consent cannot mutate the host."
+      ],
+      "verifiers": ["rust-domain", "rust-daemon", "browser-dashboard"],
+      "evidence": [
+        "crates/openfrag-setup/tests/setup_flow.rs::ordered first-run flow",
+        "crates/openfragd/src/setup_runtime.rs::consent and stale action tests"
+      ]
+    },
+    {
+      "id": "setup.compatibility-doctor",
+      "surface": "setup",
+      "behavior": "Compatibility Doctor verifies storage, Steam and CS2, GSI, media tools, capture, and shortcut readiness without requiring every optional capability.",
+      "failure_modes": [
+        "Missing software and inaccessible paths remain actionable blocked or warning states.",
+        "Private paths and identifiers are redacted from diagnostics."
+      ],
+      "verifiers": ["rust-domain", "e2e-headless", "e2e-installed"],
+      "evidence": [
+        "crates/openfrag-setup/tests/setup_contract.rs::Doctor readiness contracts",
+        "scripts/e2e/installed_mvp.py::exercise_dashboard"
+      ]
+    },
+    {
+      "id": "steam.discovery",
+      "surface": "steam_gsi",
+      "behavior": "Native Steam app 730 and external libraries are discovered from isolated metadata fixtures.",
+      "failure_modes": [
+        "Missing manifests, unsupported layouts, traversal, symlinks, and unapproved paths do not create a readiness claim."
+      ],
+      "verifiers": ["rust-domain", "e2e-headless"],
+      "evidence": [
+        "crates/openfrag-setup/tests/setup_contract.rs::Steam discovery fixtures",
+        "scripts/e2e/headless_smoke.py::hermetic Steam home"
+      ]
+    },
+    {
+      "id": "gsi.config-install",
+      "surface": "steam_gsi",
+      "behavior": "GSI setup writes only the private OpenFrag config with the canonical loopback endpoint and authenticated token.",
+      "failure_modes": [
+        "Unsafe tokens, symlink targets, and writes without consent are rejected without mutation.",
+        "Secrets are never printed or returned by diagnostics."
+      ],
+      "verifiers": ["rust-domain", "rust-daemon", "e2e-headless"],
+      "evidence": [
+        "crates/openfrag-setup/tests/capture_config_contract.rs::configuration safety",
+        "scripts/e2e/headless_smoke.py::configure_gsi"
+      ]
+    },
+    {
+      "id": "import.local-demo",
+      "surface": "import_analysis",
+      "behavior": "A selected local Demo advances through durable import phases to a canonical Match without Steam authentication.",
+      "failure_modes": [
+        "Invalid stamps, parser failures, suspicious empty output, symlinks, retries, cancellation, and expired leases remain explicit and recoverable."
+      ],
+      "verifiers": ["rust-domain", "rust-daemon", "e2e-installed"],
+      "evidence": [
+        "crates/openfrag-pipeline/tests/pipeline.rs::durable import lifecycle",
+        "scripts/e2e/installed_mvp.py::multipart Demo import"
+      ]
+    },
+    {
+      "id": "import.parser-compatibility",
+      "surface": "import_analysis",
+      "behavior": "The Demo parser emits the pinned normalized evidence schema and stable diagnostics for bounded fixtures.",
+      "failure_modes": [
+        "Malformed outer frames, schema drift, missing evidence, parser context loss, and decoder fuzz inputs fail safely."
+      ],
+      "verifiers": ["rust-domain", "parser-contracts"],
+      "evidence": [
+        "crates/openfrag-import/src/lib.rs::parser contracts",
+        "scripts/fuzz-demo-parser.sh::bounded decoder and normalizer checks"
+      ]
+    },
+    {
+      "id": "analysis.rating-receipts",
+      "surface": "import_analysis",
+      "behavior": "openfrag Rating uses the published exact formula and links every component to canonical Receipt evidence.",
+      "failure_modes": [
+        "Missing or incomplete evidence suppresses a value instead of inventing zero.",
+        "Ordering, boundary ticks, stale identity, and unavailable map context remain deterministic."
+      ],
+      "verifiers": ["rust-domain", "e2e-installed"],
+      "evidence": [
+        "crates/openfrag-analysis/tests/contracts.rs::published Rating vector",
+        "crates/openfrag-domain/tests/contracts.rs::public Rating and Receipt invariants"
+      ]
+    },
+    {
+      "id": "storage.schema-locking",
+      "surface": "storage_recovery",
+      "behavior": "SQLite metadata and plain-file artifacts preserve one canonical durable model across independent connections and restarts.",
+      "failure_modes": [
+        "Write locks, conflicting retries, invalid transitions, and transaction failures cannot publish partial state."
+      ],
+      "verifiers": ["rust-domain", "rust-daemon", "e2e-installed"],
+      "evidence": [
+        "crates/openfrag-storage/src/lib.rs::storage transaction tests",
+        "crates/openfragd/tests/storage_clip_repository.rs::repository adapter contracts"
+      ]
+    },
+    {
+      "id": "storage.artifact-recovery",
+      "surface": "storage_recovery",
+      "behavior": "Restart reconciliation repairs verified renames, marks missing artifacts, and quarantines unknown files without following links.",
+      "failure_modes": [
+        "Symlink trees, unsafe extensions, orphan files, missing media, interrupted writes, and failed derivative transactions remain private and recoverable."
+      ],
+      "verifiers": ["rust-domain", "rust-daemon"],
+      "evidence": [
+        "crates/openfrag-storage/src/lib.rs::reopen and quarantine tests",
+        "crates/openfrag-clips/tests/derivative.rs::partial staging cleanup"
+      ]
+    },
+    {
+      "id": "capture.supervision",
+      "surface": "capture_supervision",
+      "behavior": "gpu-screen-recorder is supervised as a direct subprocess and acknowledged media is verified before a Clip is finalized.",
+      "failure_modes": [
+        "Launch failure, bounded stderr, timeout, capped restart, shutdown, coalesced saves, symlink escape, and unverified media never create a Clip."
+      ],
+      "verifiers": ["rust-runtime", "rust-daemon", "e2e-installed"],
+      "evidence": [
+        "crates/openfrag-capture/src/lib.rs::capture supervision tests",
+        "crates/openfragd/tests/capture_runtime.rs::production capture adapter"
+      ]
+    },
+    {
+      "id": "capture.host-boundaries",
+      "surface": "capture_supervision",
+      "behavior": "Recorder, FFmpeg, FFprobe, PipeWire, and NVIDIA capability checks are exercised through strict deterministic process fixtures.",
+      "failure_modes": [
+        "Unavailable codecs, invalid media JSON, process failure, and missing recorder produce exact blocked diagnostics without launching unintended capture."
+      ],
+      "verifiers": ["parser-contracts", "e2e-headless"],
+      "evidence": [
+        "scripts/hardware/tests/verify-nvidia-host-self-test.sh::NVIDIA process fixtures",
+        "tests/e2e/fakes/ffprobe::strict media fixture"
+      ]
+    },
+    {
+      "id": "manual-flag.portal",
+      "surface": "manual_flag",
+      "behavior": "One approved Global Shortcut activation emits one Manual Flag and restores only the portal session token after restart.",
+      "failure_modes": [
+        "Held-key repeats, portal loss, session loss, and unavailable capture cannot duplicate or fabricate a saved Clip."
+      ],
+      "verifiers": ["rust-runtime", "rust-daemon", "e2e-installed"],
+      "evidence": [
+        "crates/openfrag-shortcuts/tests/manual_flag.rs::portal activation contract",
+        "crates/openfrag-live/tests/coordinator.rs::durable Manual Flag join"
+      ]
+    },
+    {
+      "id": "clips.review",
+      "surface": "clip_workflow",
+      "behavior": "The local dashboard can review, keep, reject, preview, trim, and export Clips without mutating source media.",
+      "failure_modes": [
+        "Invalid trim ranges, stale revisions, failed transcodes, cancellation, export collisions, and repository failures leave public state consistent and remove staging files."
+      ],
+      "verifiers": ["rust-runtime", "rust-daemon", "e2e-installed"],
+      "evidence": [
+        "crates/openfrag-clips/tests/workflow.rs::review and export workflow",
+        "crates/openfrag-clips/tests/derivative.rs::trim and transcode failures",
+        "crates/openfragd/tests/clip_ports.rs::local API adapters"
+      ]
+    },
+    {
+      "id": "clips.live-reconciliation",
+      "surface": "clip_workflow",
+      "behavior": "Provisional GSI captures reconcile against Demo evidence into supported Auto Highlight labels while Manual Flags remain independent.",
+      "failure_modes": [
+        "Incomplete Demo evidence never rejects a provisional Clip, and ordinary complete rounds never retain false highlight labels."
+      ],
+      "verifiers": ["rust-domain", "rust-runtime"],
+      "evidence": [
+        "crates/openfrag-live/tests/coordinator.rs::live candidate scheduling",
+        "crates/openfrag-pipeline/src/reconcile.rs::Demo reconciliation tests"
+      ]
+    },
+    {
+      "id": "desktop.canonical-identity",
+      "surface": "desktop_service",
+      "behavior": "The desktop entry, launcher, and user service use io.github.ntrpydev.openfrag, app.slice, loopback port 7130, and the canonical daemon path.",
+      "failure_modes": [
+        "Legacy or prototype identities, remote endpoints, unsafe service settings, and implicit enablement are rejected."
+      ],
+      "verifiers": ["rust-daemon", "package-static", "e2e-installed"],
+      "evidence": [
+        "crates/openfragd/tests/service_contract.rs::service lifecycle contract",
+        "packaging/verify-linux-assets.sh::desktop and service identity verifier"
+      ]
+    },
+    {
+      "id": "install.static-channel",
+      "surface": "static_install",
+      "behavior": "The deterministic static archive installs the exact daemon, launcher, desktop entry, service, GPL license, and third-party notices into a private user root.",
+      "failure_modes": [
+        "Modified legacy files are not overwritten, installation never activates the service, and staged bytes or modes cannot drift."
+      ],
+      "verifiers": ["package-static", "e2e-installed"],
+      "evidence": [
+        "packaging/verify-release-bundle.sh::deterministic static bundle lifecycle",
+        "packaging/verify-user-install.sh::legacy and activation guards"
+      ]
+    },
+    {
+      "id": "package.aur-build",
+      "surface": "aur_package",
+      "behavior": "The AUR recipe builds the exact vendored v1.0.0 source in a clean current Arch environment and installs canonical native paths.",
+      "failure_modes": [
+        "Source checksum drift, metadata drift, hard optional dependencies, install hooks, and package-root drift fail verification."
+      ],
+      "verifiers": ["package-static", "package-aur-clean"],
+      "evidence": [
+        "packaging/verify-channel-packages.sh::AUR recipe contract",
+        "packaging/aur/verify-package.sh::AUR package lifecycle"
+      ]
+    },
+    {
+      "id": "package.copr-fedora43",
+      "surface": "copr_package",
+      "behavior": "The RPM spec builds the exact vendored v1.0.0 source on Fedora 43 and installs canonical native paths.",
+      "failure_modes": [
+        "rpmlint errors, source checksum drift, scriptlets, install hooks, and package-root drift fail verification."
+      ],
+      "verifiers": ["package-static", "package-copr-43-clean"],
+      "evidence": [
+        "packaging/verify-channel-packages.sh::COPR recipe contract",
+        "packaging/rpm/verify-package.sh::RPM package lifecycle"
+      ]
+    },
+    {
+      "id": "package.copr-fedora44",
+      "surface": "copr_package",
+      "behavior": "The RPM spec builds the exact vendored v1.0.0 source on Fedora 44 and installs canonical native paths.",
+      "failure_modes": [
+        "rpmlint errors, source checksum drift, scriptlets, install hooks, and package-root drift fail verification."
+      ],
+      "verifiers": ["package-static", "package-copr-44-clean"],
+      "evidence": [
+        "packaging/verify-channel-packages.sh::COPR recipe contract",
+        "packaging/rpm/verify-package.sh::RPM package lifecycle"
+      ]
+    },
+    {
+      "id": "release.reproducible-assets",
+      "surface": "release_artifacts",
+      "behavior": "Two isolated builds produce byte-identical static and vendored source archives with matching SHA256 manifests.",
+      "failure_modes": [
+        "Wrong tag authority, dirty source, checksum drift, missing notices, noncanonical modes, and mismatched isolated outputs block staging."
+      ],
+      "verifiers": ["package-static", "release-contracts"],
+      "evidence": [
+        "packaging/verify-release-bundle.sh::release byte reproducibility",
+        "packaging/build-source-bundle.sh::vendored source reproducibility",
+        ".github/workflows/release.yml::isolated candidate comparison"
+      ]
+    },
+    {
+      "id": "privacy.local-only",
+      "surface": "licensing_privacy",
+      "behavior": "The shipped app functions without an OpenFrag account, backend, telemetry, upload path, Steam sign-in, or remote dashboard asset.",
+      "failure_modes": [
+        "Remote endpoints, secret-bearing diagnostics, non-loopback sockets, and remote browser requests fail the suite."
+      ],
+      "verifiers": ["rust-daemon", "e2e-headless", "e2e-installed", "browser-dashboard", "package-static"],
+      "evidence": [
+        "crates/openfragd/tests/dashboard_contract.rs::remote state exclusions",
+        "scripts/e2e/installed_mvp.py::network and diagnostic privacy gates",
+        "packaging/verify-linux-assets.sh::remote endpoint rejection"
+      ]
+    },
+    {
+      "id": "license.gpl-notices",
+      "surface": "licensing_privacy",
+      "behavior": "Every release and native package carries GPL-3.0-only terms and the reviewed third-party notices.",
+      "failure_modes": [
+        "Missing, altered, linked, or incorrectly permissioned license material fails package and release verification."
+      ],
+      "verifiers": ["package-static", "package-aur-clean", "package-copr-43-clean", "package-copr-44-clean"],
+      "evidence": [
+        "packaging/verify-release-bundle.sh::license byte checks",
+        "packaging/verify-channel-packages.sh::native package license checks"
+      ]
+    },
+    {
+      "id": "lifecycle.upgrade-uninstall",
+      "surface": "upgrade_uninstall",
+      "behavior": "Static, AUR, and COPR channels replace application files on upgrade and remove application files on uninstall while preserving user data and config.",
+      "failure_modes": [
+        "Install or upgrade hooks cannot start or enable the service, and uninstall cannot delete user-owned state."
+      ],
+      "verifiers": ["package-static", "package-aur-clean", "package-copr-43-clean", "package-copr-44-clean"],
+      "evidence": [
+        "packaging/verify-user-install.sh::static upgrade and uninstall",
+        "packaging/aur/verify-package.sh::AUR lifecycle",
+        "packaging/rpm/verify-package.sh::COPR lifecycle"
+      ]
+    }
+  ]
+}
