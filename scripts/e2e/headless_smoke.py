@@ -217,9 +217,13 @@ def verify_mounted_api_contracts(
         checks
         == {
             "storage": "ready",
-            "demo_import": "ready",
+            "local_steam_identity": "ready",
             "gsi": "ready",
             "capture": "blocked",
+            "ffprobe": "blocked",
+            "test_capture": "skipped",
+            "demo_import": "ready",
+            "manual_flag": "skipped",
         },
         f"unexpected setup API response: {setup}",
     )
