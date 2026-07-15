@@ -20,7 +20,7 @@ Missing software or inaccessible hardware is a host state, not proof that a GPU 
 
 ## Current public headline
 
-No environment is release-qualified yet. The current implementation builds and its headless suite passes on PC1. Physical and read-only prototypes establish limited evidence on KDE and GNOME Wayland, but no static, AUR, or COPR release artifact has passed the complete installed-package gates under the production application identity.
+No environment is release-qualified yet. The current implementation passes the optimized whole-app verifier on PC1, including real-browser, installed static bundle, clean AUR, clean Fedora 43 and 44 RPM, and release reproducibility checks. Physical and read-only prototypes establish limited evidence on KDE and GNOME Wayland, but no static, AUR, or COPR Channel Artifact has passed the complete installed-package gates under the production application identity.
 
 | Environment | Static release | AUR | COPR | Overall v1 claim |
 | --- | --- | --- | --- | --- |
@@ -51,9 +51,9 @@ Collected 2026-07-14 on the local PC1 session.
 
 | Gate | Result | Interpretation |
 | --- | --- | --- |
-| Current implementation CI | Passed | All first-party format, test, clippy, release build, staged static install, deterministic archive, packaging boundary, and headless end-to-end checks passed at local implementation commit `89b92ccd0184fe95e9ac8d51a81e03efffaa87dd`. The run includes the NVIDIA verifier regression test. Vendored parser warnings remain, but the first-party clippy gates passed. |
-| Static package scaffold | Passed headlessly, not qualified | The deterministic archive ships only `io.github.ntrpydev.openfrag.desktop`, `openfrag-launch`, and `app-io.github.ntrpydev.openfrag.service` in `app.slice`. Temporary-home install, legacy replacement, upgrade, and uninstall pass without activating systemd, and the bundle includes GPL-3.0-only terms. No physical installed-package gate has passed. |
-| AUR and COPR artifacts | Not tested | Neither artifact exists in the inspected implementation tree. |
+| Current implementation CI | Passed | The complete 27-requirement, 12-shard verifier passed twice at implementation commit `dd9842403108c2d4172da0464695ad075a00b182` in 787.16 and 797.85 seconds. It covers first-party format, test and clippy checks, a real Chromium journey, deterministic release and source archives, installed static lifecycle, clean native package builds, production smoke, and the NVIDIA verifier regression test. |
+| Static package scaffold | Passed headlessly, not qualified | The deterministic archive ships only `io.github.ntrpydev.openfrag.desktop`, `openfrag-launch`, and `app-io.github.ntrpydev.openfrag.service` in `app.slice`. Temporary-home install, legacy replacement, upgrade, uninstall, installed MVP, and local-only browser journeys pass without unintended activation, and the bundle includes GPL-3.0-only terms. No physical installed-package gate has passed. |
+| AUR and COPR artifacts | Clean candidates passed, not qualified | The AUR recipe and Fedora 43 and 44 COPR source package consume the same SHA-256-pinned vendored source archive. All three passed clean source build, lint, install, reinstall, production smoke, and removal with user state preserved. No public channel artifact has been installed or qualified. |
 | Storage and local Demo readiness | Prototype only | The current read-only Doctor skeleton reported a private temporary data directory and local Demo import ready. It does not yet implement the final storage, fingerprint, or remediation contract. |
 | Native Steam discovery | Prototype only | The app-730 manifest and real CS2 cfg directory were found in an external library by direct inspection and explicit Doctor override. Current automatic discovery does not parse `libraryfolders.vdf`, so the final discovery gate is not implemented. |
 | Flatpak Steam discovery | Not tested | Flatpak Steam is not installed on PC1. |
