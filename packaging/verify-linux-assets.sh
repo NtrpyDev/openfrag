@@ -2,6 +2,11 @@
 # Headless verification only: staged installation stays in a temporary HOME.
 set -euo pipefail
 
+if (( $# > 1 )) || (( $# == 1 )) && [[ $1 != --assets-only ]]; then
+    printf '%s\n' 'Usage: packaging/verify-linux-assets.sh [--assets-only]' >&2
+    exit 2
+fi
+
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 source "$root/application-identity.sh"
 service="$root/linux/$OPENFRAG_USER_SERVICE"
@@ -92,6 +97,10 @@ desktop-file-validate "$desktop"
 rendered_service="$verification_root/$OPENFRAG_USER_SERVICE"
 sed 's|^ExecStart=.*|ExecStart=/bin/true|' "$service" >"$rendered_service"
 systemd-analyze --user --man=no verify "$rendered_service"
+if (( $# == 1 )); then
+    printf '%s\n' 'Linux desktop and user-service assets passed headless verification.'
+    exit 0
+fi
 "$install_verifier"
 "$release_verifier"
 "$channel_verifier"

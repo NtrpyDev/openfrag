@@ -80,7 +80,8 @@ EOF
 chmod 0755 "$guard_bin/systemctl"
 (
     cd "$bundle"
-    HOME="$home" PATH="$guard_bin:$PATH" packaging/install-user.sh --staged
+    HOME="$home" XDG_DATA_HOME="$home/.local/share" XDG_CONFIG_HOME="$home/.config" \
+        PATH="$guard_bin:$PATH" packaging/install-user.sh --staged
 )
 cmp -s "$fixture" "$home/.local/bin/openfragd"
 test -f "$home/.local/share/applications/io.github.ntrpydev.openfrag.desktop"
@@ -96,12 +97,14 @@ test ! -e "$systemctl_log"
 printf '#!/usr/bin/env bash\nexit 99\n' >"$home/.local/bin/openfragd"
 (
     cd "$bundle"
-    HOME="$home" PATH="$guard_bin:$PATH" packaging/install-user.sh --staged
+    HOME="$home" XDG_DATA_HOME="$home/.local/share" XDG_CONFIG_HOME="$home/.config" \
+        PATH="$guard_bin:$PATH" packaging/install-user.sh --staged
 )
 cmp -s "$fixture" "$home/.local/bin/openfragd"
 (
     cd "$bundle"
-    HOME="$home" PATH="$guard_bin:$PATH" packaging/install-user.sh --staged --uninstall
+    HOME="$home" XDG_DATA_HOME="$home/.local/share" XDG_CONFIG_HOME="$home/.config" \
+        PATH="$guard_bin:$PATH" packaging/install-user.sh --staged --uninstall
 )
 test ! -e "$home/.local/bin/openfragd"
 test ! -e "$home/.local/bin/openfrag-launch"

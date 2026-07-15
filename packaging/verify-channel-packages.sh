@@ -2,8 +2,8 @@
 # Verifies native channel recipes and optionally an extracted package filesystem.
 set -euo pipefail
 
-if (( $# != 0 && $# != 2 )) || (( $# == 2 )) && [[ $1 != --root && $1 != --root-only ]]; then
-    printf '%s\n' 'Usage: packaging/verify-channel-packages.sh [--root|--root-only <package-root>]' >&2
+if (( $# != 0 && $# != 2 )) || (( $# == 2 )) && [[ $1 != --root && $1 != --root-only && $1 != --source ]]; then
+    printf '%s\n' 'Usage: packaging/verify-channel-packages.sh [--root|--root-only <package-root> | --source <archive>]' >&2
     exit 2
 fi
 
@@ -18,7 +18,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-if (( $# == 0 )) || [[ $1 == --root ]]; then
+if (( $# == 0 )) || [[ $1 == --root || $1 == --source ]]; then
     version=$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)"$/\1/p' "$repo/Cargo.toml")
     source_name="openfrag-v${version}-source.tar.gz"
     expected_sha=$(sed -n "s/^sha256sums=('\([0-9a-f]\{64\}\)')$/\1/p" "$aur/PKGBUILD")
@@ -60,20 +60,29 @@ if (( $# == 0 )) || [[ $1 == --root ]]; then
         rpmspec -P "$spec" >/dev/null
     fi
 
-    if ! "$repo/packaging/build-source-bundle.sh" "$stage" >"$stage/builder.log" 2>&1; then
-        cat "$stage/builder.log" >&2
-        exit 1
+    if (( $# == 2 )) && [[ $1 == --source ]]; then
+        source_archive=$(realpath -- "$2")
+        test "$(basename "$source_archive")" = "$source_name"
+        test -f "$source_archive" && test ! -L "$source_archive"
+        actual_sha=$(sha256sum "$source_archive")
+        actual_sha=${actual_sha%% *}
+    else
+        if ! "$repo/packaging/build-source-bundle.sh" "$stage" >"$stage/builder.log" 2>&1; then
+            cat "$stage/builder.log" >&2
+            exit 1
+        fi
+        source_archive="$stage/$source_name"
+        actual_sha=$(sha256sum "$source_archive")
+        actual_sha=${actual_sha%% *}
+        (
+            cd "$stage"
+            sha256sum -c "$source_name.sha256"
+        )
     fi
-    actual_sha=$(sha256sum "$stage/$source_name")
-    actual_sha=${actual_sha%% *}
     test "$actual_sha" = "$expected_sha"
-    (
-        cd "$stage"
-        sha256sum -c "$source_name.sha256"
-    )
 fi
 
-if (( $# == 0 )); then
+if (( $# == 0 )) || [[ $1 == --source ]]; then
     printf '%s\n' 'AUR and COPR recipes match the deterministic vendored source contract.'
     exit 0
 fi
