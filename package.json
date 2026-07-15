@@ -1,0 +1,10 @@
+{
+  "name": "openfrag-verification",
+  "private": true,
+  "scripts": {
+    "test:browser": "playwright test tests/browser/dashboard.spec.mjs --workers=1 --reporter=line"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1"
+  }
+}
