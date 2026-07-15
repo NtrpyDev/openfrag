@@ -1,0 +1,193 @@
+name: Stage GitHub release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      archive: ${{ steps.release.outputs.archive }}
+      checksum: ${{ steps.release.outputs.checksum }}
+      commit: ${{ steps.release.outputs.commit }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+      - name: Validate release authority
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = tag
+          tag=$GITHUB_REF_NAME
+          version=$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)"$/\1/p' Cargo.toml)
+          test "$tag" = "v$version"
+          test "$(git cat-file -t "refs/tags/$tag")" = tag
+          commit=$(git rev-parse "refs/tags/$tag^{}")
+          test "$commit" = "$GITHUB_SHA"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$commit" origin/main
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test -s LICENSE
+          test -s packaging/linux/THIRD_PARTY_NOTICES.md
+          test -s packaging/application-identity.sh
+          test -s packaging/linux/io.github.ntrpydev.openfrag.desktop
+          test -s packaging/linux/app-io.github.ntrpydev.openfrag.service
+          test -s docs/support-matrix.md
+          archive="openfrag-v${version}-linux-x86_64.tar.gz"
+          {
+            printf 'archive=%s\n' "$archive"
+            printf 'checksum=%s.sha256\n' "$archive"
+            printf 'commit=%s\n' "$commit"
+            printf 'tag=%s\n' "$tag"
+            printf 'version=%s\n' "$version"
+          } >>"$GITHUB_OUTPUT"
+      - name: Restore Cargo cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-verify-${{ runner.os }}-${{ hashFiles('Cargo.lock', '**/Cargo.lock') }}
+          restore-keys: release-verify-${{ runner.os }}-
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy && rustup default 1.96.0
+      - name: Run full CI mirror
+        run: ./scripts/verify-ci.sh
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [first, second]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.verify.outputs.commit }}
+      - name: Confirm isolated clean source
+        run: test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal && rustup default 1.96.0
+      - name: Build locked production binary and archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p openfragd
+          mkdir candidate
+          install -m 0755 target/release/openfragd candidate/openfragd
+          packaging/build-release-bundle.sh target/release/openfragd candidate
+          (cd candidate && sha256sum -c "${{ needs.verify.outputs.checksum }}")
+      - name: Upload isolated candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: candidate-${{ matrix.build }}
+          path: candidate/
+          if-no-files-found: error
+          retention-days: 1
+
+  compare:
+    needs: [verify, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download first isolated candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-first
+          path: candidates/first
+      - name: Download second isolated candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-second
+          path: candidates/second
+      - name: Require reproducible release bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=${{ needs.verify.outputs.archive }}
+          checksum=${{ needs.verify.outputs.checksum }}
+          cmp candidates/first/openfragd candidates/second/openfragd
+          cmp "candidates/first/$archive" "candidates/second/$archive"
+          cmp "candidates/first/$checksum" "candidates/second/$checksum"
+          (cd candidates/first && sha256sum -c "$checksum")
+          mkdir release
+          install -m 0644 "candidates/first/$archive" "release/$archive"
+          install -m 0644 "candidates/first/$checksum" "release/$checksum"
+      - name: Upload canonical release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: canonical-release
+          path: release/
+          if-no-files-found: error
+          retention-days: 1
+
+  stage:
+    needs: [verify, compare]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: v1-release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download canonical release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: canonical-release
+          path: release
+      - name: Verify canonical checksum
+        run: cd release && sha256sum -c "${{ needs.verify.outputs.checksum }}"
+      - name: Attest canonical release assets
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-path: |
+            release/${{ needs.verify.outputs.archive }}
+            release/${{ needs.verify.outputs.checksum }}
+      - name: Verify published attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "release/${{ needs.verify.outputs.archive }}" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify "release/${{ needs.verify.outputs.checksum }}" --repo "$GITHUB_REPOSITORY"
+      - name: Stage immutable draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=${{ needs.verify.outputs.tag }}
+          commit=${{ needs.verify.outputs.commit }}
+          archive=${{ needs.verify.outputs.archive }}
+          checksum=${{ needs.verify.outputs.checksum }}
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            printf 'Release %s already exists; release assets are never replaced.\n' "$tag" >&2
+            exit 1
+          fi
+          notes=$(mktemp)
+          trap 'rm -f -- "$notes"' EXIT
+          {
+            printf 'OpenFrag %s release candidate.\n\n' "$tag"
+            printf 'Qualification status: [support matrix](https://github.com/%s/blob/%s/docs/support-matrix.md).\n\n' "$GITHUB_REPOSITORY" "$commit"
+            printf 'Verify provenance with `gh attestation verify %s --repo %s`.\n' "$archive" "$GITHUB_REPOSITORY"
+          } >"$notes"
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --title "OpenFrag $tag" \
+            --notes-file "$notes" \
+            "release/$archive" \
+            "release/$checksum"
