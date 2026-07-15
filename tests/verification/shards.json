@@ -1,0 +1,180 @@
+{
+  "version": 1,
+  "max_jobs": 4,
+  "resource_limits": {
+    "native-package-build": 2
+  },
+  "profiles": {
+    "fast": {
+      "budget_seconds": 120,
+      "ci_budget_seconds": 180
+    },
+    "complete": {
+      "budget_seconds": 1200,
+      "ci_budget_seconds": 1500
+    }
+  },
+  "preparations": [
+    {
+      "id": "suite-contract",
+      "profiles": ["fast", "complete"],
+      "commands": [
+        ["python3", "-m", "unittest", "tests/verification/test_suite.py"]
+      ],
+      "timeout_seconds": 30
+    },
+    {
+      "id": "quality-fast",
+      "profiles": ["fast"],
+      "commands": [
+        ["scripts/verify-format.sh"],
+        ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"]
+      ],
+      "timeout_seconds": 60
+    },
+    {
+      "id": "quality-complete",
+      "profiles": ["complete"],
+      "commands": [
+        ["scripts/verify-format.sh"],
+        ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
+        ["cargo", "clippy", "--locked", "-p", "openfrag-analysis", "-p", "openfrag-capture", "-p", "openfrag-clips", "-p", "openfrag-domain", "-p", "openfrag-gsi", "-p", "openfrag-import", "-p", "openfrag-live", "-p", "openfrag-pipeline", "-p", "openfrag-setup", "-p", "openfrag-shortcuts", "-p", "openfrag-storage", "-p", "openfragd", "--no-deps", "--", "-D", "warnings"]
+      ],
+      "timeout_seconds": 300
+    },
+    {
+      "id": "build-fast",
+      "profiles": ["fast"],
+      "commands": [
+        ["cargo", "test", "--locked", "--workspace", "--all-features", "--no-run"],
+        ["cargo", "build", "--locked", "-p", "openfragd"],
+        ["install", "-D", "-m", "0755", "{cargo_target}/debug/openfragd", "{artifacts}/openfragd-production"]
+      ],
+      "timeout_seconds": 300
+    },
+    {
+      "id": "build-complete",
+      "profiles": ["complete"],
+      "commands": [
+        ["cargo", "test", "--locked", "--workspace", "--all-features", "--no-run"],
+        ["cargo", "build", "--locked", "--release", "-p", "openfragd"],
+        ["install", "-D", "-m", "0755", "{cargo_target}/release/openfragd", "{artifacts}/openfragd-production"],
+        ["cargo", "build", "--locked", "--release", "-p", "openfragd", "--features", "acceptance-fixtures"],
+        ["install", "-D", "-m", "0755", "{cargo_target}/release/openfragd", "{artifacts}/openfragd-acceptance"],
+        ["packaging/build-source-bundle.sh", "{artifacts}/source"]
+      ],
+      "timeout_seconds": 600
+    }
+  ],
+  "shards": [
+    {
+      "id": "rust-domain",
+      "profiles": ["fast", "complete"],
+      "commands": [
+        ["cargo", "test", "--locked", "--all-features", "-p", "openfrag-analysis", "-p", "openfrag-domain", "-p", "openfrag-gsi", "-p", "openfrag-import", "-p", "openfrag-pipeline", "-p", "openfrag-setup", "-p", "openfrag-storage"]
+      ],
+      "timeout_seconds": 300
+    },
+    {
+      "id": "rust-runtime",
+      "profiles": ["fast", "complete"],
+      "commands": [
+        ["cargo", "test", "--locked", "--all-features", "-p", "openfrag-capture", "-p", "openfrag-clips", "-p", "openfrag-live", "-p", "openfrag-shortcuts"]
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "id": "rust-daemon",
+      "profiles": ["fast", "complete"],
+      "commands": [
+        ["cargo", "test", "--locked", "--all-features", "-p", "openfragd"]
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "id": "parser-contracts",
+      "profiles": ["complete"],
+      "commands": [
+        ["cargo", "run", "--locked", "-q", "-p", "openfrag-import", "--bin", "openfrag-schema", "--", "--check", "schema/openfrag-demo-evidence-1.schema.json"],
+        ["cargo", "run", "--locked", "-q", "-p", "openfrag-import", "--features", "demoparser", "--bin", "openfrag-compat-lab", "--", "check-manifest", "benchmarks/parser-fixtures.json"],
+        ["scripts/fuzz-demo-parser.sh", "check"],
+        ["bash", "-n", "scripts/benchmark-parser.sh"],
+        ["bash", "-n", "scripts/fuzz-demo-parser.sh"],
+        ["scripts/hardware/tests/verify-nvidia-host-self-test.sh"]
+      ],
+      "timeout_seconds": 300
+    },
+    {
+      "id": "package-static",
+      "profiles": ["complete"],
+      "commands": [
+        ["packaging/verify-linux-assets.sh", "--assets-only"],
+        ["packaging/verify-user-install.sh"],
+        ["packaging/verify-release-bundle.sh"],
+        ["packaging/verify-channel-packages.sh", "--source", "{artifacts}/source/openfrag-v1.0.0-source.tar.gz"]
+      ],
+      "timeout_seconds": 300
+    },
+    {
+      "id": "release-contracts",
+      "profiles": ["complete"],
+      "commands": [
+        ["packaging/build-source-bundle.sh", "{run}/source-second"],
+        ["cmp", "{artifacts}/source/openfrag-v1.0.0-source.tar.gz", "{run}/source-second/openfrag-v1.0.0-source.tar.gz"],
+        ["cmp", "{artifacts}/source/openfrag-v1.0.0-source.tar.gz.sha256", "{run}/source-second/openfrag-v1.0.0-source.tar.gz.sha256"]
+      ],
+      "timeout_seconds": 300
+    },
+    {
+      "id": "e2e-headless",
+      "profiles": ["fast", "complete"],
+      "commands": [
+        ["python3", "scripts/e2e/headless_smoke.py", "--binary", "{artifacts}/openfragd-production"]
+      ],
+      "timeout_seconds": 60
+    },
+    {
+      "id": "e2e-installed",
+      "profiles": ["complete"],
+      "commands": [
+        ["python3", "scripts/e2e/installed_mvp.py", "--binary", "{artifacts}/openfragd-acceptance"]
+      ],
+      "timeout_seconds": 90
+    },
+    {
+      "id": "browser-dashboard",
+      "profiles": ["complete"],
+      "commands": [
+        ["node_modules/.bin/playwright", "test", "tests/browser/dashboard.spec.mjs", "--workers=1", "--reporter=line", "--output", "{run}/playwright"]
+      ],
+      "timeout_seconds": 90
+    },
+    {
+      "id": "package-aur-clean",
+      "profiles": ["complete"],
+      "resource": "native-package-build",
+      "commands": [
+        ["packaging/verify-clean-channel.sh", "aur", "{artifacts}/source/openfrag-v1.0.0-source.tar.gz"]
+      ],
+      "timeout_seconds": 900
+    },
+    {
+      "id": "package-copr-43-clean",
+      "profiles": ["complete"],
+      "resource": "native-package-build",
+      "commands": [
+        ["packaging/verify-clean-channel.sh", "fedora43", "{artifacts}/source/openfrag-v1.0.0-source.tar.gz"]
+      ],
+      "timeout_seconds": 900
+    },
+    {
+      "id": "package-copr-44-clean",
+      "profiles": ["complete"],
+      "resource": "native-package-build",
+      "commands": [
+        ["packaging/verify-clean-channel.sh", "fedora44", "{artifacts}/source/openfrag-v1.0.0-source.tar.gz"]
+      ],
+      "timeout_seconds": 900
+    }
+  ]
+}
