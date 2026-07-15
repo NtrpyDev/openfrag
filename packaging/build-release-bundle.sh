@@ -8,6 +8,7 @@ if (( $# != 2 )); then
 fi
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+source "$root/packaging/application-identity.sh"
 binary=$1
 output=$2
 bundle_name=openfrag-v1.0.0-linux-x86_64
@@ -31,14 +32,19 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 bundle="$stage/$bundle_name"
-install -D -m 0755 "$binary" "$bundle/target/release/openfragd"
+install -D -m 0755 "$binary" "$bundle/target/release/$OPENFRAG_DAEMON_NAME"
+install -D -m 0644 "$root/LICENSE" "$bundle/LICENSE"
+install -D -m 0644 "$root/packaging/linux/THIRD_PARTY_NOTICES.md" \
+    "$bundle/THIRD_PARTY_NOTICES.md"
+install -D -m 0644 "$root/packaging/application-identity.sh" \
+    "$bundle/packaging/application-identity.sh"
 install -D -m 0755 "$root/packaging/install-user.sh" "$bundle/packaging/install-user.sh"
-install -D -m 0755 "$root/packaging/linux/openfrag-open-dashboard" \
-    "$bundle/packaging/linux/openfrag-open-dashboard"
-install -D -m 0644 "$root/packaging/linux/openfrag.desktop" \
-    "$bundle/packaging/linux/openfrag.desktop"
-install -D -m 0644 "$root/packaging/linux/openfragd.service" \
-    "$bundle/packaging/linux/openfragd.service"
+install -D -m 0755 "$root/packaging/linux/$OPENFRAG_LAUNCHER_NAME" \
+    "$bundle/packaging/linux/$OPENFRAG_LAUNCHER_NAME"
+install -D -m 0644 "$root/packaging/linux/$OPENFRAG_DESKTOP_NAME" \
+    "$bundle/packaging/linux/$OPENFRAG_DESKTOP_NAME"
+install -D -m 0644 "$root/packaging/linux/$OPENFRAG_USER_SERVICE" \
+    "$bundle/packaging/linux/$OPENFRAG_USER_SERVICE"
 
 LC_ALL=C TZ=UTC tar \
     --sort=name \
