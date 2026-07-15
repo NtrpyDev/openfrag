@@ -1,0 +1,225 @@
+{
+  "$id": "openfrag-demo-evidence-1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "additionalProperties": false,
+          "properties": {
+            "warmup": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "warmup"
+          ],
+          "type": "object"
+        },
+        "ingestion_ordinal": {
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": "integer",
+          "x-openfrag-type": "IngestionOrdinal"
+        },
+        "tick": {
+          "type": "integer",
+          "x-openfrag-type": "DemoTick"
+        },
+        "type": {
+          "const": "round_freeze_end"
+        }
+      },
+      "required": [
+        "type",
+        "tick",
+        "ingestion_ordinal",
+        "data"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "additionalProperties": false,
+          "properties": {
+            "winner": {
+              "type": "integer"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "ingestion_ordinal": {
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": "integer",
+          "x-openfrag-type": "IngestionOrdinal"
+        },
+        "tick": {
+          "type": "integer",
+          "x-openfrag-type": "DemoTick"
+        },
+        "type": {
+          "const": "round_end"
+        }
+      },
+      "required": [
+        "type",
+        "tick",
+        "ingestion_ordinal",
+        "data"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "additionalProperties": false,
+          "properties": {
+            "attacker": {
+              "maximum": 18446744073709551615,
+              "minimum": 0,
+              "type": "integer",
+              "x-openfrag-type": "SteamId"
+            },
+            "damage_health": {
+              "type": "integer"
+            },
+            "victim": {
+              "maximum": 18446744073709551615,
+              "minimum": 0,
+              "type": "integer",
+              "x-openfrag-type": "SteamId"
+            },
+            "weapon": {
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "ingestion_ordinal": {
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": "integer",
+          "x-openfrag-type": "IngestionOrdinal"
+        },
+        "tick": {
+          "type": "integer",
+          "x-openfrag-type": "DemoTick"
+        },
+        "type": {
+          "const": "player_hurt"
+        }
+      },
+      "required": [
+        "type",
+        "tick",
+        "ingestion_ordinal",
+        "data"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "additionalProperties": false,
+          "properties": {
+            "assisted_flash": {
+              "type": "boolean"
+            },
+            "assister": {
+              "maximum": 18446744073709551615,
+              "minimum": 0,
+              "type": "integer",
+              "x-openfrag-type": "SteamId"
+            },
+            "attacker": {
+              "maximum": 18446744073709551615,
+              "minimum": 0,
+              "type": "integer",
+              "x-openfrag-type": "SteamId"
+            },
+            "victim": {
+              "maximum": 18446744073709551615,
+              "minimum": 0,
+              "type": "integer",
+              "x-openfrag-type": "SteamId"
+            },
+            "weapon": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "assisted_flash"
+          ],
+          "type": "object"
+        },
+        "ingestion_ordinal": {
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": "integer",
+          "x-openfrag-type": "IngestionOrdinal"
+        },
+        "tick": {
+          "type": "integer",
+          "x-openfrag-type": "DemoTick"
+        },
+        "type": {
+          "const": "player_death"
+        }
+      },
+      "required": [
+        "type",
+        "tick",
+        "ingestion_ordinal",
+        "data"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "additionalProperties": false,
+          "properties": {
+            "player": {
+              "maximum": 18446744073709551615,
+              "minimum": 0,
+              "type": "integer",
+              "x-openfrag-type": "SteamId"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "ingestion_ordinal": {
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": "integer",
+          "x-openfrag-type": "IngestionOrdinal"
+        },
+        "tick": {
+          "type": "integer",
+          "x-openfrag-type": "DemoTick"
+        },
+        "type": {
+          "const": "player_disconnect"
+        }
+      },
+      "required": [
+        "type",
+        "tick",
+        "ingestion_ordinal",
+        "data"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "OpenFrag normalized Demo evidence"
+}
