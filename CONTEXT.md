@@ -17,3 +17,6 @@ The ubiquitous language for this project. Terms mean exactly this everywhere: co
 - **Tonight**: the dashboard home view, the current play session's matches, stats, and best clips.
 - **Setup Wizard**: the first-run flow in the dashboard that configures storage, writes the GSI config into CS2, and tests recording, GSI, and the Manual Flag path.
 - **Compatibility Doctor**: the wizard's diagnostic step, verifying compositor, encoder, hotkey, GSI, and Steam location before first use. Re-runnable from settings.
+- **Release Candidate**: one exact versioned source commit and the proposed Channel Artifacts derived from it. Any source, recipe, dependency, or artifact change creates a different candidate.
+- **Channel Artifact**: the installable output for one distribution channel: a GitHub static archive, an AUR package built from one exact pkgbase commit, or a COPR RPM from one exact build. Artifacts from different channels never inherit each other's qualification.
+- **Qualification Record**: the redacted support-matrix evidence tying one Channel Artifact to its exact build inputs, hash, host fingerprint, observed gates, failures, and limitations.
