@@ -880,6 +880,7 @@ fn normalize_event(
     }
 }
 
+#[cfg(any(feature = "demoparser", test))]
 fn parser_error(
     category: ParseDiagnosticCategory,
     stage: ParseStage,
@@ -901,6 +902,7 @@ fn parser_error(
     }
 }
 
+#[cfg(any(feature = "demoparser", test))]
 fn missing_evidence_error(
     required_item: &str,
     game_build: Option<String>,
