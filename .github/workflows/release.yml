@@ -15,6 +15,8 @@ jobs:
       archive: ${{ steps.release.outputs.archive }}
       checksum: ${{ steps.release.outputs.checksum }}
       commit: ${{ steps.release.outputs.commit }}
+      source_archive: ${{ steps.release.outputs.source_archive }}
+      source_checksum: ${{ steps.release.outputs.source_checksum }}
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
@@ -43,10 +45,13 @@ jobs:
           test -s packaging/linux/app-io.github.ntrpydev.openfrag.service
           test -s docs/support-matrix.md
           archive="openfrag-v${version}-linux-x86_64.tar.gz"
+          source_archive="openfrag-v${version}-source.tar.gz"
           {
             printf 'archive=%s\n' "$archive"
             printf 'checksum=%s.sha256\n' "$archive"
             printf 'commit=%s\n' "$commit"
+            printf 'source_archive=%s\n' "$source_archive"
+            printf 'source_checksum=%s.sha256\n' "$source_archive"
             printf 'tag=%s\n' "$tag"
             printf 'version=%s\n' "$version"
           } >>"$GITHUB_OUTPUT"
@@ -88,7 +93,9 @@ jobs:
           mkdir candidate
           install -m 0755 target/release/openfragd candidate/openfragd
           packaging/build-release-bundle.sh target/release/openfragd candidate
+          packaging/build-source-bundle.sh candidate
           (cd candidate && sha256sum -c "${{ needs.verify.outputs.checksum }}")
+          (cd candidate && sha256sum -c "${{ needs.verify.outputs.source_checksum }}")
       - name: Upload isolated candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -118,13 +125,20 @@ jobs:
           set -euo pipefail
           archive=${{ needs.verify.outputs.archive }}
           checksum=${{ needs.verify.outputs.checksum }}
+          source_archive=${{ needs.verify.outputs.source_archive }}
+          source_checksum=${{ needs.verify.outputs.source_checksum }}
           cmp candidates/first/openfragd candidates/second/openfragd
           cmp "candidates/first/$archive" "candidates/second/$archive"
           cmp "candidates/first/$checksum" "candidates/second/$checksum"
+          cmp "candidates/first/$source_archive" "candidates/second/$source_archive"
+          cmp "candidates/first/$source_checksum" "candidates/second/$source_checksum"
           (cd candidates/first && sha256sum -c "$checksum")
+          (cd candidates/first && sha256sum -c "$source_checksum")
           mkdir release
           install -m 0644 "candidates/first/$archive" "release/$archive"
           install -m 0644 "candidates/first/$checksum" "release/$checksum"
+          install -m 0644 "candidates/first/$source_archive" "release/$source_archive"
+          install -m 0644 "candidates/first/$source_checksum" "release/$source_checksum"
       - name: Upload canonical release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -149,19 +163,26 @@ jobs:
           name: canonical-release
           path: release
       - name: Verify canonical checksum
-        run: cd release && sha256sum -c "${{ needs.verify.outputs.checksum }}"
+        run: |
+          cd release
+          sha256sum -c "${{ needs.verify.outputs.checksum }}"
+          sha256sum -c "${{ needs.verify.outputs.source_checksum }}"
       - name: Attest canonical release assets
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
         with:
           subject-path: |
             release/${{ needs.verify.outputs.archive }}
             release/${{ needs.verify.outputs.checksum }}
+            release/${{ needs.verify.outputs.source_archive }}
+            release/${{ needs.verify.outputs.source_checksum }}
       - name: Verify published attestations
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh attestation verify "release/${{ needs.verify.outputs.archive }}" --repo "$GITHUB_REPOSITORY"
           gh attestation verify "release/${{ needs.verify.outputs.checksum }}" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify "release/${{ needs.verify.outputs.source_archive }}" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify "release/${{ needs.verify.outputs.source_checksum }}" --repo "$GITHUB_REPOSITORY"
       - name: Stage immutable draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -172,6 +193,8 @@ jobs:
           commit=${{ needs.verify.outputs.commit }}
           archive=${{ needs.verify.outputs.archive }}
           checksum=${{ needs.verify.outputs.checksum }}
+          source_archive=${{ needs.verify.outputs.source_archive }}
+          source_checksum=${{ needs.verify.outputs.source_checksum }}
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             printf 'Release %s already exists; release assets are never replaced.\n' "$tag" >&2
             exit 1
@@ -190,4 +213,6 @@ jobs:
             --title "OpenFrag $tag" \
             --notes-file "$notes" \
             "release/$archive" \
-            "release/$checksum"
+            "release/$checksum" \
+            "release/$source_archive" \
+            "release/$source_checksum"

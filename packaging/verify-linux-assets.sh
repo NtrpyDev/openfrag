@@ -11,6 +11,8 @@ installer="$root/install-user.sh"
 install_verifier="$root/verify-user-install.sh"
 release_builder="$root/build-release-bundle.sh"
 release_verifier="$root/verify-release-bundle.sh"
+source_builder="$root/build-source-bundle.sh"
+channel_verifier="$root/verify-channel-packages.sh"
 verification_root=$(mktemp -d "${TMPDIR:-/tmp}/openfrag-systemd-verify.XXXXXXXX")
 trap 'rm -rf -- "$verification_root"' EXIT HUP INT TERM
 
@@ -72,6 +74,8 @@ bash -n "$installer"
 bash -n "$install_verifier"
 bash -n "$release_builder"
 bash -n "$release_verifier"
+bash -n "$source_builder"
+bash -n "$channel_verifier"
 command -v desktop-file-validate >/dev/null 2>&1 || {
     printf '%s\n' 'desktop-file-validate is required for package verification' >&2
     exit 1
@@ -86,4 +90,5 @@ sed 's|^ExecStart=.*|ExecStart=/bin/true|' "$service" >"$rendered_service"
 systemd-analyze --user --man=no verify "$rendered_service"
 "$install_verifier"
 "$release_verifier"
+"$channel_verifier"
 printf '%s\n' 'Linux packaging assets passed headless verification.'
