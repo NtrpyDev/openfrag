@@ -1,134 +1,212 @@
-//! PROTOTYPE ONLY. This is the state machine being exercised by the evdev spike.
+//! PROTOTYPE ONLY. Pure broker state used by both the live spike and simulator.
 
-use std::collections::HashSet;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fingerprint {
+    pub serial: String,
+    pub interface: String,
+    pub name: String,
+    pub input_id: String,
+    pub physical_path: String,
+    pub unique_name: String,
+}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Binding(pub u16);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub event_path: String,
+    pub fingerprint: Fingerprint,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceState {
-    Reading,
+    AwaitingDevice,
+    Armed { event_path: String },
+    Ambiguous { matches: usize },
+    IdentityChanged,
     PermissionDenied(String),
     Disconnected(String),
-    Conflict(String),
+    Suspended,
+    Recovering { event_path: String },
 }
 
-#[derive(Debug, Clone)]
-pub struct DeviceView {
-    pub path: String,
-    pub name: String,
-    pub physical_id: String,
-    pub state: DeviceState,
-}
-
-#[derive(Debug, Clone)]
-pub struct Press {
-    pub physical_id: String,
-    pub code: u16,
-    pub value: i32,
-    pub at_ms: u128,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientState {
+    Disconnected,
+    Authorized { uid: u32 },
+    Rejected { uid: u32 },
 }
 
 #[derive(Debug)]
-pub struct Model {
-    pub binding: Binding,
-    pub devices: Vec<DeviceView>,
-    pub manual_flags: u64,
-    pub last_flag: Option<String>,
-    armed: bool,
-    pressed: HashSet<(String, u16)>,
-    last_physical_press: Option<(String, u16, u128)>,
+pub struct BrokerModel {
+    pub binding: u16,
+    pub minimum_interval_ms: u128,
+    pub authorized_device: Option<Fingerprint>,
+    pub device: DeviceState,
+    pub client: ClientState,
+    pub flags_emitted: u64,
+    pub last_decision: String,
+    pressed: bool,
+    last_emit_ms: Option<u128>,
 }
 
-impl Model {
-    pub fn new(binding: Binding) -> Self {
+impl BrokerModel {
+    pub fn new(binding: u16, minimum_interval_ms: u128) -> Self {
         Self {
             binding,
-            devices: Vec::new(),
-            manual_flags: 0,
-            last_flag: None,
-            armed: false,
-            pressed: HashSet::new(),
-            last_physical_press: None,
+            minimum_interval_ms,
+            authorized_device: None,
+            device: DeviceState::AwaitingDevice,
+            client: ClientState::Disconnected,
+            flags_emitted: 0,
+            last_decision: "waiting for the selected stable device identity".into(),
+            pressed: false,
+            last_emit_ms: None,
         }
     }
 
-    pub fn replace_devices(&mut self, mut devices: Vec<DeviceView>) {
-        self.pressed.clear();
-        let readable = devices
-            .iter()
-            .filter(|device| device.state == DeviceState::Reading)
-            .count();
-        if readable > 1 {
-            for device in &mut devices {
-                if device.state == DeviceState::Reading {
-                    device.state = DeviceState::Conflict(
-                        "multiple matching event nodes; duplicate filtering is heuristic".into(),
-                    );
+    pub fn replace_candidates(&mut self, candidates: Vec<Candidate>) {
+        if self.device == DeviceState::Suspended {
+            self.last_decision = "ignored discovery while suspended".into();
+            return;
+        }
+        self.pressed = false;
+        match candidates.as_slice() {
+            [] => {
+                self.device = DeviceState::Disconnected("selected identity is absent".into());
+                self.last_decision = "disarmed because the selected identity is absent".into();
+            }
+            [candidate] => match &self.authorized_device {
+                None => {
+                    self.authorized_device = Some(candidate.fingerprint.clone());
+                    self.device = DeviceState::Armed {
+                        event_path: candidate.event_path.clone(),
+                    };
+                    self.last_decision = "captured the user-selected identity and armed".into();
                 }
+                Some(authorized) if authorized == &candidate.fingerprint => {
+                    self.device = DeviceState::Armed {
+                        event_path: candidate.event_path.clone(),
+                    };
+                    self.last_decision = "same identity returned and re-armed".into();
+                }
+                Some(_) => {
+                    self.device = DeviceState::IdentityChanged;
+                    self.last_decision = "rejected unexpected identity metadata".into();
+                }
+            },
+            many => {
+                self.device = DeviceState::Ambiguous {
+                    matches: many.len(),
+                };
+                self.last_decision = "rejected ambiguous stable identity".into();
             }
         }
-        self.devices = devices;
-        self.recompute_armed();
     }
 
-    pub fn mark_disconnected(&mut self, path: &str, reason: String) {
-        if let Some(device) = self.devices.iter_mut().find(|device| device.path == path) {
-            device.state = DeviceState::Disconnected(reason);
-        }
-        self.pressed.clear();
-        self.recompute_armed();
+    pub fn permission_denied(&mut self, error: String) {
+        self.pressed = false;
+        self.device = DeviceState::PermissionDenied(error);
+        self.last_decision =
+            "disarmed because the broker lacks the narrow device permission".into();
     }
 
-    /// SYN_DROPPED recovery must never create a flag. A held key is seeded so it
-    /// must be released before a later down transition can be considered new.
-    pub fn recover_key_state(&mut self, physical_id: String, held: bool) {
-        let key = (physical_id, self.binding.0);
-        if held {
-            self.pressed.insert(key);
+    pub fn identity_changed(&mut self, error: String) {
+        self.pressed = false;
+        self.device = DeviceState::IdentityChanged;
+        self.last_decision = format!("rejected unexpected identity metadata: {error}");
+    }
+
+    pub fn disconnect(&mut self, reason: String) {
+        self.pressed = false;
+        self.device = DeviceState::Disconnected(reason);
+        self.last_decision = "disarmed after device loss".into();
+    }
+
+    pub fn suspend(&mut self) {
+        self.pressed = false;
+        self.device = DeviceState::Suspended;
+        self.last_decision = "closed and disarmed for suspend".into();
+    }
+
+    pub fn resume(&mut self) {
+        self.pressed = false;
+        self.device = DeviceState::AwaitingDevice;
+        self.last_decision = "resumed disarmed and requires identity revalidation".into();
+    }
+
+    pub fn begin_sync_recovery(&mut self) {
+        let event_path = match &self.device {
+            DeviceState::Armed { event_path } => event_path.clone(),
+            _ => return,
+        };
+        self.pressed = false;
+        self.device = DeviceState::Recovering { event_path };
+        self.last_decision =
+            "discarding events until SYN_REPORT and state resynchronization".into();
+    }
+
+    pub fn finish_sync_recovery(&mut self, binding_is_held: bool) {
+        let event_path = match &self.device {
+            DeviceState::Recovering { event_path } => event_path.clone(),
+            _ => return,
+        };
+        self.pressed = binding_is_held;
+        self.device = DeviceState::Armed { event_path };
+        self.last_decision = if binding_is_held {
+            "recovered with the binding held; release is required before another flag".into()
         } else {
-            self.pressed.remove(&key);
-        }
+            "recovered with the binding released and re-armed".into()
+        };
     }
 
-    /// Returns true exactly once for a physical down transition. value=2 is autorepeat.
-    pub fn observe(&mut self, press: Press) -> bool {
-        if press.code != self.binding.0 {
+    pub fn connect_client(&mut self, uid: u32, allowed_uid: u32) {
+        self.client = if uid == allowed_uid {
+            ClientState::Authorized { uid }
+        } else {
+            ClientState::Rejected { uid }
+        };
+        self.last_decision = if uid == allowed_uid {
+            "accepted the configured daemon UID".into()
+        } else {
+            "rejected an unexpected IPC peer UID".into()
+        };
+    }
+
+    pub fn disconnect_client(&mut self) {
+        self.client = ClientState::Disconnected;
+        self.last_decision = "IPC client disconnected".into();
+    }
+
+    pub fn observe_key(&mut self, code: u16, value: i32, now_ms: u128) -> bool {
+        if code != self.binding {
             return false;
         }
-        let key = (press.physical_id.clone(), press.code);
-        if press.value == 0 {
-            self.pressed.remove(&key);
+        if value == 0 {
+            self.pressed = false;
+            self.last_decision = "binding released".into();
             return false;
         }
-        if !self.armed {
+        if !matches!(self.device, DeviceState::Armed { .. })
+            || !matches!(self.client, ClientState::Authorized { .. })
+        {
+            self.last_decision =
+                "suppressed input while device or client was not authorized".into();
             return false;
         }
-        if press.value != 1 || !self.pressed.insert(key) {
+        if value != 1 || self.pressed {
+            self.last_decision = "suppressed key repeat or duplicate press".into();
             return false;
         }
-        // Composite keyboards can expose one physical press through several event nodes.
-        // Timestamps are the best cheap identity evdev exposes here, not a correctness proof.
-        if let Some((physical_id, code, at_ms)) = &self.last_physical_press {
-            if *physical_id == press.physical_id
-                && *code == press.code
-                && press.at_ms.saturating_sub(*at_ms) < 8
-            {
-                return false;
-            }
+        self.pressed = true;
+        if self
+            .last_emit_ms
+            .is_some_and(|last| now_ms.saturating_sub(last) < self.minimum_interval_ms)
+        {
+            self.last_decision = "suppressed press inside the rate limit".into();
+            return false;
         }
-        self.last_physical_press = Some((press.physical_id.clone(), press.code, press.at_ms));
-        self.manual_flags += 1;
-        self.last_flag = Some(format!("{} at {}ms", press.physical_id, press.at_ms));
+        self.last_emit_ms = Some(now_ms);
+        self.flags_emitted += 1;
+        self.last_decision = "emitted the literal one-bit FLAG message".into();
         true
-    }
-
-    fn recompute_armed(&mut self) {
-        self.armed = self
-            .devices
-            .iter()
-            .filter(|device| device.state == DeviceState::Reading)
-            .count()
-            == 1;
     }
 }
