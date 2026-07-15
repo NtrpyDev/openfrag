@@ -28,6 +28,8 @@ for package in "${packages[@]}"; do
 done
 cargo test -p openfrag-import --features demoparser
 cargo test -p openfrag-pipeline --features demoparser
+cargo check -p openfrag-import --features demoparser --bin openfrag-parser-benchmark
+bash -n scripts/benchmark-parser.sh
 cargo build -p openfragd --release
 packaging/verify-linux-assets.sh
 scripts/hardware/tests/verify-nvidia-host-self-test.sh

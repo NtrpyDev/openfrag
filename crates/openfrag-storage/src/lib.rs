@@ -21,6 +21,7 @@ const CLIP_MODEL_MIGRATION: &str = include_str!("../migrations/0007_clip_model.s
 const CLIP_REVIEW_TIME_MIGRATION: &str = include_str!("../migrations/0008_clip_review_time.sql");
 const IMPORT_DIAGNOSTICS_MIGRATION: &str =
     include_str!("../migrations/0009_import_diagnostics.sql");
+const PARSER_PROGRESS_MIGRATION: &str = include_str!("../migrations/0010_parser_progress.sql");
 
 #[derive(Debug)]
 pub enum Error {
@@ -175,6 +176,22 @@ pub struct ImportJob {
     pub error_code: Option<String>,
     pub remediation_code: Option<String>,
     pub diagnostic_json: Option<String>,
+    pub bytes_done: Option<i64>,
+    pub bytes_total: Option<i64>,
+    pub work_phase: Option<String>,
+    pub frames_done: Option<i64>,
+    pub events_emitted: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParserProgressUpdate<'a> {
+    pub phase: &'a str,
+    pub bytes_done: i64,
+    pub bytes_total: i64,
+    pub frames_done: i64,
+    pub events_emitted: i64,
+    pub progress_bp: i64,
+    pub heartbeat_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -579,6 +596,7 @@ impl Storage {
         ensure_migration(&self.connection, 7, CLIP_MODEL_MIGRATION)?;
         ensure_migration(&self.connection, 8, CLIP_REVIEW_TIME_MIGRATION)?;
         ensure_migration(&self.connection, 9, IMPORT_DIAGNOSTICS_MIGRATION)?;
+        ensure_migration(&self.connection, 10, PARSER_PROGRESS_MIGRATION)?;
         Ok(())
     }
     pub fn stage_artifact(&self, bytes: &[u8]) -> Result<StagedArtifact> {
@@ -1633,7 +1651,12 @@ impl Storage {
             Option<String>,
             Option<String>,
             Option<String>,
-        )> = self.connection.query_row("SELECT status,progress_bp,lease_owner,lease_expires_at_ms,error_code,remediation_code,diagnostic_json FROM import_jobs WHERE id=?",[id.as_str()],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        )> = self.connection.query_row("SELECT status,progress_bp,lease_owner,lease_expires_at_ms,error_code,remediation_code,diagnostic_json,bytes_done,bytes_total,work_phase,frames_done,events_emitted FROM import_jobs WHERE id=?",[id.as_str()],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?))).optional()?;
         let (
             phase,
             progress_bp,
@@ -1642,6 +1665,11 @@ impl Storage {
             error_code,
             remediation_code,
             diagnostic_json,
+            bytes_done,
+            bytes_total,
+            work_phase,
+            frames_done,
+            events_emitted,
         ) = row.ok_or(Error::NotFound("import job"))?;
         Ok(ImportJob {
             id: id.clone(),
@@ -1652,6 +1680,11 @@ impl Storage {
             error_code,
             remediation_code,
             diagnostic_json,
+            bytes_done,
+            bytes_total,
+            work_phase,
+            frames_done,
+            events_emitted,
         })
     }
     pub fn import_job_by_id(&self, id: &str) -> Result<ImportJob> {
@@ -2010,9 +2043,35 @@ impl Storage {
         if !(0..=10_000).contains(&progress) {
             return Err(Error::Invalid("progress"));
         }
-        let n=self.connection.execute("UPDATE import_jobs SET bytes_done=?,bytes_total=?,progress_bp=?,heartbeat_at_ms=?,updated_at_ms=? WHERE id=? AND status='leased' AND lease_owner=?",params![done,total,progress,heartbeat,now_ms(),id.as_str(),owner])?;
+        let n=self.connection.execute("UPDATE import_jobs SET bytes_done=COALESCE(?,bytes_done),bytes_total=COALESCE(?,bytes_total),progress_bp=?,heartbeat_at_ms=?,updated_at_ms=? WHERE id=? AND status='leased' AND lease_owner=?",params![done,total,progress,heartbeat,now_ms(),id.as_str(),owner])?;
         if n == 0 {
             return Err(Error::IllegalTransition("import progress lease"));
+        }
+        Ok(())
+    }
+    pub fn update_parser_progress(
+        &self,
+        id: &ImportJobId,
+        owner: &str,
+        update: ParserProgressUpdate<'_>,
+    ) -> Result<()> {
+        if !matches!(update.phase, "first_pass" | "second_pass" | "finalize") {
+            return Err(Error::Invalid("parser progress phase"));
+        }
+        if update.bytes_done < 0
+            || update.bytes_total < 0
+            || update.frames_done < 0
+            || update.events_emitted < 0
+            || !(0..=10_000).contains(&update.progress_bp)
+        {
+            return Err(Error::Invalid("parser progress"));
+        }
+        let n = self.connection.execute(
+            "UPDATE import_jobs SET work_phase=?,bytes_done=?,bytes_total=?,frames_done=?,events_emitted=?,progress_bp=?,heartbeat_at_ms=?,updated_at_ms=? WHERE id=? AND status='leased' AND lease_owner=?",
+            params![update.phase,update.bytes_done,update.bytes_total,update.frames_done,update.events_emitted,update.progress_bp,update.heartbeat_at_ms,now_ms(),id.as_str(),owner],
+        )?;
+        if n == 0 {
+            return Err(Error::IllegalTransition("parser progress lease"));
         }
         Ok(())
     }

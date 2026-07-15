@@ -4,9 +4,12 @@ pub mod reconcile;
 
 use openfrag_analysis::{AnalysisReceipt, AnalysisUnavailable, analyze};
 use openfrag_import::{
-    MAX_DEMO_BYTES, ParseDiagnostic, ParseDiagnosticCategory, ParseStage, ParsedOutput, ParserError,
+    MAX_DEMO_BYTES, ParseDiagnostic, ParseDiagnosticCategory, ParseStage, ParsedOutput,
+    ParserError, ParserProgress, ParserProgressPhase,
 };
-use openfrag_storage::{AnalysisIdentity, ImportJobId, ImportPhase, Layout, Storage};
+use openfrag_storage::{
+    AnalysisIdentity, ImportJobId, ImportPhase, Layout, ParserProgressUpdate, Storage,
+};
 use reconcile::{
     ReconciliationCandidate, ReconciliationDecision, ReconciliationPersistence,
     reconcile_demo_candidates,
@@ -20,7 +23,11 @@ pub trait ParserBackend {
     ///
     /// # Errors
     /// Returns a stable parser error description when evidence extraction fails.
-    fn parse(&self, path: &Path) -> Result<ParsedOutput, ParserError>;
+    fn parse(
+        &self,
+        path: &Path,
+        progress: &mut dyn FnMut(ParserProgress),
+    ) -> Result<ParsedOutput, ParserError>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -203,10 +210,45 @@ impl<'a, B: ParserBackend> ImportService<'a, B> {
         let relative = artifact
             .relative_path
             .ok_or(PipelineError::Storage("artifact path absent".into()))?;
-        let parsed = match self
-            .parser
-            .parse(&self.storage.layout().root.join(relative))
-        {
+        let parser_path = self.storage.layout().root.join(relative);
+        let storage = &*self.storage;
+        let mut progress_error = None;
+        let mut last_persisted = None;
+        let parsed_result = self.parser.parse(&parser_path, &mut |parser_progress| {
+            let progress_bp = parser_progress_basis_points(parser_progress);
+            let phase_changed =
+                last_persisted.is_none_or(|(phase, _)| phase != parser_progress.phase);
+            let advanced = last_persisted.is_none_or(|(_, previous)| progress_bp >= previous + 10);
+            if progress_error.is_none()
+                && (phase_changed
+                    || advanced
+                    || parser_progress.phase == ParserProgressPhase::Finalize)
+            {
+                progress_error = storage
+                    .update_parser_progress(
+                        job,
+                        request.worker,
+                        ParserProgressUpdate {
+                            phase: parser_progress.phase.code(),
+                            bytes_done: i64::try_from(parser_progress.bytes_consumed)
+                                .unwrap_or(i64::MAX),
+                            bytes_total: i64::try_from(parser_progress.total_bytes)
+                                .unwrap_or(i64::MAX),
+                            frames_done: i64::try_from(parser_progress.frames).unwrap_or(i64::MAX),
+                            events_emitted: i64::try_from(parser_progress.events_emitted)
+                                .unwrap_or(i64::MAX),
+                            progress_bp,
+                            heartbeat_at_ms: now_ms(),
+                        },
+                    )
+                    .err();
+                last_persisted = Some((parser_progress.phase, progress_bp));
+            }
+        });
+        if let Some(error) = progress_error {
+            return Err(storage_error(error));
+        }
+        let parsed = match parsed_result {
             Ok(parsed) => parsed,
             Err(error) => {
                 self.storage
@@ -646,7 +688,24 @@ pub struct PinnedParser;
 
 #[cfg(feature = "demoparser")]
 impl ParserBackend for PinnedParser {
-    fn parse(&self, path: &Path) -> Result<ParsedOutput, ParserError> {
-        openfrag_import::parse_with_pinned_demoparser(path)
+    fn parse(
+        &self,
+        path: &Path,
+        progress: &mut dyn FnMut(ParserProgress),
+    ) -> Result<ParsedOutput, ParserError> {
+        openfrag_import::parse_with_pinned_demoparser_with_progress(path, progress)
     }
+}
+
+fn parser_progress_basis_points(progress: ParserProgress) -> i64 {
+    let fraction = (progress.bytes_consumed.min(progress.total_bytes) * 1_000)
+        .checked_div(progress.total_bytes)
+        .unwrap_or(0);
+    let fraction = i64::try_from(fraction).unwrap_or(1_000);
+    let (base, span): (i64, i64) = match progress.phase {
+        ParserProgressPhase::FirstPass => (3_000, 1_000),
+        ParserProgressPhase::SecondPass => (4_000, 2_500),
+        ParserProgressPhase::Finalize => (6_500, 500),
+    };
+    base + fraction * span / 1_000
 }

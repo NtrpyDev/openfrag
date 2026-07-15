@@ -1,7 +1,7 @@
 use openfrag_import::{
     CalculationIdentity, DemoMetadata, EventReceipt, ParseDiagnostic, ParseDiagnosticCategory,
-    ParseStage, ParsedEvent, ParsedOutput, ParsedRound, ParserError, Participant, PlayerSnapshot,
-    SnapshotPhase,
+    ParseStage, ParsedEvent, ParsedOutput, ParsedRound, ParserError, ParserProgress,
+    ParserProgressPhase, Participant, PlayerSnapshot, SnapshotPhase,
 };
 use openfrag_pipeline::{
     ImportOutcome, ImportRequest, ImportService, ParserBackend, PipelineError,
@@ -19,7 +19,11 @@ use std::{fs, path::Path};
 struct FixtureParser(ParsedOutput);
 
 impl ParserBackend for FixtureParser {
-    fn parse(&self, _: &Path) -> Result<ParsedOutput, openfrag_import::ParserError> {
+    fn parse(
+        &self,
+        _: &Path,
+        _: &mut dyn FnMut(ParserProgress),
+    ) -> Result<ParsedOutput, openfrag_import::ParserError> {
         Ok(self.0.clone())
     }
 }
@@ -28,10 +32,52 @@ impl ParserBackend for FixtureParser {
 struct FailingParser(ParseDiagnostic);
 
 impl ParserBackend for FailingParser {
-    fn parse(&self, _: &Path) -> Result<ParsedOutput, ParserError> {
+    fn parse(
+        &self,
+        _: &Path,
+        _: &mut dyn FnMut(ParserProgress),
+    ) -> Result<ParsedOutput, ParserError> {
         Err(ParserError {
             diagnostic: Box::new(self.0.clone()),
         })
+    }
+}
+
+#[derive(Clone)]
+struct ProgressFixtureParser(ParsedOutput);
+
+impl ParserBackend for ProgressFixtureParser {
+    fn parse(
+        &self,
+        _: &Path,
+        progress: &mut dyn FnMut(ParserProgress),
+    ) -> Result<ParsedOutput, ParserError> {
+        for sample in [
+            ParserProgress {
+                phase: ParserProgressPhase::FirstPass,
+                bytes_consumed: 50,
+                total_bytes: 100,
+                frames: 4,
+                events_emitted: 0,
+            },
+            ParserProgress {
+                phase: ParserProgressPhase::SecondPass,
+                bytes_consumed: 75,
+                total_bytes: 100,
+                frames: 8,
+                events_emitted: 9,
+            },
+            ParserProgress {
+                phase: ParserProgressPhase::Finalize,
+                bytes_consumed: 100,
+                total_bytes: 100,
+                frames: 8,
+                events_emitted: 9,
+            },
+        ] {
+            progress(sample);
+        }
+        Ok(self.0.clone())
     }
 }
 
@@ -290,6 +336,39 @@ fn unavailable_rating_still_commits_a_nonempty_match_and_receipt() {
         .unwrap(),
         1
     );
+}
+
+#[test]
+fn parser_phase_progress_is_persisted_through_terminal_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("fixture.dem");
+    fs::write(&source, b"PBDEMS2\0fixture").unwrap();
+    let mut storage = Storage::open(Layout::at(dir.path().join("store"))).unwrap();
+    ImportService::new(&mut storage, ProgressFixtureParser(fixture_output()))
+        .import(ImportRequest {
+            source: &source,
+            local_steam_id: 76_561_197_964_020_430,
+            worker: "progress-worker",
+            lease_expires_at_ms: i64::MAX,
+        })
+        .unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("store/openfrag.sqlite3")).unwrap();
+    let progress = db
+        .query_row(
+            "SELECT work_phase,bytes_done,bytes_total,frames_done,events_emitted FROM import_jobs",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(progress, ("finalize".into(), 100, 100, 8, 9));
 }
 
 #[test]

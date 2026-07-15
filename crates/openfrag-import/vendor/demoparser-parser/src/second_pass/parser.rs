@@ -32,6 +32,7 @@ use snap::raw::decompress_len;
 use snap::raw::Decoder as SnapDecoder;
 
 use super::variants::InputHistory;
+use crate::progress::{ParsePhase, ParseProgress};
 
 const OUTER_BUF_DEFAULT_LEN: usize = 400_000;
 const INNER_BUF_DEFAULT_LEN: usize = 8192 * 15;
@@ -75,6 +76,9 @@ pub struct SecondPassOutput {
 }
 impl<'a> SecondPassParser<'a> {
     pub fn start(&mut self, demo_bytes: &'a [u8]) -> Result<(), DemoParserError> {
+        self.start_with_progress(demo_bytes, &mut |_| {})
+    }
+    pub fn start_with_progress<F: FnMut(ParseProgress) + ?Sized>(&mut self, demo_bytes: &'a [u8], progress: &mut F) -> Result<(), DemoParserError> {
         if prof_on() {
             PROF_ENTS_NS.with(|c| c.set(0));
             PROF_COLLECT_NS.with(|c| c.set(0));
@@ -82,6 +86,14 @@ impl<'a> SecondPassParser<'a> {
             PROF_DECODE_NS.with(|c| c.set(0));
         }
         let started_at = self.ptr;
+        let total_bytes = demo_bytes.len() as u64;
+        progress(ParseProgress {
+            phase: ParsePhase::SecondPass,
+            bytes_consumed: self.ptr as u64,
+            total_bytes,
+            frames: self.frames_processed,
+            events_emitted: self.game_events.len() as u64,
+        });
         // re-use these to avoid allocation
         let mut buf = vec![0_u8; INNER_BUF_DEFAULT_LEN];
         let mut buf2 = vec![0_u8; OUTER_BUF_DEFAULT_LEN];
@@ -96,14 +108,17 @@ impl<'a> SecondPassParser<'a> {
                 Err(DemoParserError::OutOfBytesError) => break,
                 Err(e) => return Err(e),
             };
+            self.frames_processed += 1;
             if frame.demo_cmd == DemAnimationData || frame.demo_cmd == DemSendTables || frame.demo_cmd == DemStringTables {
                 self.ptr += frame.size as usize;
+                self.report_progress(total_bytes, progress);
                 continue;
             }
             let bytes = match self.slice_packet_bytes(demo_bytes, frame.size) {
                 Ok(b) => b,
                 Err(_) => {
                     self.ptr += frame.size;
+                    self.report_progress(total_bytes, progress);
                     continue;
                 }
             };
@@ -113,7 +128,10 @@ impl<'a> SecondPassParser<'a> {
             let ok = match frame.demo_cmd {
                 DemSignonPacket => self.parse_packet(&bytes, &mut buf2),
                 DemPacket => self.parse_packet(&bytes, &mut buf2),
-                DemStop => break,
+                DemStop => {
+                    self.report_progress(total_bytes, progress);
+                    break;
+                }
                 DemUserCmd => Ok(()),
                 DemFullPacket => {
                     if self.parse_full_packet_and_break_if_needed(&bytes, &mut buf2, started_at)? {
@@ -124,6 +142,7 @@ impl<'a> SecondPassParser<'a> {
                 _ => Ok(()),
             };
             ok?;
+            self.report_progress(total_bytes, progress);
         }
         if prof_on() {
             let ents = PROF_ENTS_NS.with(|c| c.get());
@@ -142,6 +161,15 @@ impl<'a> SecondPassParser<'a> {
             );
         }
         Ok(())
+    }
+    fn report_progress<F: FnMut(ParseProgress) + ?Sized>(&self, total_bytes: u64, progress: &mut F) {
+        progress(ParseProgress {
+            phase: ParsePhase::SecondPass,
+            bytes_consumed: (self.ptr as u64).min(total_bytes),
+            total_bytes,
+            frames: self.frames_processed,
+            events_emitted: self.game_events.len() as u64,
+        });
     }
     fn parse_full_packet_and_break_if_needed(&mut self, bytes: &[u8], buf: &mut Vec<u8>, started_at: usize) -> Result<bool, DemoParserError> {
         if let Some(start_end_offset) = self.start_end_offset {

@@ -4,6 +4,7 @@ use crate::first_pass::parser_settings::check_multithreadability;
 use crate::first_pass::parser_settings::{FirstPassParser, ParserInputs};
 use crate::first_pass::prop_controller::{NAME_ID, PropController, STEAMID_ID, TICK_ID};
 use crate::first_pass::read_bits::{DemoParserError, DemoParserErrorContext, DemoParserStage};
+use crate::progress::{ParsePhase, ParseProgress};
 use crate::second_pass::collect_data::ProjectileRecord;
 use crate::second_pass::game_events::{EventField, GameEvent};
 use crate::second_pass::parser::SecondPassOutput;
@@ -64,10 +65,13 @@ impl<'a> Parser<'a> {
         }
     }
     pub fn parse_demo(&mut self, demo_bytes: &[u8]) -> Result<DemoOutput, DemoParserError> {
+        self.parse_demo_with_progress(demo_bytes, &mut |_| {})
+    }
+    pub fn parse_demo_with_progress(&mut self, demo_bytes: &[u8], progress: &mut dyn FnMut(ParseProgress)) -> Result<DemoOutput, DemoParserError> {
         let _prof = std::env::var("CS2_PROF").is_ok();
         let _t = std::time::Instant::now();
         let mut first_pass_parser = FirstPassParser::new(&self.input);
-        let first_pass_output = match first_pass_parser.parse_demo(demo_bytes, false) {
+        let first_pass_output = match first_pass_parser.parse_demo_with_progress(demo_bytes, false, progress) {
             Ok(output) => output,
             Err(source) => {
                 return Err(source.with_context(DemoParserErrorContext {
@@ -88,7 +92,7 @@ impl<'a> Parser<'a> {
         {
             return self.second_pass_multi_threaded(demo_bytes, first_pass_output);
         } else {
-            self.second_pass_single_threaded(demo_bytes, first_pass_output)
+            self.second_pass_single_threaded(demo_bytes, first_pass_output, progress)
         }
     }
 
@@ -140,7 +144,12 @@ impl<'a> Parser<'a> {
         events.retain(|x| x.name != "player_first_connect");
         events.extend(ids.values().map(|x| x.clone()));
     }
-    fn second_pass_single_threaded(&self, outer_bytes: &[u8], first_pass_output: FirstPassOutput) -> Result<DemoOutput, DemoParserError> {
+    fn second_pass_single_threaded(
+        &self,
+        outer_bytes: &[u8],
+        first_pass_output: FirstPassOutput,
+        progress: &mut dyn FnMut(ParseProgress),
+    ) -> Result<DemoOutput, DemoParserError> {
         let prof = std::env::var("CS2_PROF").is_ok();
         let mut t = std::time::Instant::now();
         let game_build = first_pass_output.header.get("patch_version").cloned();
@@ -152,7 +161,7 @@ impl<'a> Parser<'a> {
                 game_build: game_build.clone(),
             })
         })?;
-        if let Err(source) = parser.start(outer_bytes) {
+        if let Err(source) = parser.start_with_progress(outer_bytes, progress) {
             return Err(source.with_context(DemoParserErrorContext {
                 stage: DemoParserStage::SecondPass,
                 byte_offset: Some(parser.ptr),
@@ -164,6 +173,7 @@ impl<'a> Parser<'a> {
             eprintln!("[prof] second_pass start(): {:.3}s", t.elapsed().as_secs_f64());
             t = std::time::Instant::now();
         }
+        let frames = parser.frames_processed;
         let second_pass_output = parser.create_output();
         if prof {
             eprintln!("[prof] create_output: {:.3}s", t.elapsed().as_secs_f64());
@@ -179,6 +189,13 @@ impl<'a> Parser<'a> {
         }
         Parser::add_item_purchase_sell_column(&mut outputs.game_events);
         Parser::remove_item_sold_events(&mut outputs.game_events);
+        progress(ParseProgress {
+            phase: ParsePhase::Finalize,
+            bytes_consumed: outer_bytes.len() as u64,
+            total_bytes: outer_bytes.len() as u64,
+            frames,
+            events_emitted: outputs.game_events.len() as u64,
+        });
         if prof {
             eprintln!("[prof] post-proc: {:.3}s", t.elapsed().as_secs_f64());
         }

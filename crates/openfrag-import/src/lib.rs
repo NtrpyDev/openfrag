@@ -60,6 +60,33 @@ impl Progress {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParserProgressPhase {
+    FirstPass,
+    SecondPass,
+    Finalize,
+}
+
+impl ParserProgressPhase {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::FirstPass => "first_pass",
+            Self::SecondPass => "second_pass",
+            Self::Finalize => "finalize",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParserProgress {
+    pub phase: ParserProgressPhase,
+    pub bytes_consumed: u64,
+    pub total_bytes: u64,
+    pub frames: u64,
+    pub events_emitted: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CalculationIdentity {
     pub source_sha256: String,
@@ -939,6 +966,14 @@ fn map_upstream_error(
 
 #[cfg(feature = "demoparser")]
 pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserError> {
+    parse_with_pinned_demoparser_with_progress(path, &mut |_| {})
+}
+
+#[cfg(feature = "demoparser")]
+pub fn parse_with_pinned_demoparser_with_progress(
+    path: &Path,
+    progress: &mut dyn FnMut(ParserProgress),
+) -> Result<ParsedOutput, ParserError> {
     use ahash::AHashMap;
     use demoparser_parser::second_pass::parser_settings::create_huffman_lookup_table;
     use demoparser_parser::{
@@ -993,7 +1028,24 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
     })?;
     let mut parser = Parser::new(inputs, ParsingMode::ForceSingleThreaded);
     let out = parser
-        .parse_demo(&bytes)
+        .parse_demo_with_progress(&bytes, &mut |upstream| {
+            let phase = match upstream.phase {
+                demoparser_parser::progress::ParsePhase::FirstPass => {
+                    ParserProgressPhase::FirstPass
+                }
+                demoparser_parser::progress::ParsePhase::SecondPass => {
+                    ParserProgressPhase::SecondPass
+                }
+                demoparser_parser::progress::ParsePhase::Finalize => ParserProgressPhase::Finalize,
+            };
+            progress(ParserProgress {
+                phase,
+                bytes_consumed: upstream.bytes_consumed,
+                total_bytes: upstream.total_bytes,
+                frames: upstream.frames,
+                events_emitted: upstream.events_emitted,
+            });
+        })
         .map_err(|error| map_upstream_error(error, &frame_locations))?;
     let player_snapshots = soa_to_aos(OutputSerdeHelperStruct {
         prop_infos: out.prop_controller.prop_infos.clone(),
@@ -1882,8 +1934,46 @@ mod tests {
             return;
         };
         let start = std::time::Instant::now();
+        let mut parser_progress = Vec::new();
         let parsed =
-            parse_with_pinned_demoparser(Path::new(&path)).expect("pinned fixture must parse");
+            parse_with_pinned_demoparser_with_progress(Path::new(&path), &mut |progress| {
+                parser_progress.push(progress)
+            })
+            .expect("pinned fixture must parse");
+        assert!(
+            parser_progress
+                .iter()
+                .any(|progress| progress.phase == ParserProgressPhase::FirstPass)
+        );
+        assert!(
+            parser_progress
+                .iter()
+                .any(|progress| progress.phase == ParserProgressPhase::SecondPass)
+        );
+        assert_eq!(
+            parser_progress.last().map(|progress| progress.phase),
+            Some(ParserProgressPhase::Finalize)
+        );
+        for phase in [
+            ParserProgressPhase::FirstPass,
+            ParserProgressPhase::SecondPass,
+            ParserProgressPhase::Finalize,
+        ] {
+            let samples = parser_progress
+                .iter()
+                .filter(|progress| progress.phase == phase)
+                .collect::<Vec<_>>();
+            assert!(samples.windows(2).all(|samples| {
+                samples[0].bytes_consumed <= samples[1].bytes_consumed
+                    && samples[0].frames <= samples[1].frames
+                    && samples[0].events_emitted <= samples[1].events_emitted
+            }));
+            assert!(
+                samples
+                    .iter()
+                    .all(|sample| sample.bytes_consumed <= sample.total_bytes)
+            );
+        }
         assert!(!parsed.suspicious_empty);
         assert_eq!(parsed.metadata.map.as_deref(), Some("de_mirage"));
         assert_eq!(parsed.participants.len(), 10);

@@ -10,6 +10,7 @@ use crate::first_pass::stringtables::StringTable;
 use crate::first_pass::stringtables::UserInfo;
 use crate::maps::demo_cmd_type_from_int;
 
+use crate::progress::{ParsePhase, ParseProgress};
 use crate::second_pass::decoder::QfMapper;
 use crate::second_pass::other_netmessages::Class;
 use ahash::AHashMap;
@@ -89,8 +90,25 @@ impl<'a> FirstPassParser<'a> {
         Ok(self.header.clone())
     }
     pub fn parse_demo(&mut self, demo_bytes: &'a [u8], exit_early: bool) -> Result<FirstPassOutput, DemoParserError> {
+        self.parse_demo_with_progress(demo_bytes, exit_early, &mut |_| {})
+    }
+    pub fn parse_demo_with_progress<F: FnMut(ParseProgress) + ?Sized>(
+        &mut self,
+        demo_bytes: &'a [u8],
+        exit_early: bool,
+        progress: &mut F,
+    ) -> Result<FirstPassOutput, DemoParserError> {
         self.handle_short_header(demo_bytes.len(), &demo_bytes[..HEADER_ENDS_AT_BYTE])?;
         let mut reuseable_buffer = vec![0_u8; 100_000];
+        let total_bytes = demo_bytes.len() as u64;
+        let mut frames = 0_u64;
+        progress(ParseProgress {
+            phase: ParsePhase::FirstPass,
+            bytes_consumed: self.ptr as u64,
+            total_bytes,
+            frames,
+            events_emitted: 0,
+        });
         // Loop that goes trough the entire file
         loop {
             // Need at least a few bytes to read frame header (3 varints, minimum 1 byte each)
@@ -105,14 +123,29 @@ impl<'a> FirstPassParser<'a> {
                 Err(DemoParserError::OutOfBytesError) => break,
                 Err(e) => return Err(e),
             };
+            frames += 1;
             if self.is_packet_we_skip_on_first_pass(frame.demo_cmd) {
                 self.ptr += frame.size;
+                progress(ParseProgress {
+                    phase: ParsePhase::FirstPass,
+                    bytes_consumed: self.ptr.min(demo_bytes.len()) as u64,
+                    total_bytes,
+                    frames,
+                    events_emitted: 0,
+                });
                 continue;
             }
             let bytes = match self.slice_packet_bytes(demo_bytes, frame.size) {
                 Ok(b) => b,
                 Err(_) => {
                     self.ptr += frame.size;
+                    progress(ParseProgress {
+                        phase: ParsePhase::FirstPass,
+                        bytes_consumed: self.ptr.min(demo_bytes.len()) as u64,
+                        total_bytes,
+                        frames,
+                        events_emitted: 0,
+                    });
                     continue;
                 }
             };
@@ -124,9 +157,25 @@ impl<'a> FirstPassParser<'a> {
                 EDemoCommands::DemClassInfo => self.parse_class_info(bytes)?,
                 EDemoCommands::DemSignonPacket => self.parse_packet(bytes)?,
                 EDemoCommands::DemFullPacket => self.parse_full_packet(bytes, &frame)?,
-                EDemoCommands::DemStop => break,
+                EDemoCommands::DemStop => {
+                    progress(ParseProgress {
+                        phase: ParsePhase::FirstPass,
+                        bytes_consumed: self.ptr.min(demo_bytes.len()) as u64,
+                        total_bytes,
+                        frames,
+                        events_emitted: 0,
+                    });
+                    break;
+                }
                 _ => {}
             };
+            progress(ParseProgress {
+                phase: ParsePhase::FirstPass,
+                bytes_consumed: self.ptr.min(demo_bytes.len()) as u64,
+                total_bytes,
+                frames,
+                events_emitted: 0,
+            });
         }
         self.fallback_if_first_pass_missing_data()?;
         self.create_first_pass_output()
