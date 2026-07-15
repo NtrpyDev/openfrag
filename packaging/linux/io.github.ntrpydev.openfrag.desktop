@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=openfrag
+Comment=Open the local openfrag dashboard
+Exec=openfrag-launch
+TryExec=openfrag-launch
+Icon=io.github.ntrpydev.openfrag
+Terminal=false
+Categories=Utility;
+StartupNotify=true
