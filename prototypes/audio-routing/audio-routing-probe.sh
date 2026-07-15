@@ -35,16 +35,23 @@ capture_state() {
 capture_state initial
 
 if command -v gpu-screen-recorder >/dev/null; then
-  gpu-screen-recorder --help >"$out_dir/gpu-screen-recorder-help.txt" 2>&1 || true
+  gpu_screen_recorder_bin="$(command -v gpu-screen-recorder)"
+  "$gpu_screen_recorder_bin" --help >"$out_dir/gpu-screen-recorder-help.txt" 2>&1 || true
+  gpu_screen_recorder_version="$("$gpu_screen_recorder_bin" --version 2>&1 | head -1)"
+  "$gpu_screen_recorder_bin" --list-audio-devices >"$out_dir/gpu-screen-recorder-audio-devices.txt" 2>&1
+  "$gpu_screen_recorder_bin" --list-application-audio >"$out_dir/gpu-screen-recorder-applications.txt" 2>&1
   gpu_screen_recorder="present"
-  if grep -Eqi '(^|[[:space:]])(-a|--audio)([[:space:],]|$)|audio.*source|source.*audio' "$out_dir/gpu-screen-recorder-help.txt"; then
-    gpu_audio_selection="advertised-in-help"
+  if grep -Fq 'PipeWire' "$out_dir/initial-pactl-info.txt"; then
+    gpu_audio_selection="device-and-application-discovery"
   else
-    gpu_audio_selection="not-advertised-in-help"
+    gpu_audio_selection="device-discovery-only"
   fi
 else
   printf '%s\n' 'gpu-screen-recorder is not installed on this host.' >"$out_dir/gpu-screen-recorder-help.txt"
+  printf '%s\n' 'gpu-screen-recorder is not installed on this host.' >"$out_dir/gpu-screen-recorder-audio-devices.txt"
+  printf '%s\n' 'gpu-screen-recorder is not installed on this host.' >"$out_dir/gpu-screen-recorder-applications.txt"
   gpu_screen_recorder="absent"
+  gpu_screen_recorder_version="unavailable"
   gpu_audio_selection="unavailable"
 fi
 
@@ -90,9 +97,12 @@ jq -n \
   --slurpfile sources "$out_dir/initial-pulse-sources.json" \
   --slurpfile inputs "$out_dir/initial-pulse-sink-inputs.json" \
   --slurpfile outputs "$out_dir/initial-pulse-source-outputs.json" \
+  --rawfile gpu_audio_devices "$out_dir/gpu-screen-recorder-audio-devices.txt" \
+  --rawfile gpu_applications "$out_dir/gpu-screen-recorder-applications.txt" \
   --arg generated_at "$(date --iso-8601=seconds)" \
   --arg synthetic_status "$synthetic_status" \
   --arg gpu_screen_recorder "$gpu_screen_recorder" \
+  --arg gpu_screen_recorder_version "$gpu_screen_recorder_version" \
   --arg gpu_audio_selection "$gpu_audio_selection" \
   --argjson pw_play_status "$play_status" \
   --argjson pw_record_status "$record_status" \
@@ -119,9 +129,16 @@ jq -n \
     generated_at: $generated_at,
     probe: "issue-18-audio-routing-throwaway",
     safety: "Synthetic null-sink monitor only; no microphone was selected or recorded.",
-    gpu_screen_recorder: {availability: $gpu_screen_recorder, audio_source_selection: $gpu_audio_selection, help_file: "gpu-screen-recorder-help.txt"},
+    gpu_screen_recorder: {
+      availability: $gpu_screen_recorder,
+      version: $gpu_screen_recorder_version,
+      audio_source_selection: $gpu_audio_selection,
+      devices: ($gpu_audio_devices | split("\n") | map(select(length > 0))),
+      applications: ($gpu_applications | split("\n") | map(select(length > 0))),
+      files: ["gpu-screen-recorder-help.txt", "gpu-screen-recorder-audio-devices.txt", "gpu-screen-recorder-applications.txt"]
+    },
     synthetic_capture: {status: $synthetic_status, sink: $sink_name, source: ($sink_name + ".monitor"), file: "synthetic-monitor.wav", pw_play_status: $pw_play_status, pw_record_status: $pw_record_status, verification: "synthetic-ffprobe.json and synthetic-astats.txt"},
-    persistence_rule: "Use node.name plus device.serial/device.bus_path/device.name when present; numeric object serial is diagnostic only.",
+    persistence_rule: "For devices, use node.name plus device.serial/device.bus_path/device.name when present. For applications, re-resolve the selected application name against the live gpu-screen-recorder list. Numeric indices and object serials are diagnostic only.",
     fallback: "If no separate CS2 and voice candidates are routable, capture one mixed_game_voice sink monitor; capture microphone separately only from a non-monitor source. Otherwise three tracks are unavailable.",
     sinks: [$sinks[0][] | {description, persistence: persistence}],
     non_monitor_sources: [$sources[0][] | select((.name | endswith(".monitor")) | not) | {description, persistence: persistence}],

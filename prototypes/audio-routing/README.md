@@ -24,18 +24,24 @@ Interpretation is deliberately conservative:
 
 - A three-track setup requires three distinct inputs: a CS2 sink-input, a
   voice-chat sink-input, and a non-monitor microphone source. The report names
-  candidates but never assumes one exists from a device label alone.
+  candidates but never assumes one exists from a device label alone. Repeated
+  `gpu-screen-recorder -a` arguments create separate tracks; sources joined
+  with `|` are mixed into one track.
 - Persist a Pulse/PipeWire `node.name` plus stable device identity properties
-  (`device.serial`, `device.bus_path`, `device.name`) when available. Never
-  persist a numeric object index/serial as the primary identity.
+  (`device.serial`, `device.bus_path`, `device.name`) when available. Persist
+  an application role by its selected gpu-screen-recorder application name and
+  re-resolve it at each start. Never persist a numeric object index/serial as
+  the primary identity.
 - If CS2 and voice chat both arrive only at the same sink monitor, capture one
   explicit `mixed_game_voice` track (and a microphone track only when a
   non-monitor source exists). Three independently playable tracks are then
   unavailable. The human must choose mixed capture or configure a separate
   virtual sink/routing rule outside this spike.
-- If `gpu-screen-recorder` is absent or its help lacks an audio-source option,
-  the recording integration is unavailable. The synthetic capture proves only
-  PipeWire/Pulse routing and source selection, not gpu-screen-recorder media
-  muxing.
+- In-game CS2 voice that shares CS2's application stream cannot be separated
+  by application capture. A separate voice application such as Discord can be
+  assigned its own track on PipeWire.
+- If `gpu-screen-recorder` is absent, the recording integration is unavailable.
+  The synthetic capture proves only PipeWire/Pulse routing and source
+  selection, not gpu-screen-recorder media muxing.
 
 Do not commit generated reports or WAV files.
