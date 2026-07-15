@@ -80,7 +80,7 @@ if [[ $ffmpeg_ready == true ]] \
     elif command -v timeout >/dev/null 2>&1 \
         && timeout --signal=TERM --kill-after=2s 10s \
             ffmpeg -nostdin -v error \
-            -f lavfi -i color=c=black:s=128x128:r=1:d=0.1 \
+            -f lavfi -i color=c=black:s=256x256:r=1:d=0.1 \
             -frames:v 1 -an -c:v h264_nvenc -f null - >/dev/null 2>&1; then
         set_check nvenc ready runtime_verified
     else
