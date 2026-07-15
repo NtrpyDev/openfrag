@@ -5,4 +5,6 @@ edition = "2021"
 description = "Non-invasive XDG Global Shortcuts portal introspection probe for issue 23"
 
 [dependencies]
-zbus = { version = "4", features = ["blocking"] }
+ashpd = { version = "0.13.12", default-features = false, features = ["global_shortcuts", "tokio"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
