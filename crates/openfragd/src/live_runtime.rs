@@ -4,10 +4,18 @@ use openfrag_live::{
     Clock, Coordinator, EvidenceStore, FinalizedClip, IngestOutcome, LiveDiagnostic, Recorder,
     Scheduler, StorageEvidenceStore, TimerId, TimerOutcome,
 };
+use openfrag_shortcuts::{
+    ManualFlagService, ManualFlagSink, PortalBackend, RestoreToken, RestoreTokenStore,
+    ShortcutDiagnostic,
+};
 use openfrag_storage::Storage;
+use serde_json::{Value, json};
 use std::{
     collections::{HashMap, VecDeque},
-    path::Path,
+    fs::{self, OpenOptions},
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -16,6 +24,8 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+use crate::{api::ApiError, service::MutationPorts};
 
 const MAX_DIAGNOSTICS: usize = 32;
 
@@ -513,6 +523,270 @@ where
         self.ingest_receipt(&receipt)
             .map(|_| ())
             .map_err(|error| format!("{error:?}"))
+    }
+}
+
+/// Bridges the daemon's live capture runtime to portal and loopback Manual Flag requests.
+pub struct LiveManualFlagAdapter<E, R, C, S> {
+    runtime: Arc<LiveRuntime<E, R, C, S>>,
+}
+
+impl<E, R, C, S> LiveManualFlagAdapter<E, R, C, S> {
+    #[must_use]
+    pub fn new(runtime: Arc<LiveRuntime<E, R, C, S>>) -> Self {
+        Self { runtime }
+    }
+}
+
+impl<E, R, C, S> ManualFlagSink for LiveManualFlagAdapter<E, R, C, S>
+where
+    E: EvidenceStore + 'static,
+    R: CaptureRuntimePort + 'static,
+    C: Clock + 'static,
+    S: Scheduler + 'static,
+{
+    fn manual_flag(&self) -> Result<(), ShortcutDiagnostic> {
+        self.runtime
+            .manual_flag()
+            .map(|_| ())
+            .map_err(|error| ShortcutDiagnostic::Sink(format!("{error:?}")))
+    }
+}
+
+impl<E, R, C, S> MutationPorts for LiveManualFlagAdapter<E, R, C, S>
+where
+    E: EvidenceStore + 'static,
+    R: CaptureRuntimePort + 'static,
+    C: Clock + 'static,
+    S: Scheduler + 'static,
+{
+    fn manual_flag(&self) -> Result<Value, ApiError> {
+        self.runtime
+            .manual_flag()
+            .map(|capture_id| json!({"capture_id": capture_id}))
+            .map_err(|error| ApiError::Unavailable(format!("Manual Flag unavailable: {error:?}")))
+    }
+}
+
+/// Private durable storage for the portal's opaque Manual Flag restore token.
+pub struct FileRestoreTokenStore {
+    path: PathBuf,
+}
+
+impl FileRestoreTokenStore {
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl RestoreTokenStore for FileRestoreTokenStore {
+    fn load(&self) -> Result<Option<RestoreToken>, ShortcutDiagnostic> {
+        let value = match fs::read_to_string(&self.path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(persistence_error(&self.path, &error)),
+        };
+        let value = value.trim();
+        if value.is_empty() || value.contains(['\n', '\r']) {
+            return Err(ShortcutDiagnostic::Persistence(format!(
+                "{} contains an invalid token",
+                self.path.display()
+            )));
+        }
+        Ok(Some(RestoreToken::new(value)))
+    }
+
+    fn save(&self, token: &RestoreToken) -> Result<(), ShortcutDiagnostic> {
+        let parent = self.path.parent().ok_or_else(|| {
+            ShortcutDiagnostic::Persistence(format!(
+                "{} has no parent directory",
+                self.path.display()
+            ))
+        })?;
+        fs::create_dir_all(parent).map_err(|error| persistence_error(parent, &error))?;
+        let temporary = self.path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(token.as_str().as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            fs::rename(&temporary, &self.path)
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_file(&temporary);
+            return Err(persistence_error(&self.path, &error));
+        }
+        Ok(())
+    }
+}
+
+fn persistence_error(path: &Path, error: &std::io::Error) -> ShortcutDiagnostic {
+    ShortcutDiagnostic::Persistence(format!("{}: {error}", path.display()))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManualFlagWorkerStatus {
+    Starting,
+    Ready,
+    Unavailable(ShortcutDiagnostic),
+    Stopped,
+}
+
+#[derive(Clone)]
+pub struct ManualFlagStatusHandle {
+    status: Arc<Mutex<ManualFlagWorkerStatus>>,
+}
+
+impl ManualFlagStatusHandle {
+    #[must_use]
+    pub fn status(&self) -> ManualFlagWorkerStatus {
+        self.status
+            .lock()
+            .map_or(ManualFlagWorkerStatus::Stopped, |status| status.clone())
+    }
+}
+
+/// Owns the asynchronous portal session and closes it when the daemon drops the worker.
+pub struct ManualFlagWorker {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    join: Option<JoinHandle<()>>,
+    status: Arc<Mutex<ManualFlagWorkerStatus>>,
+}
+
+impl ManualFlagWorker {
+    pub fn start<P, M, T>(
+        portal: Arc<P>,
+        sink: Arc<M>,
+        store: Arc<T>,
+        preferred_trigger: Option<String>,
+    ) -> Result<Self, ShortcutDiagnostic>
+    where
+        P: PortalBackend + 'static,
+        M: ManualFlagSink + 'static,
+        T: RestoreTokenStore + 'static,
+    {
+        let (stop, stop_receiver) = tokio::sync::oneshot::channel();
+        let status = Arc::new(Mutex::new(ManualFlagWorkerStatus::Starting));
+        let thread_status = status.clone();
+        let join = std::thread::Builder::new()
+            .name("openfrag-manual-flag".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let diagnostic = ShortcutDiagnostic::Portal(format!(
+                            "cannot start portal runtime: {error}"
+                        ));
+                        set_manual_flag_status(
+                            &thread_status,
+                            ManualFlagWorkerStatus::Unavailable(diagnostic.clone()),
+                        );
+                        return;
+                    }
+                };
+                runtime.block_on(run_manual_flag_service(
+                    portal,
+                    sink,
+                    store,
+                    preferred_trigger,
+                    stop_receiver,
+                    thread_status,
+                ));
+            })
+            .map_err(|error| {
+                ShortcutDiagnostic::Portal(format!("cannot start portal worker: {error}"))
+            })?;
+        Ok(Self {
+            stop: Some(stop),
+            join: Some(join),
+            status,
+        })
+    }
+
+    #[must_use]
+    pub fn status(&self) -> ManualFlagWorkerStatus {
+        self.status_handle().status()
+    }
+
+    #[must_use]
+    pub fn status_handle(&self) -> ManualFlagStatusHandle {
+        ManualFlagStatusHandle {
+            status: self.status.clone(),
+        }
+    }
+}
+
+async fn run_manual_flag_service<P, M, T>(
+    portal: Arc<P>,
+    sink: Arc<M>,
+    store: Arc<T>,
+    preferred_trigger: Option<String>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+    status: Arc<Mutex<ManualFlagWorkerStatus>>,
+) where
+    P: PortalBackend,
+    M: ManualFlagSink,
+    T: RestoreTokenStore,
+{
+    let mut service = ManualFlagService::new(portal, sink, store, preferred_trigger);
+    let start = tokio::select! {
+        _ = &mut stop => {
+            set_manual_flag_status(&status, ManualFlagWorkerStatus::Stopped);
+            return;
+        }
+        result = service.start() => result,
+    };
+    if let Err(error) = start {
+        set_manual_flag_status(&status, ManualFlagWorkerStatus::Unavailable(error.clone()));
+        return;
+    }
+    set_manual_flag_status(&status, ManualFlagWorkerStatus::Ready);
+    let terminal = loop {
+        tokio::select! {
+            _ = &mut stop => break None,
+            result = service.poll() => {
+                if let Err(error) = result {
+                    break Some(error);
+                }
+            }
+        }
+    };
+    let shutdown_error = service.shutdown().await.err();
+    if let Some(error) = terminal.or(shutdown_error) {
+        set_manual_flag_status(&status, ManualFlagWorkerStatus::Unavailable(error));
+    } else {
+        set_manual_flag_status(&status, ManualFlagWorkerStatus::Stopped);
+    }
+}
+
+fn set_manual_flag_status(status: &Mutex<ManualFlagWorkerStatus>, value: ManualFlagWorkerStatus) {
+    if let Ok(mut status) = status.lock() {
+        *status = value;
+    }
+}
+
+impl Drop for ManualFlagWorker {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
     }
 }
 

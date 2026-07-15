@@ -247,7 +247,12 @@ def verify_mounted_api_contracts(
     require(status == 200, f"diagnostics API returned {status}: {body!r}")
     diagnostics = json.loads(body)
     require(
-        diagnostics == {"capture": "needs_action", "gsi": "ready"},
+        diagnostics
+        == {
+            "capture": "needs_action",
+            "gsi": "ready",
+            "manual_flag": "unavailable",
+        },
         f"unexpected diagnostics API response: {diagnostics}",
     )
 

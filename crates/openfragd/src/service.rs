@@ -317,7 +317,11 @@ impl<P: MutationPorts> LocalApi for StorageApi<P> {
                 .find(|check| check.id == id)
                 .map_or("unknown", |check| check.status.as_str())
         };
-        Ok(json!({"capture":status("capture"),"gsi":status("gsi")}))
+        Ok(json!({
+            "capture": status("capture"),
+            "gsi": status("gsi"),
+            "manual_flag": status("manual_flag")
+        }))
     }
 }
 fn unavailable(name: &str) -> ApiError {

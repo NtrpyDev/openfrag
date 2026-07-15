@@ -7,8 +7,7 @@ use openfrag_domain::{
 };
 use openfrag_gsi::{EvidenceContext, EvidenceReceipt, PresenceBits, StateOutput, TransitionFact};
 use openfrag_live::{
-    CandidateRecord, CaptureKind, CaptureRecord, CaptureStatus, EvidenceStore, LiveDiagnostic,
-    MANUAL_FLAG_SAVE_JOIN_REQUIREMENT, StorageEvidenceStore,
+    CandidateRecord, CaptureKind, CaptureRecord, CaptureStatus, EvidenceStore, StorageEvidenceStore,
 };
 use openfrag_storage::{Layout, Storage};
 use rusqlite::Connection;
@@ -279,7 +278,7 @@ fn retry_and_coalesced_transitions_wait_for_real_media_acknowledgement() {
 }
 
 #[test]
-fn manual_request_persists_available_rows_and_reports_the_one_missing_join_api() {
+fn manual_request_persists_flag_attempt_and_durable_join() {
     let directory = tempfile::tempdir().expect("temp directory");
     let layout = Layout::at(directory.path());
     let adapter = StorageEvidenceStore::new(
@@ -288,7 +287,7 @@ fn manual_request_persists_available_rows_and_reports_the_one_missing_join_api()
     )
     .expect("adapter");
     let window = manual_capture_window(42_000, 0);
-    let result = adapter.upsert_capture(&CaptureRecord {
+    let mut capture = CaptureRecord {
         id: "manual:42000:1".into(),
         kind: CaptureKind::ManualFlag,
         round_id: None,
@@ -305,13 +304,13 @@ fn manual_request_persists_available_rows_and_reports_the_one_missing_join_api()
             end_ms: 42_000,
         }),
         status: CaptureStatus::Requesting,
+    };
+    assert_eq!(adapter.upsert_capture(&capture), Ok(()));
+    capture.status = CaptureStatus::SaveRequested(SaveRequestOutcome {
+        recorder_request_id: "manual-recorder-save-1".into(),
+        disposition: SaveDisposition::Signalled,
     });
-    assert_eq!(
-        result,
-        Err(LiveDiagnostic::StorageRequirement(
-            MANUAL_FLAG_SAVE_JOIN_REQUIREMENT
-        ))
-    );
+    assert_eq!(adapter.upsert_capture(&capture), Ok(()));
     drop(adapter);
     let connection = Connection::open(layout.database).expect("database");
     assert_eq!(
@@ -336,7 +335,7 @@ fn manual_request_persists_available_rows_and_reports_the_one_missing_join_api()
                 |row| row.get::<_, i64>(0)
             )
             .expect("joins"),
-        0
+        1
     );
 }
 

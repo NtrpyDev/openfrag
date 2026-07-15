@@ -1,6 +1,6 @@
 use crate::{
     CandidateRecord, CaptureKind, CaptureRecord, CaptureStatus, EvidenceStore, FinalizedClip,
-    LiveDiagnostic, MANUAL_FLAG_SAVE_JOIN_REQUIREMENT,
+    LiveDiagnostic,
 };
 use openfrag_capture::{SaveAcknowledgement, SaveProvenance};
 use openfrag_domain::CandidateTrigger;
@@ -232,6 +232,10 @@ impl EvidenceStore for StorageEvidenceStore {
         let window = capture
             .window
             .ok_or(LiveDiagnostic::Unsupported("capture window"))?;
+        if capture.kind == CaptureKind::ManualFlag && capture.status == CaptureStatus::Requesting {
+            ensure_manual_flag(&mut state, &self.session, capture, window)?;
+            return Ok(());
+        }
         let requested_at_ms = capture
             .raw_coverage
             .map_or(window.requested_at_ms, |coverage| coverage.end_ms);
@@ -250,10 +254,16 @@ impl EvidenceStore for StorageEvidenceStore {
             join_candidate_once(&mut state, &candidate_id, &attempt, window)?;
         }
         if capture.kind == CaptureKind::ManualFlag {
-            ensure_manual_flag(&mut state, &self.session, capture, window)?;
-            return Err(LiveDiagnostic::StorageRequirement(
-                MANUAL_FLAG_SAVE_JOIN_REQUIREMENT,
-            ));
+            let flag = ensure_manual_flag(&mut state, &self.session, capture, window)?;
+            state
+                .storage
+                .join_manual_flag_save(
+                    &flag,
+                    &attempt,
+                    millis_u64_to_nanos(window.desired.start_ms)?,
+                    millis_u64_to_nanos(window.desired.end_ms)?,
+                )
+                .map_err(persistence)?;
         }
         match &capture.status {
             CaptureStatus::Requesting | CaptureStatus::SaveRequested(_) => {}

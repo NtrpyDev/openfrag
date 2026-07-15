@@ -77,11 +77,20 @@ pub enum AppError {
 
 #[derive(Clone)]
 struct AppState {
-    #[allow(dead_code)]
-    storage: Arc<Mutex<Storage>>,
+    shortcut_worker: Option<Arc<live_runtime::ManualFlagWorker>>,
     #[allow(dead_code)]
     runtime_worker: Option<Arc<live_runtime::RuntimeWorker>>,
+    storage: Arc<Mutex<Storage>>,
+    manual_flag_diagnostic: String,
     gsi_configured: bool,
+}
+
+struct LiveComposition {
+    gsi_service: Option<GsiService>,
+    runtime_worker: Option<Arc<live_runtime::RuntimeWorker>>,
+    shortcut_worker: Option<Arc<live_runtime::ManualFlagWorker>>,
+    ports: Arc<dyn service::MutationPorts>,
+    diagnostic: String,
 }
 
 #[derive(Serialize)]
@@ -92,6 +101,7 @@ struct Health {
     upload_path: bool,
     database: &'static str,
     gsi: &'static str,
+    manual_flag: String,
     rating_state: &'static str,
     rating: Option<String>,
 }
@@ -124,12 +134,17 @@ pub fn app(config: &AppConfig) -> Result<Router, AppError> {
             AppError::Configuration(format!("cannot compose local clip ports: {error:?}"))
         })?,
     );
-    let ports = service::CompositePorts::new(
-        import_ports,
-        clip_ports,
-        Arc::new(service::UnavailablePorts),
-    );
-    let setup_runtime = compose_setup_runtime(config, credentials.is_some())?;
+    let live = compose_live_runtime(config, credentials.as_ref(), &storage)?;
+    let gsi_service = live.gsi_service;
+    let runtime_worker = live.runtime_worker;
+    let shortcut_worker = live.shortcut_worker;
+    let live_ports = live.ports;
+    let manual_flag_diagnostic = live.diagnostic;
+    let manual_flag_status = shortcut_worker
+        .as_ref()
+        .map(|worker| worker.status_handle());
+    let ports = service::CompositePorts::new(import_ports, clip_ports, live_ports);
+    let setup_runtime = compose_setup_runtime(config, credentials.is_some(), manual_flag_status)?;
     let local_api = service::StorageApi::new(
         storage.clone(),
         ports,
@@ -140,45 +155,11 @@ pub fn app(config: &AppConfig) -> Result<Router, AppError> {
         ),
     )
     .with_setup_runtime(setup_runtime);
-    let mut gsi_service = None;
-    let mut runtime_worker = None;
-    if let Some((token, steam_id)) = &credentials {
-        let (sink, driver): (
-            Arc<dyn EventSink>,
-            Option<live_runtime::ProductionRuntimeDriver>,
-        ) = if let Ok(driver) = live_runtime::production_runtime(&config.data_directory, steam_id) {
-            (driver.runtime(), Some(driver))
-        } else {
-            let session = storage
-                .lock()
-                .map_err(|_| AppError::Storage("storage lock poisoned".into()))?
-                .create_capture_session(steam_id)
-                .map_err(|error| AppError::Storage(format!("{error:?}")))?;
-            (
-                Arc::new(StorageGsiSink {
-                    storage: storage.clone(),
-                    session,
-                }),
-                None,
-            )
-        };
-        let service = GsiService::new(
-            GsiConfig::new(token, steam_id, Duration::from_secs(10)),
-            Arc::new(SystemClock::default()),
-            sink,
-        );
-        if let Some(driver) = driver {
-            runtime_worker = Some(Arc::new(
-                live_runtime::RuntimeWorker::start(driver, service.clone()).map_err(|error| {
-                    AppError::Configuration(format!("cannot start live runtime worker: {error}"))
-                })?,
-            ));
-        }
-        gsi_service = Some(service);
-    }
     let state = AppState {
-        storage: storage.clone(),
+        shortcut_worker,
         runtime_worker,
+        storage: storage.clone(),
+        manual_flag_diagnostic,
         gsi_configured,
     };
     let mut router = Router::new()
@@ -194,9 +175,82 @@ pub fn app(config: &AppConfig) -> Result<Router, AppError> {
     Ok(router)
 }
 
+fn compose_live_runtime(
+    config: &AppConfig,
+    credentials: Option<&(String, String)>,
+    storage: &Arc<Mutex<Storage>>,
+) -> Result<LiveComposition, AppError> {
+    let Some((token, steam_id)) = credentials else {
+        return Ok(LiveComposition {
+            gsi_service: None,
+            runtime_worker: None,
+            shortcut_worker: None,
+            ports: Arc::new(service::UnavailablePorts),
+            diagnostic: "setup_required".to_owned(),
+        });
+    };
+    let driver = match live_runtime::production_runtime(&config.data_directory, steam_id) {
+        Ok(driver) => driver,
+        Err(error) => {
+            let session = storage
+                .lock()
+                .map_err(|_| AppError::Storage("storage lock poisoned".into()))?
+                .create_capture_session(steam_id)
+                .map_err(|error| AppError::Storage(format!("{error:?}")))?;
+            return Ok(LiveComposition {
+                gsi_service: Some(GsiService::new(
+                    GsiConfig::new(token, steam_id, Duration::from_secs(10)),
+                    Arc::new(SystemClock::default()),
+                    Arc::new(StorageGsiSink {
+                        storage: storage.clone(),
+                        session,
+                    }),
+                )),
+                runtime_worker: None,
+                shortcut_worker: None,
+                ports: Arc::new(service::UnavailablePorts),
+                diagnostic: format!("capture_unavailable: {error:?}"),
+            });
+        }
+    };
+    let runtime = driver.runtime();
+    let gsi_service = GsiService::new(
+        GsiConfig::new(token, steam_id, Duration::from_secs(10)),
+        Arc::new(SystemClock::default()),
+        runtime.clone(),
+    );
+    let runtime_worker = Arc::new(
+        live_runtime::RuntimeWorker::start(driver, gsi_service.clone()).map_err(|error| {
+            AppError::Configuration(format!("cannot start live runtime worker: {error}"))
+        })?,
+    );
+    let ports = Arc::new(live_runtime::LiveManualFlagAdapter::new(runtime));
+    let shortcut_worker = Arc::new(
+        live_runtime::ManualFlagWorker::start(
+            Arc::new(openfrag_shortcuts::linux_portal::LinuxPortalBackend::new()),
+            ports.clone(),
+            Arc::new(live_runtime::FileRestoreTokenStore::new(
+                config.data_directory.join("manual-flag-restore-token"),
+            )),
+            None,
+        )
+        .map_err(|error| {
+            AppError::Configuration(format!("cannot start Manual Flag portal worker: {error}"))
+        })?,
+    );
+    Ok(LiveComposition {
+        gsi_service: Some(gsi_service),
+        runtime_worker: Some(runtime_worker),
+        shortcut_worker: Some(shortcut_worker),
+        ports,
+        diagnostic: "starting".to_owned(),
+    })
+}
+
 fn compose_setup_runtime(
     config: &AppConfig,
     gsi_active: bool,
+    manual_flag_status: Option<live_runtime::ManualFlagStatusHandle>,
 ) -> Result<Arc<setup_runtime::SetupRuntime>, AppError> {
     let home_is_explicit = config.setup_home.is_some();
     let home = config
@@ -211,18 +265,21 @@ fn compose_setup_runtime(
     let xdg_data_home = std::env::var_os("XDG_DATA_HOME")
         .filter(|_| !home_is_explicit)
         .map(PathBuf::from);
-    setup_runtime::SetupRuntime::new(
-        Arc::new(setup_runtime::SystemSetupHost::new(
-            home,
-            config.data_directory.clone(),
-            config_directory.clone(),
-            xdg_data_home,
-            gsi_active,
-        )),
-        config_directory.join("setup-state.json"),
-    )
-    .map(Arc::new)
-    .map_err(|error| AppError::Configuration(format!("cannot compose setup runtime: {error:?}")))
+    let mut host = setup_runtime::SystemSetupHost::new(
+        home,
+        config.data_directory.clone(),
+        config_directory.clone(),
+        xdg_data_home,
+        gsi_active,
+    );
+    if let Some(status) = manual_flag_status {
+        host = host.with_manual_flag_status(status);
+    }
+    setup_runtime::SetupRuntime::new(Arc::new(host), config_directory.join("setup-state.json"))
+        .map(Arc::new)
+        .map_err(|error| {
+            AppError::Configuration(format!("cannot compose setup runtime: {error:?}"))
+        })
 }
 
 fn configured_ffprobe(config: &AppConfig) -> PathBuf {
@@ -261,6 +318,17 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         Some(StoredRatingAvailability::Pending) => ("preview", None),
         Some(StoredRatingAvailability::Unavailable { .. }) | None => ("unavailable", None),
     };
+    let manual_flag = state.shortcut_worker.as_ref().map_or_else(
+        || state.manual_flag_diagnostic.clone(),
+        |worker| match worker.status() {
+            live_runtime::ManualFlagWorkerStatus::Starting => "starting".to_owned(),
+            live_runtime::ManualFlagWorkerStatus::Ready => "ready".to_owned(),
+            live_runtime::ManualFlagWorkerStatus::Unavailable(error) => {
+                format!("unsupported: {error}")
+            }
+            live_runtime::ManualFlagWorkerStatus::Stopped => "stopped".to_owned(),
+        },
+    );
     Json(Health {
         version: env!("CARGO_PKG_VERSION"),
         binding: "loopback",
@@ -272,6 +340,7 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         } else {
             "setup_required"
         },
+        manual_flag,
         rating_state,
         rating,
     })

@@ -4,6 +4,7 @@ use crate::api::{
     ApiError, SetupAction, SetupActionRequest, SetupCandidate, SetupCheck, SetupResponse,
 };
 use crate::capture_runtime::CaptureRuntime;
+use crate::live_runtime::{ManualFlagStatusHandle, ManualFlagWorkerStatus};
 use openfrag_capture::{FfprobeMediaProbe, SaveProvenance, StdClock, StdFilesystem, StdProcess};
 use openfrag_setup::{
     CaptureConfiguration, CaptureRecorder, discover_cs2_cfg_directories, install_actionable_gsi,
@@ -56,6 +57,7 @@ pub struct SystemSetupHost {
     data_directory: PathBuf,
     xdg_data_home: Option<PathBuf>,
     gsi_active: bool,
+    manual_flag_status: Option<ManualFlagStatusHandle>,
 }
 
 impl SystemSetupHost {
@@ -73,7 +75,14 @@ impl SystemSetupHost {
             data_directory,
             xdg_data_home,
             gsi_active,
+            manual_flag_status: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_manual_flag_status(mut self, status: ManualFlagStatusHandle) -> Self {
+        self.manual_flag_status = Some(status);
+        self
     }
 }
 
@@ -229,7 +238,9 @@ impl SetupHost for SystemSetupHost {
     }
 
     fn manual_flag_available(&self) -> bool {
-        false
+        self.manual_flag_status
+            .as_ref()
+            .is_some_and(|status| status.status() == ManualFlagWorkerStatus::Ready)
     }
 }
 

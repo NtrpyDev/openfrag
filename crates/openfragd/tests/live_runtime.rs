@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -12,9 +13,14 @@ use openfrag_live::{
     CandidateRecord, CaptureRecord, Clock, EvidenceStore, LiveDiagnostic, Scheduler,
     StorageEvidenceStore, TimerId, TimerOutcome,
 };
+use openfrag_shortcuts::{
+    MANUAL_FLAG_ID, OpenedSession, PortalBackend, PortalSignal, RestoreToken, SessionHandle,
+    ShortcutDiagnostic, ShortcutRequest,
+};
 use openfrag_storage::{Layout, Storage};
 use openfragd::live_runtime::{
-    CaptureRuntimePort, LiveRuntime, LiveRuntimeError, LiveRuntimeStatus, MonotonicClock,
+    CaptureRuntimePort, FileRestoreTokenStore, LiveManualFlagAdapter, LiveRuntime,
+    LiveRuntimeError, LiveRuntimeStatus, ManualFlagWorker, ManualFlagWorkerStatus, MonotonicClock,
     RuntimeDriver, RuntimeWorker, UnavailableReason, deadline_channel,
 };
 use std::{
@@ -26,6 +32,75 @@ use std::{
     time::Duration,
 };
 use tower::ServiceExt;
+
+struct BoundaryPortal {
+    opens: Mutex<Vec<(Option<RestoreToken>, Vec<ShortcutRequest>)>>,
+    signals: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<PortalSignal>>,
+    closes: Mutex<Vec<SessionHandle>>,
+}
+
+impl BoundaryPortal {
+    fn new() -> (Arc<Self>, tokio::sync::mpsc::UnboundedSender<PortalSignal>) {
+        let (sender, signals) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Arc::new(Self {
+                opens: Mutex::new(Vec::new()),
+                signals: tokio::sync::Mutex::new(signals),
+                closes: Mutex::new(Vec::new()),
+            }),
+            sender,
+        )
+    }
+}
+
+#[async_trait]
+impl PortalBackend for BoundaryPortal {
+    async fn open(
+        &self,
+        restore_token: Option<&RestoreToken>,
+        shortcuts: &[ShortcutRequest],
+    ) -> Result<OpenedSession, ShortcutDiagnostic> {
+        let mut opens = self.opens.lock().expect("portal opens");
+        opens.push((restore_token.cloned(), shortcuts.to_vec()));
+        let ordinal = opens.len();
+        Ok(OpenedSession {
+            session: SessionHandle::new(format!("boundary-session-{ordinal}")),
+            restore_token: restore_token
+                .cloned()
+                .unwrap_or_else(|| RestoreToken::new("durable-manual-flag-token")),
+        })
+    }
+
+    async fn next_signal(
+        &self,
+        _session: &SessionHandle,
+    ) -> Result<PortalSignal, ShortcutDiagnostic> {
+        self.signals
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or(ShortcutDiagnostic::SessionLost)
+    }
+
+    async fn close(&self, session: &SessionHandle) -> Result<(), ShortcutDiagnostic> {
+        self.closes
+            .lock()
+            .expect("portal closes")
+            .push(session.clone());
+        Ok(())
+    }
+}
+
+fn wait_until(mut condition: impl FnMut() -> bool) {
+    for _ in 0..200 {
+        if condition() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("condition did not become true");
+}
 
 #[test]
 fn monotonic_clock_clones_share_one_non_decreasing_epoch() {
@@ -457,4 +532,177 @@ async fn authenticated_gsi_deadline_finalizes_one_clip_and_shuts_down_capture() 
     assert_eq!(clip_count, 1);
     drop(worker);
     assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn production_manual_flag_boundary_restores_reconnects_and_closes_without_a_desktop() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let layout = Layout::at(directory.path().join("data"));
+    let token_path = directory.path().join("manual-flag-restore-token");
+    let output = directory.path().join("manual-flag.mkv");
+    std::fs::write(&output, b"validated manual flag media").expect("captured media");
+    let shutdowns = Arc::new(AtomicU64::new(0));
+    let clock = FakeClock::default();
+    clock.0.store(40_000, Ordering::SeqCst);
+    let store = StorageEvidenceStore::new(
+        Storage::open(layout.clone()).expect("storage"),
+        "76561198000000000",
+    )
+    .expect("durable store");
+    let session = store.capture_session_id().to_owned();
+    let (scheduler, deadlines) = deadline_channel();
+    let runtime = Arc::new(LiveRuntime::with_store(
+        session,
+        store,
+        FinalizingCapture {
+            clock: clock.0.clone(),
+            output,
+            pending: None,
+            shutdowns: shutdowns.clone(),
+        },
+        clock.clone(),
+        scheduler,
+    ));
+    let driver = RuntimeDriver::new(runtime.clone(), deadlines, clock.clone());
+    let gsi = openfrag_gsi::GsiService::new(
+        openfrag_gsi::GsiConfig::new(
+            "private-test-token",
+            "76561198000000000",
+            Duration::from_secs(10),
+        ),
+        Arc::new(clock.clone()),
+        runtime.clone(),
+    );
+    let runtime_worker = RuntimeWorker::start(driver, gsi).expect("runtime worker");
+    let (portal, signals) = BoundaryPortal::new();
+    let shortcut_worker = ManualFlagWorker::start(
+        portal.clone(),
+        Arc::new(LiveManualFlagAdapter::new(runtime.clone())),
+        Arc::new(FileRestoreTokenStore::new(token_path.clone())),
+        None,
+    )
+    .expect("manual flag worker");
+
+    wait_until(|| portal.opens.lock().expect("opens").len() == 1);
+    wait_until(|| shortcut_worker.status() == ManualFlagWorkerStatus::Ready);
+    wait_until(|| token_path.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&token_path)
+                .expect("restore token metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    let first_open = portal.opens.lock().expect("opens")[0].clone();
+    assert_eq!(first_open.0, None);
+    assert_eq!(first_open.1.len(), 1);
+    assert_eq!(first_open.1[0].id, MANUAL_FLAG_ID);
+    signals
+        .send(PortalSignal::Activated(MANUAL_FLAG_ID.into()))
+        .expect("first activation");
+    signals
+        .send(PortalSignal::Activated(MANUAL_FLAG_ID.into()))
+        .expect("held activation");
+    for _ in 0..200 {
+        if Storage::open(layout.clone())
+            .and_then(|storage| storage.list_clips())
+            .is_ok_and(|clips| clips.len() == 1)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        Storage::open(layout.clone())
+            .expect("clip storage")
+            .list_clips()
+            .expect("clips")
+            .len(),
+        1,
+        "worker status: {:?}; runtime diagnostics: {:?}",
+        shortcut_worker.status(),
+        runtime.diagnostics()
+    );
+    drop(shortcut_worker);
+    drop(runtime_worker);
+    assert_eq!(portal.closes.lock().expect("closes").len(), 1);
+    assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+
+    let restart_clock = FakeClock::default();
+    restart_clock.0.store(50_000, Ordering::SeqCst);
+    let restart_store = StorageEvidenceStore::new(
+        Storage::open(layout.clone()).expect("reopened storage"),
+        "76561198000000000",
+    )
+    .expect("restarted durable store");
+    let restart_session = restart_store.capture_session_id().to_owned();
+    let (restart_scheduler, restart_deadlines) = deadline_channel();
+    let restart_runtime = Arc::new(LiveRuntime::with_store(
+        restart_session,
+        restart_store,
+        FinalizingCapture {
+            clock: restart_clock.0.clone(),
+            output: directory.path().join("unused-restart.mkv"),
+            pending: None,
+            shutdowns: shutdowns.clone(),
+        },
+        restart_clock.clone(),
+        restart_scheduler,
+    ));
+    let restart_driver = RuntimeDriver::new(
+        restart_runtime.clone(),
+        restart_deadlines,
+        restart_clock.clone(),
+    );
+    let restart_gsi = openfrag_gsi::GsiService::new(
+        openfrag_gsi::GsiConfig::new(
+            "private-test-token",
+            "76561198000000000",
+            Duration::from_secs(10),
+        ),
+        Arc::new(restart_clock),
+        restart_runtime.clone(),
+    );
+    let restart_runtime_worker =
+        RuntimeWorker::start(restart_driver, restart_gsi).expect("restarted runtime worker");
+    let (restart_portal, restart_signals) = BoundaryPortal::new();
+    let restart_shortcut_worker = ManualFlagWorker::start(
+        restart_portal.clone(),
+        Arc::new(LiveManualFlagAdapter::new(restart_runtime)),
+        Arc::new(FileRestoreTokenStore::new(token_path)),
+        None,
+    )
+    .expect("restarted manual flag worker");
+
+    wait_until(|| restart_portal.opens.lock().expect("opens").len() == 1);
+    assert_eq!(
+        restart_portal.opens.lock().expect("opens")[0].0,
+        Some(RestoreToken::new("durable-manual-flag-token"))
+    );
+    restart_signals
+        .send(PortalSignal::PortalLost)
+        .expect("portal loss");
+    wait_until(|| restart_portal.opens.lock().expect("opens").len() == 2);
+    assert_eq!(
+        restart_portal.opens.lock().expect("opens")[1].0,
+        Some(RestoreToken::new("durable-manual-flag-token"))
+    );
+    drop(restart_shortcut_worker);
+    drop(restart_runtime_worker);
+    assert_eq!(restart_portal.closes.lock().expect("closes").len(), 1);
+    assert_eq!(shutdowns.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        Storage::open(layout)
+            .expect("final storage")
+            .list_clips()
+            .expect("final clips")
+            .len(),
+        1
+    );
 }
