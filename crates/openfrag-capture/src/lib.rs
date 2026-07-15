@@ -112,7 +112,9 @@ pub struct MediaInfo {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SaveAcknowledgement {
     pub path: PathBuf,
+    pub recorder_request_id: String,
     pub provenance: SaveProvenance,
+    pub requested_at_ms: u64,
     pub media: MediaInfo,
 }
 
@@ -120,6 +122,12 @@ pub struct SaveAcknowledgement {
 pub enum SaveDisposition {
     Signalled,
     Coalesced,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SaveRequestOutcome {
+    pub recorder_request_id: String,
+    pub disposition: SaveDisposition,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,9 +187,11 @@ impl Config {
     }
 }
 
-struct InFlight {
+struct PendingSave {
+    recorder_request_id: String,
     provenance: SaveProvenance,
     since_wall_ms: u64,
+    requested_at_ms: u64,
 }
 
 /// Coordinates one recorder child and one durable save acknowledgement at a time.
@@ -195,8 +205,8 @@ pub struct Supervisor<P, F, C, M> {
     shutting_down: bool,
     started_ms: u64,
     stable: bool,
-    in_flight: Option<InFlight>,
-    queued: Option<SaveProvenance>,
+    in_flight: Option<PendingSave>,
+    queued: Option<PendingSave>,
     next_restart_ms: Option<u64>,
     failures: usize,
     stderr: VecDeque<u8>,
@@ -235,26 +245,57 @@ impl<P: Process, F: Filesystem, C: Clock, M: MediaProbe> Supervisor<P, F, C, M> 
         self.next_restart_ms
     }
     #[must_use]
+    pub fn has_save_in_flight(&self) -> bool {
+        self.in_flight.is_some()
+    }
+    #[must_use]
     pub fn stderr_tail(&self) -> Vec<u8> {
         self.stderr.iter().copied().collect()
     }
 
-    pub fn request_save(&mut self, provenance: SaveProvenance) -> Result<SaveDisposition, Error> {
+    pub fn request_save(
+        &mut self,
+        recorder_request_id: &str,
+        provenance: SaveProvenance,
+    ) -> Result<SaveRequestOutcome, Error> {
         if !self.running {
             return Err(Error::NotRunning);
         }
         if self.in_flight.is_some() {
-            if self.queued.is_none() {
-                self.queued = Some(provenance);
+            let queued = self.queued.get_or_insert_with(|| PendingSave {
+                recorder_request_id: recorder_request_id.to_owned(),
+                provenance,
+                since_wall_ms: 0,
+                requested_at_ms: 0,
+            });
+            if provenance == SaveProvenance::ManualFlag {
+                queued.provenance = SaveProvenance::ManualFlag;
             }
-            return Ok(SaveDisposition::Coalesced);
+            return Ok(SaveRequestOutcome {
+                recorder_request_id: queued.recorder_request_id.clone(),
+                disposition: SaveDisposition::Coalesced,
+            });
         }
+        self.signal_save(recorder_request_id.to_owned(), provenance)?;
+        Ok(SaveRequestOutcome {
+            recorder_request_id: recorder_request_id.to_owned(),
+            disposition: SaveDisposition::Signalled,
+        })
+    }
+
+    fn signal_save(
+        &mut self,
+        recorder_request_id: String,
+        provenance: SaveProvenance,
+    ) -> Result<(), Error> {
         self.process.signal(Signal::User1).map_err(Error::Process)?;
-        self.in_flight = Some(InFlight {
+        self.in_flight = Some(PendingSave {
+            recorder_request_id,
             provenance,
             since_wall_ms: self.clock.wall_ms(),
+            requested_at_ms: self.clock.now_ms(),
         });
-        Ok(SaveDisposition::Signalled)
+        Ok(())
     }
 
     /// Discover and verify a newly emitted file before acknowledging the save.
@@ -273,21 +314,19 @@ impl<P: Process, F: Filesystem, C: Clock, M: MediaProbe> Supervisor<P, F, C, M> 
     }
 
     pub fn acknowledge(&mut self, path: PathBuf) -> Result<SaveAcknowledgement, Error> {
-        let provenance = self
-            .in_flight
-            .as_ref()
-            .ok_or(Error::NoSaveInFlight)?
-            .provenance;
+        let pending = self.in_flight.as_ref().ok_or(Error::NoSaveInFlight)?;
         self.validate_output(&path)?;
         let media = self.probe.verify(&path).map_err(Error::Media)?;
         let acknowledgement = SaveAcknowledgement {
             path,
-            provenance,
+            recorder_request_id: pending.recorder_request_id.clone(),
+            provenance: pending.provenance,
+            requested_at_ms: pending.requested_at_ms,
             media,
         };
         self.in_flight = None;
         if let Some(next) = self.queued.take() {
-            self.request_save(next)?;
+            self.signal_save(next.recorder_request_id, next.provenance)?;
         }
         Ok(acknowledgement)
     }
@@ -875,28 +914,40 @@ mod tests {
         let mut s = supervisor(5);
         s.start().unwrap();
         assert_eq!(
-            s.request_save(SaveProvenance::ManualFlag),
-            Ok(SaveDisposition::Signalled)
+            s.request_save("manual-first", SaveProvenance::ManualFlag),
+            Ok(SaveRequestOutcome {
+                recorder_request_id: "manual-first".into(),
+                disposition: SaveDisposition::Signalled,
+            })
         );
         assert_eq!(
-            s.request_save(SaveProvenance::AutoRoundEnd),
-            Ok(SaveDisposition::Coalesced)
+            s.request_save("auto-follow-up", SaveProvenance::AutoRoundEnd),
+            Ok(SaveRequestOutcome {
+                recorder_request_id: "auto-follow-up".into(),
+                disposition: SaveDisposition::Coalesced,
+            })
         );
         assert_eq!(
-            s.request_save(SaveProvenance::ManualFlag),
-            Ok(SaveDisposition::Coalesced)
+            s.request_save("manual-coalesced", SaveProvenance::ManualFlag),
+            Ok(SaveRequestOutcome {
+                recorder_request_id: "auto-follow-up".into(),
+                disposition: SaveDisposition::Coalesced,
+            })
         );
         let ack = s.acknowledge("/clips/one.mp4".into()).unwrap();
+        assert_eq!(ack.recorder_request_id, "manual-first");
         assert_eq!(ack.provenance, SaveProvenance::ManualFlag);
         assert_eq!(s.process.signals, vec![Signal::User1, Signal::User1]);
         let follow_up = s.acknowledge("/clips/two.mp4".into()).unwrap();
-        assert_eq!(follow_up.provenance, SaveProvenance::AutoRoundEnd);
+        assert_eq!(follow_up.recorder_request_id, "auto-follow-up");
+        assert_eq!(follow_up.provenance, SaveProvenance::ManualFlag);
     }
     #[test]
     fn rejects_escape_symlink_and_unverified_media() {
         let mut s = supervisor(0);
         s.start().unwrap();
-        s.request_save(SaveProvenance::ManualFlag).unwrap();
+        s.request_save("manual", SaveProvenance::ManualFlag)
+            .unwrap();
         assert_eq!(
             s.acknowledge("/clips/../outside.mp4".into()),
             Err(Error::UnsafeOutputPath)
@@ -912,7 +963,8 @@ mod tests {
         let mut s = supervisor(0);
         s.start().unwrap();
         assert_eq!(s.discover_save(), Err(Error::NoSaveInFlight));
-        s.request_save(SaveProvenance::AutoRoundEnd).unwrap();
+        s.request_save("auto", SaveProvenance::AutoRoundEnd)
+            .unwrap();
         s.filesystem.outputs = vec!["/clips/final.mp4".into()];
         assert_eq!(
             s.discover_save().unwrap().unwrap().path,

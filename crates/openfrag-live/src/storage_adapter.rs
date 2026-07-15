@@ -1,8 +1,8 @@
 use crate::{
-    CandidateRecord, CaptureKind, CaptureRecord, CaptureStatus, EvidenceStore, LiveDiagnostic,
-    MANUAL_FLAG_SAVE_JOIN_REQUIREMENT,
+    CandidateRecord, CaptureKind, CaptureRecord, CaptureStatus, EvidenceStore, FinalizedClip,
+    LiveDiagnostic, MANUAL_FLAG_SAVE_JOIN_REQUIREMENT,
 };
-use openfrag_capture::SaveDisposition;
+use openfrag_capture::{SaveAcknowledgement, SaveProvenance};
 use openfrag_domain::CandidateTrigger;
 use openfrag_gsi::EvidenceReceipt;
 use openfrag_storage::{CaptureSessionId, LiveCandidateId, ManualFlagId, SaveAttemptId, Storage};
@@ -74,6 +74,85 @@ impl StorageEvidenceStore {
     #[must_use]
     pub fn capture_session_id(&self) -> &str {
         self.session.as_str()
+    }
+
+    /// Validates and commits one recorder acknowledgement as a durable Clip.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the request identity is unknown, the media is unsafe,
+    /// or artifact and Clip persistence cannot complete.
+    pub fn finalize_capture(
+        &self,
+        acknowledgement: &SaveAcknowledgement,
+    ) -> Result<FinalizedClip, LiveDiagnostic> {
+        let state = self.lock()?;
+        let attempt = state
+            .storage
+            .save_attempt_for_request(&acknowledgement.recorder_request_id)
+            .map_err(persistence)?;
+        let metadata = std::fs::symlink_metadata(&acknowledgement.path).map_err(|error| {
+            LiveDiagnostic::Persistence(format!("cannot inspect captured media: {error}"))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(LiveDiagnostic::Unsupported(
+                "captured media must be a regular file",
+            ));
+        }
+        let extension = acknowledgement
+            .path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(str::to_ascii_lowercase)
+            .filter(|value| matches!(value.as_str(), "mkv" | "mp4" | "webm"))
+            .ok_or(LiveDiagnostic::Unsupported("captured media extension"))?;
+        let mut source = std::fs::File::open(&acknowledgement.path).map_err(|error| {
+            LiveDiagnostic::Persistence(format!("cannot open captured media: {error}"))
+        })?;
+        let staged = state
+            .storage
+            .stage_from_reader(&mut source)
+            .map_err(persistence)?;
+        let artifact = state
+            .storage
+            .commit_artifact(staged, &extension, Some(media_type(&extension)))
+            .map_err(persistence)?;
+        let actual_end_ns = millis_u64_to_nanos(acknowledgement.requested_at_ms)?;
+        let actual_start_ns = millis_u64_to_nanos(
+            acknowledgement
+                .requested_at_ms
+                .saturating_sub(acknowledgement.media.duration_ms),
+        )?;
+        let provenance = match acknowledgement.provenance {
+            SaveProvenance::AutoRoundEnd => "raw_auto",
+            SaveProvenance::ManualFlag => "raw_manual",
+        };
+        let clip = state
+            .storage
+            .finalize_captured_clip(
+                &attempt,
+                &artifact,
+                actual_start_ns,
+                actual_end_ns,
+                provenance,
+            )
+            .map_err(persistence)?;
+        std::fs::remove_file(&acknowledgement.path).map_err(|error| {
+            LiveDiagnostic::Persistence(format!("cannot remove captured source: {error}"))
+        })?;
+        Ok(FinalizedClip {
+            clip_id: clip.as_str().into(),
+            recorder_request_id: acknowledgement.recorder_request_id.clone(),
+        })
+    }
+}
+
+fn media_type(extension: &str) -> &'static str {
+    match extension {
+        "mkv" => "video/x-matroska",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
     }
 }
 
@@ -156,7 +235,17 @@ impl EvidenceStore for StorageEvidenceStore {
         let requested_at_ms = capture
             .raw_coverage
             .map_or(window.requested_at_ms, |coverage| coverage.end_ms);
-        let attempt = ensure_attempt(&mut state, &self.session, capture, requested_at_ms)?;
+        let recorder_request_id = match &capture.status {
+            CaptureStatus::SaveRequested(outcome) => Some(outcome.recorder_request_id.as_str()),
+            _ => None,
+        };
+        let attempt = ensure_attempt(
+            &mut state,
+            &self.session,
+            capture,
+            requested_at_ms,
+            recorder_request_id,
+        )?;
         if let Some(candidate_id) = candidate_id {
             join_candidate_once(&mut state, &candidate_id, &attempt, window)?;
         }
@@ -167,12 +256,7 @@ impl EvidenceStore for StorageEvidenceStore {
             ));
         }
         match &capture.status {
-            CaptureStatus::Requesting
-            | CaptureStatus::SaveRequested(SaveDisposition::Signalled) => {}
-            CaptureStatus::SaveRequested(SaveDisposition::Coalesced) => state
-                .storage
-                .acknowledge_save(&attempt)
-                .map_err(persistence)?,
+            CaptureStatus::Requesting | CaptureStatus::SaveRequested(_) => {}
             CaptureStatus::Retryable(message) => {
                 state
                     .storage
@@ -194,6 +278,13 @@ impl EvidenceStore for StorageEvidenceStore {
             CaptureStatus::Scheduled => unreachable!(),
         }
         Ok(())
+    }
+
+    fn finalize_capture(
+        &self,
+        acknowledgement: &SaveAcknowledgement,
+    ) -> Result<FinalizedClip, LiveDiagnostic> {
+        Self::finalize_capture(self, acknowledgement)
     }
 }
 
@@ -325,6 +416,7 @@ fn ensure_attempt(
     session: &CaptureSessionId,
     capture: &CaptureRecord,
     requested_at_ms: u64,
+    recorder_request_id: Option<&str>,
 ) -> Result<SaveAttemptId, LiveDiagnostic> {
     if let Some(existing) = state.save_attempts.get(&capture.id)
         && !existing.failed
@@ -335,11 +427,16 @@ fn ensure_attempt(
         .save_attempts
         .get(&capture.id)
         .map_or(0, |existing| existing.generation.saturating_add(1));
-    let request_id = if generation == 0 {
-        capture.id.clone()
-    } else {
-        format!("{}:retry:{generation}", capture.id)
-    };
+    let request_id = recorder_request_id.map_or_else(
+        || {
+            if generation == 0 {
+                capture.id.clone()
+            } else {
+                format!("{}:retry:{generation}", capture.id)
+            }
+        },
+        str::to_owned,
+    );
     let attempt = state
         .storage
         .request_save(session, &request_id, millis_u64_to_nanos(requested_at_ms)?)

@@ -1,24 +1,9 @@
-mod live_runtime {
-    use openfrag_capture::{SaveAcknowledgement, SaveDisposition, SaveProvenance};
-
-    pub trait CaptureRuntimePort: Send {
-        fn readiness(&self) -> Result<(), String>;
-        fn available_from_ms(&self) -> u64;
-        fn request_save(&mut self, provenance: SaveProvenance) -> Result<SaveDisposition, String>;
-        fn poll(&mut self) -> Result<Option<i32>, String>;
-        fn discover_save(&mut self) -> Result<Option<SaveAcknowledgement>, String>;
-        fn shutdown(&mut self) -> Result<(), String>;
-    }
-}
-
-#[path = "../src/capture_runtime.rs"]
-mod capture_runtime;
-
-use capture_runtime::{CaptureRuntime, RuntimeError, RuntimeStatus, UnavailableReason};
-use openfrag_capture::{
-    Clock, Filesystem, MediaInfo, MediaProbe, Process, SaveDisposition, SaveProvenance, Signal,
-};
+use openfrag_capture::{Clock, Filesystem, MediaInfo, MediaProbe, Process, SaveProvenance, Signal};
 use openfrag_setup::{CaptureConfiguration, CaptureRecorder, write_capture_configuration};
+use openfragd::{
+    capture_runtime::{CaptureRuntime, RuntimeError, RuntimeStatus, UnavailableReason},
+    live_runtime::CaptureRuntimePort,
+};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -108,7 +93,7 @@ fn runtime(
     )
 }
 
-fn assert_live_port_ready(port: &impl live_runtime::CaptureRuntimePort) {
+fn assert_live_port_ready(port: &impl CaptureRuntimePort) {
     assert_eq!(port.readiness(), Ok(()));
     assert_eq!(port.available_from_ms(), 12_000);
 }
@@ -153,7 +138,7 @@ fn missing_and_disabled_configs_never_reach_the_supervisor() {
     let mut disabled = runtime(directory.path(), log.clone(), None);
     assert_eq!(disabled.status(), RuntimeStatus::Disabled);
     assert_eq!(
-        disabled.request_save(SaveProvenance::ManualFlag),
+        disabled.request_save("manual-save", SaveProvenance::ManualFlag),
         Err(RuntimeError::Disabled)
     );
     assert!(log.lock().expect("process log").spawns.is_empty());
@@ -202,20 +187,19 @@ fn enabled_runtime_delegates_lifecycle_to_fakes_only() {
     assert_eq!(runtime.status(), RuntimeStatus::Running);
     assert_live_port_ready(&runtime);
     assert_eq!(
-        live_runtime::CaptureRuntimePort::request_save(&mut runtime, SaveProvenance::ManualFlag)
-            .expect("fake save"),
-        SaveDisposition::Signalled
+        CaptureRuntimePort::request_save(&mut runtime, "manual-save", SaveProvenance::ManualFlag,)
+            .expect("fake save")
+            .recorder_request_id,
+        "manual-save"
     );
-    let acknowledgement = live_runtime::CaptureRuntimePort::discover_save(&mut runtime)
+    let acknowledgement = CaptureRuntimePort::discover_save(&mut runtime)
         .expect("discover fake save")
         .expect("acknowledgement");
     assert_eq!(acknowledgement.path, output);
+    assert_eq!(acknowledgement.recorder_request_id, "manual-save");
     assert_eq!(acknowledgement.provenance, SaveProvenance::ManualFlag);
-    assert_eq!(
-        live_runtime::CaptureRuntimePort::poll(&mut runtime),
-        Ok(None)
-    );
-    live_runtime::CaptureRuntimePort::shutdown(&mut runtime).expect("shutdown fake supervisor");
+    assert_eq!(CaptureRuntimePort::poll(&mut runtime), Ok(None));
+    CaptureRuntimePort::shutdown(&mut runtime).expect("shutdown fake supervisor");
     assert!(runtime.stderr_tail().expect("stderr tail").is_empty());
 
     let log = log.lock().expect("process log");

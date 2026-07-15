@@ -1,4 +1,6 @@
-use openfrag_capture::{SaveDisposition, SaveProvenance};
+use openfrag_capture::{
+    MediaInfo, SaveAcknowledgement, SaveDisposition, SaveProvenance, SaveRequestOutcome,
+};
 use openfrag_domain::{
     AutoCaptureDecision, CandidateTrigger, HighlightCandidate, TimeRange, auto_capture_window,
     manual_capture_window, merge_candidates,
@@ -125,7 +127,10 @@ fn receipt_candidate_and_save_metadata_survive_reopen() {
                 start_ms: 0,
                 end_ms: 52_000,
             }),
-            status: CaptureStatus::SaveRequested(SaveDisposition::Signalled),
+            status: CaptureStatus::SaveRequested(SaveRequestOutcome {
+                recorder_request_id: "auto:maphash:4".into(),
+                disposition: SaveDisposition::Signalled,
+            }),
         })
         .expect("persist save request");
     drop(adapter);
@@ -228,7 +233,7 @@ fn scheduled_and_cancelled_states_are_idempotent_without_inventing_save_attempts
 }
 
 #[test]
-fn retry_and_coalesced_transitions_create_a_new_acknowledged_attempt() {
+fn retry_and_coalesced_transitions_wait_for_real_media_acknowledgement() {
     let directory = tempfile::tempdir().expect("temp directory");
     let layout = Layout::at(directory.path());
     let adapter = StorageEvidenceStore::new(
@@ -256,7 +261,10 @@ fn retry_and_coalesced_transitions_create_a_new_acknowledged_attempt() {
         status: CaptureStatus::Retryable("recorder_busy".into()),
     };
     adapter.upsert_capture(&capture).expect("retryable");
-    capture.status = CaptureStatus::SaveRequested(SaveDisposition::Coalesced);
+    capture.status = CaptureStatus::SaveRequested(SaveRequestOutcome {
+        recorder_request_id: "auto:retry:coalesced".into(),
+        disposition: SaveDisposition::Coalesced,
+    });
     adapter.upsert_capture(&capture).expect("coalesced retry");
     drop(adapter);
     let connection = Connection::open(layout.database).expect("database");
@@ -267,7 +275,7 @@ fn retry_and_coalesced_transitions_create_a_new_acknowledged_attempt() {
         .expect("query")
         .collect::<Result<Vec<_>, _>>()
         .expect("statuses");
-    assert_eq!(statuses, ["failed", "acknowledged"]);
+    assert_eq!(statuses, ["failed", "requested"]);
 }
 
 #[test]
@@ -329,5 +337,68 @@ fn manual_request_persists_available_rows_and_reports_the_one_missing_join_api()
             )
             .expect("joins"),
         0
+    );
+}
+
+#[test]
+fn one_acknowledged_recorder_request_finalizes_one_durable_clip() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let layout = Layout::at(directory.path().join("data"));
+    let output = directory.path().join("captured.mkv");
+    std::fs::write(&output, b"verified captured media").expect("captured media");
+    let adapter = StorageEvidenceStore::new(
+        Storage::open(layout.clone()).expect("storage"),
+        "76561198000000000",
+    )
+    .expect("adapter");
+    let outcome = SaveRequestOutcome {
+        recorder_request_id: "recorder-save-1".into(),
+        disposition: SaveDisposition::Signalled,
+    };
+    let window = manual_capture_window(42_000, 0);
+    for id in ["auto:first", "auto:coalesced"] {
+        adapter
+            .upsert_capture(&CaptureRecord {
+                id: id.into(),
+                kind: CaptureKind::AutoRoundEnd,
+                round_id: None,
+                provenance: SaveProvenance::AutoRoundEnd,
+                source_receipt_ids: BTreeSet::new(),
+                candidate: None,
+                final_labels: BTreeSet::new(),
+                round_end_ms: Some(42_000),
+                deadline_ms: Some(52_000),
+                timer: None,
+                window: Some(window),
+                raw_coverage: Some(TimeRange {
+                    start_ms: 0,
+                    end_ms: 52_000,
+                }),
+                status: CaptureStatus::SaveRequested(outcome.clone()),
+            })
+            .expect("save request");
+    }
+
+    let finalized = adapter
+        .finalize_capture(&SaveAcknowledgement {
+            path: output.clone(),
+            recorder_request_id: "recorder-save-1".into(),
+            provenance: SaveProvenance::AutoRoundEnd,
+            requested_at_ms: 52_000,
+            media: MediaInfo {
+                duration_ms: 60_000,
+                video_streams: 1,
+            },
+        })
+        .expect("finalized Clip");
+    assert!(!finalized.clip_id.is_empty());
+    assert!(!output.exists());
+    assert_eq!(
+        Storage::open(layout)
+            .expect("reopen storage")
+            .list_clips()
+            .expect("Clips")
+            .len(),
+        1
     );
 }

@@ -1,14 +1,20 @@
-use openfrag_capture::{SaveAcknowledgement, SaveDisposition, SaveProvenance};
+use openfrag_capture::{SaveAcknowledgement, SaveProvenance, SaveRequestOutcome};
 use openfrag_gsi::{EventSink, EvidenceReceipt};
 use openfrag_live::{
-    Clock, Coordinator, EvidenceStore, IngestOutcome, LiveDiagnostic, Recorder, Scheduler,
-    StorageEvidenceStore, TimerId, TimerOutcome,
+    Clock, Coordinator, EvidenceStore, FinalizedClip, IngestOutcome, LiveDiagnostic, Recorder,
+    Scheduler, StorageEvidenceStore, TimerId, TimerOutcome,
 };
 use openfrag_storage::Storage;
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex, mpsc},
-    time::{Duration, Instant},
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    thread::JoinHandle,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MAX_DIAGNOSTICS: usize = 32;
@@ -17,13 +23,29 @@ const MAX_DIAGNOSTICS: usize = 32;
 #[derive(Clone)]
 pub struct MonotonicClock {
     started: Arc<Instant>,
+    started_wall_ms: u64,
 }
 
 impl Default for MonotonicClock {
     fn default() -> Self {
         Self {
             started: Arc::new(Instant::now()),
+            started_wall_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+                .unwrap_or(0),
         }
+    }
+}
+
+impl openfrag_capture::Clock for MonotonicClock {
+    fn now_ms(&self) -> u64 {
+        Clock::now_ms(self)
+    }
+
+    fn wall_ms(&self) -> u64 {
+        self.started_wall_ms.saturating_add(Clock::now_ms(self))
     }
 }
 
@@ -200,12 +222,19 @@ impl DeadlineDriver {
 pub trait CaptureRuntimePort: Send {
     fn readiness(&self) -> Result<(), String>;
     fn available_from_ms(&self) -> u64;
-    fn request_save(&mut self, provenance: SaveProvenance) -> Result<SaveDisposition, String>;
+    fn request_save(
+        &mut self,
+        recorder_request_id: &str,
+        provenance: SaveProvenance,
+    ) -> Result<SaveRequestOutcome, String>;
     fn poll(&mut self) -> Result<Option<i32>, String> {
         Ok(None)
     }
     fn discover_save(&mut self) -> Result<Option<SaveAcknowledgement>, String> {
         Ok(None)
+    }
+    fn has_save_in_flight(&self) -> bool {
+        false
     }
     fn shutdown(&mut self) -> Result<(), String> {
         Ok(())
@@ -240,6 +269,7 @@ pub struct DiagnosticRecord {
 struct RecorderFacade<R> {
     capture: Arc<Mutex<R>>,
     available_from_ms: u64,
+    request_ordinal: AtomicU64,
 }
 
 impl<R> Recorder for RecorderFacade<R>
@@ -250,11 +280,17 @@ where
         self.available_from_ms
     }
 
-    fn request_save(&self, provenance: SaveProvenance) -> Result<SaveDisposition, String> {
+    fn request_save(
+        &self,
+        capture_id: &str,
+        provenance: SaveProvenance,
+    ) -> Result<SaveRequestOutcome, String> {
+        let ordinal = self.request_ordinal.fetch_add(1, Ordering::SeqCst) + 1;
+        let recorder_request_id = format!("{capture_id}:request:{ordinal}");
         self.capture
             .lock()
             .map_err(|_| "capture runtime lock poisoned".to_owned())?
-            .request_save(provenance)
+            .request_save(&recorder_request_id, provenance)
     }
 }
 
@@ -319,6 +355,7 @@ where
         let recorder = Arc::new(RecorderFacade {
             capture: capture.clone(),
             available_from_ms,
+            request_ordinal: AtomicU64::new(0),
         });
         let coordinator = Coordinator::new(
             capture_session_id.into(),
@@ -370,6 +407,24 @@ where
 
     pub fn discover_save(&self) -> Result<Option<SaveAcknowledgement>, LiveRuntimeError> {
         self.with_capture("save_discovery", CaptureRuntimePort::discover_save)
+    }
+
+    pub fn finalize_discovered_save(&self) -> Result<Option<FinalizedClip>, LiveRuntimeError> {
+        let has_save_in_flight = self
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.lock().ok())
+            .is_some_and(|capture| capture.has_save_in_flight());
+        if !has_save_in_flight {
+            return Ok(None);
+        }
+        let Some(acknowledgement) = self.discover_save()? else {
+            return Ok(None);
+        };
+        self.run("capture_finalize", |coordinator| {
+            coordinator.finalize_capture(&acknowledgement)
+        })
+        .map(Some)
     }
 
     pub fn shutdown_capture(&self) -> Result<(), LiveRuntimeError> {
@@ -459,4 +514,162 @@ where
             .map(|_| ())
             .map_err(|error| format!("{error:?}"))
     }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeDriveReport {
+    pub timers_dispatched: usize,
+    pub recorder_exit: Option<i32>,
+    pub finalized_clip: Option<FinalizedClip>,
+}
+
+/// Daemon-owned driver for deadlines, recorder supervision, and save finalization.
+pub struct RuntimeDriver<E, R, C, S> {
+    runtime: Arc<LiveRuntime<E, R, C, S>>,
+    deadlines: Mutex<DeadlineDriver>,
+    clock: C,
+}
+
+impl<E, R, C, S> RuntimeDriver<E, R, C, S>
+where
+    E: EvidenceStore + 'static,
+    R: CaptureRuntimePort + 'static,
+    C: Clock + Clone + 'static,
+    S: Scheduler + 'static,
+{
+    #[must_use]
+    pub fn new(runtime: Arc<LiveRuntime<E, R, C, S>>, deadlines: DeadlineDriver, clock: C) -> Self {
+        Self {
+            runtime,
+            deadlines: Mutex::new(deadlines),
+            clock,
+        }
+    }
+
+    #[must_use]
+    pub fn runtime(&self) -> Arc<LiveRuntime<E, R, C, S>> {
+        self.runtime.clone()
+    }
+
+    pub fn drive_once(&self) -> Result<RuntimeDriveReport, LiveRuntimeError> {
+        let due = self
+            .deadlines
+            .lock()
+            .map_err(|_| LiveRuntimeError::State("deadline driver lock poisoned".into()))?
+            .take_due(self.clock.now_ms());
+        for timer in &due {
+            self.runtime.dispatch_timer(timer.as_str())?;
+        }
+        let recorder_exit = self.runtime.poll_capture()?;
+        let finalized_clip = self.runtime.finalize_discovered_save()?;
+        Ok(RuntimeDriveReport {
+            timers_dispatched: due.len(),
+            recorder_exit,
+            finalized_clip,
+        })
+    }
+
+    pub fn shutdown(&self) -> Result<(), LiveRuntimeError> {
+        self.runtime.shutdown_capture()
+    }
+}
+
+/// Owns the daemon thread that advances live deadlines and recorder state.
+pub struct RuntimeWorker {
+    stop: Option<mpsc::Sender<()>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl RuntimeWorker {
+    pub fn start<E, R, C, S>(
+        driver: RuntimeDriver<E, R, C, S>,
+        gsi: openfrag_gsi::GsiService,
+    ) -> std::io::Result<Self>
+    where
+        E: EvidenceStore + 'static,
+        R: CaptureRuntimePort + 'static,
+        C: Clock + Clone + 'static,
+        S: Scheduler + 'static,
+    {
+        let (stop, receiver) = mpsc::channel();
+        let join = std::thread::Builder::new()
+            .name("openfrag-live-runtime".into())
+            .spawn(move || {
+                loop {
+                    match receiver.recv_timeout(Duration::from_millis(25)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let _ = driver.drive_once();
+                    let _ = gsi.poll_stale();
+                }
+                let _ = driver.shutdown();
+            })?;
+        Ok(Self {
+            stop: Some(stop),
+            join: Some(join),
+        })
+    }
+}
+
+impl Drop for RuntimeWorker {
+    fn drop(&mut self) {
+        self.stop.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+pub type ProductionCapture = crate::capture_runtime::CaptureRuntime<
+    openfrag_capture::StdProcess,
+    openfrag_capture::StdFilesystem,
+    MonotonicClock,
+    openfrag_capture::FfprobeMediaProbe,
+>;
+pub type ProductionLiveRuntime =
+    LiveRuntime<StorageEvidenceStore, ProductionCapture, MonotonicClock, ChannelScheduler>;
+pub type ProductionRuntimeDriver =
+    RuntimeDriver<StorageEvidenceStore, ProductionCapture, MonotonicClock, ChannelScheduler>;
+
+pub fn production_runtime(
+    data_directory: &Path,
+    local_steam_id: &str,
+) -> Result<ProductionRuntimeDriver, LiveRuntimeError> {
+    let configuration =
+        openfrag_setup::read_capture_configuration(data_directory).map_err(|error| {
+            LiveRuntimeError::Unavailable(UnavailableReason::Capture(format!("{error:?}")))
+        })?;
+    let clock = MonotonicClock::default();
+    let probe = openfrag_capture::FfprobeMediaProbe {
+        program: configuration.ffprobe_path().to_path_buf(),
+        ..openfrag_capture::FfprobeMediaProbe::default()
+    };
+    let mut capture = crate::capture_runtime::CaptureRuntime::from_data_directory(
+        data_directory,
+        openfrag_capture::StdProcess::default(),
+        openfrag_capture::StdFilesystem,
+        clock.clone(),
+        probe,
+    );
+    capture.start_at(clock.now_ms()).map_err(|error| {
+        LiveRuntimeError::Unavailable(UnavailableReason::Capture(format!("{error:?}")))
+    })?;
+    let storage = Storage::open(openfrag_storage::Layout::at(data_directory)).map_err(|error| {
+        LiveRuntimeError::Unavailable(UnavailableReason::Storage(format!("{error:?}")))
+    })?;
+    let (scheduler, deadlines) = deadline_channel();
+    let runtime = Arc::new(LiveRuntime::durable(
+        storage,
+        local_steam_id,
+        capture,
+        clock.clone(),
+        scheduler,
+    ));
+    if runtime.status() != LiveRuntimeStatus::Ready {
+        return Err(LiveRuntimeError::State(
+            "production live runtime did not become ready".into(),
+        ));
+    }
+    Ok(RuntimeDriver::new(runtime, deadlines, clock))
 }

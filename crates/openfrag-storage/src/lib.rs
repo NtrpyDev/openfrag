@@ -1431,6 +1431,17 @@ impl Storage {
         self.connection.execute("INSERT INTO recorder_save_attempts(id,recorder_request_id,capture_session_id,requested_monotonic_ns,status) VALUES(?,?,?,?,?)", params![id.as_str(), recorder_request_id, session.as_str(), monotonic_ns, SaveAttemptStatus::Requested.as_str()])?;
         Ok(id)
     }
+    pub fn save_attempt_for_request(&self, recorder_request_id: &str) -> Result<SaveAttemptId> {
+        self.connection
+            .query_row(
+                "SELECT id FROM recorder_save_attempts WHERE recorder_request_id=?",
+                [recorder_request_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(SaveAttemptId)
+            .ok_or(Error::NotFound("recorder save request"))
+    }
     pub fn acknowledge_save(&self, attempt: &SaveAttemptId) -> Result<()> {
         self.connection.execute("UPDATE recorder_save_attempts SET acknowledgement_count=acknowledgement_count+1, status=CASE WHEN status='requested' THEN 'acknowledged' ELSE status END WHERE id=?", [attempt.as_str()])?;
         Ok(())

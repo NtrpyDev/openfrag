@@ -1,6 +1,6 @@
 use openfrag_capture::{
     Clock, Config, Error as SupervisorError, Filesystem, MediaProbe, RecorderInstall, ReplayConfig,
-    SaveAcknowledgement, SaveDisposition, SaveProvenance, Supervisor, replay_launch,
+    SaveAcknowledgement, SaveProvenance, SaveRequestOutcome, Supervisor, replay_launch,
 };
 use openfrag_setup::{CaptureConfigError, CaptureRecorder, read_capture_configuration};
 use std::{ffi::OsString, path::Path};
@@ -33,7 +33,7 @@ pub enum RuntimeError {
 enum Gate<P, F, C, M> {
     Disabled,
     Unavailable(UnavailableReason),
-    Ready(Supervisor<P, F, C, M>),
+    Ready(Box<Supervisor<P, F, C, M>>),
 }
 
 /// Gated daemon runtime for one replay-buffer supervisor.
@@ -89,7 +89,9 @@ where
             configuration.output_directory().to_path_buf(),
         );
         Self {
-            gate: Gate::Ready(Supervisor::new(process, filesystem, clock, probe, config)),
+            gate: Gate::Ready(Box::new(Supervisor::new(
+                process, filesystem, clock, probe, config,
+            ))),
             available_from_ms: None,
         }
     }
@@ -128,10 +130,11 @@ where
 
     pub fn request_save(
         &mut self,
+        recorder_request_id: &str,
         provenance: SaveProvenance,
-    ) -> Result<SaveDisposition, RuntimeError> {
+    ) -> Result<SaveRequestOutcome, RuntimeError> {
         self.supervisor_mut()?
-            .request_save(provenance)
+            .request_save(recorder_request_id, provenance)
             .map_err(RuntimeError::Supervisor)
     }
 
@@ -139,6 +142,12 @@ where
         self.supervisor_mut()?
             .discover_save()
             .map_err(RuntimeError::Supervisor)
+    }
+
+    #[must_use]
+    pub fn has_save_in_flight(&self) -> bool {
+        self.supervisor()
+            .is_ok_and(openfrag_capture::Supervisor::has_save_in_flight)
     }
 
     pub fn shutdown(&mut self) -> Result<(), RuntimeError> {
@@ -186,8 +195,13 @@ where
         self.available_from_ms.unwrap_or(0)
     }
 
-    fn request_save(&mut self, provenance: SaveProvenance) -> Result<SaveDisposition, String> {
-        CaptureRuntime::request_save(self, provenance).map_err(|error| format!("{error:?}"))
+    fn request_save(
+        &mut self,
+        recorder_request_id: &str,
+        provenance: SaveProvenance,
+    ) -> Result<SaveRequestOutcome, String> {
+        CaptureRuntime::request_save(self, recorder_request_id, provenance)
+            .map_err(|error| format!("{error:?}"))
     }
 
     fn poll(&mut self) -> Result<Option<i32>, String> {
@@ -196,6 +210,10 @@ where
 
     fn discover_save(&mut self) -> Result<Option<SaveAcknowledgement>, String> {
         CaptureRuntime::discover_save(self).map_err(|error| format!("{error:?}"))
+    }
+
+    fn has_save_in_flight(&self) -> bool {
+        CaptureRuntime::has_save_in_flight(self)
     }
 
     fn shutdown(&mut self) -> Result<(), String> {

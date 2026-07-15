@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use openfrag_capture::{SaveDisposition, SaveProvenance};
+use openfrag_capture::{SaveAcknowledgement, SaveProvenance, SaveRequestOutcome};
 use openfrag_domain::{
     AUTO_POST_ROLL_MS, AutoCaptureDecision, CandidateTrigger, CaptureWindow, FinalHighlightLabel,
     HighlightCandidate, REPLAY_BUFFER_MS, TimeRange, auto_capture_window, live_kill_trigger,
@@ -48,7 +48,7 @@ pub enum CancelReason {
 pub enum CaptureStatus {
     Scheduled,
     Requesting,
-    SaveRequested(SaveDisposition),
+    SaveRequested(SaveRequestOutcome),
     Retryable(String),
     Cancelled(CancelReason),
 }
@@ -74,6 +74,12 @@ pub struct CaptureRecord {
     pub window: Option<CaptureWindow>,
     pub raw_coverage: Option<TimeRange>,
     pub status: CaptureStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizedClip {
+    pub clip_id: String,
+    pub recorder_request_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +143,15 @@ pub trait EvidenceStore: Send + Sync {
     ///
     /// Returns a persistence diagnostic when durable storage fails.
     fn upsert_capture(&self, capture: &CaptureRecord) -> Result<(), LiveDiagnostic>;
+    /// Publishes one validated recorder output and finalizes its durable Clip.
+    ///
+    /// # Errors
+    ///
+    /// Returns a persistence diagnostic without creating a second Clip on retry.
+    fn finalize_capture(
+        &self,
+        acknowledgement: &SaveAcknowledgement,
+    ) -> Result<FinalizedClip, LiveDiagnostic>;
 }
 
 pub trait Recorder: Send + Sync {
@@ -146,7 +161,11 @@ pub trait Recorder: Send + Sync {
     /// # Errors
     ///
     /// Returns a recorder diagnostic while leaving coordinator metadata retryable.
-    fn request_save(&self, provenance: SaveProvenance) -> Result<SaveDisposition, String>;
+    fn request_save(
+        &self,
+        capture_id: &str,
+        provenance: SaveProvenance,
+    ) -> Result<SaveRequestOutcome, String>;
 }
 
 pub trait Clock: Send + Sync {
@@ -348,6 +367,18 @@ where
         Ok(id)
     }
 
+    /// Finalizes a validated recorder output through the durable evidence store.
+    ///
+    /// # Errors
+    ///
+    /// Returns a persistence diagnostic without creating a duplicate Clip on retry.
+    pub fn finalize_capture(
+        &self,
+        acknowledgement: &SaveAcknowledgement,
+    ) -> Result<FinalizedClip, LiveDiagnostic> {
+        self.store.finalize_capture(acknowledgement)
+    }
+
     fn create_candidate(
         &mut self,
         receipt: &EvidenceReceipt,
@@ -514,9 +545,9 @@ where
             capture.window = Some(window);
             capture.raw_coverage = Some(raw_coverage(now_ms, self.recorder.available_from_ms()));
         }
-        match self.recorder.request_save(capture.provenance) {
-            Ok(disposition) => {
-                capture.status = CaptureStatus::SaveRequested(disposition);
+        match self.recorder.request_save(&capture.id, capture.provenance) {
+            Ok(outcome) => {
+                capture.status = CaptureStatus::SaveRequested(outcome);
                 self.store.upsert_capture(&capture)?;
                 self.captures.insert(capture_id.into(), capture);
                 Ok(TimerOutcome::SaveRequested)

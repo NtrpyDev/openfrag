@@ -59,6 +59,8 @@ pub enum AppError {
 struct AppState {
     #[allow(dead_code)]
     storage: Arc<Mutex<Storage>>,
+    #[allow(dead_code)]
+    runtime_worker: Option<Arc<live_runtime::RuntimeWorker>>,
     gsi_configured: bool,
 }
 
@@ -76,20 +78,13 @@ struct Health {
 
 pub fn app(config: &AppConfig) -> Result<Router, AppError> {
     let credentials = read_gsi_credentials(&config.data_directory)?;
+    let gsi_configured = credentials.is_some();
     let local_steam_id = credentials
         .as_ref()
         .and_then(|(_, steam_id)| steam_id.parse::<u64>().ok());
     let storage = Storage::open(Layout::at(&config.data_directory))
         .map_err(|error| AppError::Storage(format!("{error:?}")))?;
     let storage = Arc::new(Mutex::new(storage));
-    let state = AppState {
-        storage: storage.clone(),
-        gsi_configured: credentials.is_some(),
-    };
-    let mut router = Router::new()
-        .route("/", get(dashboard))
-        .route("/api/health", get(health))
-        .with_state(state);
     let local_api = service::StorageApi::new(
         storage.clone(),
         service::PipelinePorts::new(
@@ -103,19 +98,53 @@ pub fn app(config: &AppConfig) -> Result<Router, AppError> {
             local_steam_id.is_some(),
         ),
     );
-    router = router.merge(api::router_without_health(Arc::new(local_api)));
-    if let Some((token, steam_id)) = credentials {
-        let session = storage
-            .lock()
-            .map_err(|_| AppError::Storage("storage lock poisoned".into()))?
-            .create_capture_session(&steam_id)
-            .map_err(|error| AppError::Storage(format!("{error:?}")))?;
-        let sink = Arc::new(StorageGsiSink { storage, session });
+    let mut gsi_service = None;
+    let mut runtime_worker = None;
+    if let Some((token, steam_id)) = &credentials {
+        let (sink, driver): (
+            Arc<dyn EventSink>,
+            Option<live_runtime::ProductionRuntimeDriver>,
+        ) = if let Ok(driver) = live_runtime::production_runtime(&config.data_directory, steam_id) {
+            (driver.runtime(), Some(driver))
+        } else {
+            let session = storage
+                .lock()
+                .map_err(|_| AppError::Storage("storage lock poisoned".into()))?
+                .create_capture_session(steam_id)
+                .map_err(|error| AppError::Storage(format!("{error:?}")))?;
+            (
+                Arc::new(StorageGsiSink {
+                    storage: storage.clone(),
+                    session,
+                }),
+                None,
+            )
+        };
         let service = GsiService::new(
-            GsiConfig::new(&token, &steam_id, Duration::from_secs(10)),
+            GsiConfig::new(token, steam_id, Duration::from_secs(10)),
             Arc::new(SystemClock::default()),
             sink,
         );
+        if let Some(driver) = driver {
+            runtime_worker = Some(Arc::new(
+                live_runtime::RuntimeWorker::start(driver, service.clone()).map_err(|error| {
+                    AppError::Configuration(format!("cannot start live runtime worker: {error}"))
+                })?,
+            ));
+        }
+        gsi_service = Some(service);
+    }
+    let state = AppState {
+        storage: storage.clone(),
+        runtime_worker,
+        gsi_configured,
+    };
+    let mut router = Router::new()
+        .route("/", get(dashboard))
+        .route("/api/health", get(health))
+        .with_state(state);
+    router = router.merge(api::router_without_health(Arc::new(local_api)));
+    if let Some(service) = gsi_service {
         router = router.merge(openfrag_gsi::router(service));
     } else {
         router = router.route("/gsi/router", post(gsi_unavailable));

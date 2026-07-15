@@ -1,19 +1,22 @@
-#[path = "../src/live_runtime.rs"]
-mod live_runtime;
-
-use live_runtime::{
-    CaptureRuntimePort, LiveRuntime, LiveRuntimeError, LiveRuntimeStatus, MonotonicClock,
-    UnavailableReason, deadline_channel,
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
 };
-use openfrag_capture::{SaveDisposition, SaveProvenance};
+use openfrag_capture::{
+    MediaInfo, SaveAcknowledgement, SaveDisposition, SaveProvenance, SaveRequestOutcome,
+};
 use openfrag_gsi::{
     EventSink, EvidenceContext, EvidenceReceipt, PresenceBits, StateOutput, TransitionFact,
 };
 use openfrag_live::{
-    CandidateRecord, CaptureRecord, Clock, EvidenceStore, LiveDiagnostic, Scheduler, TimerId,
-    TimerOutcome,
+    CandidateRecord, CaptureRecord, Clock, EvidenceStore, LiveDiagnostic, Scheduler,
+    StorageEvidenceStore, TimerId, TimerOutcome,
 };
 use openfrag_storage::{Layout, Storage};
+use openfragd::live_runtime::{
+    CaptureRuntimePort, LiveRuntime, LiveRuntimeError, LiveRuntimeStatus, MonotonicClock,
+    RuntimeDriver, RuntimeWorker, UnavailableReason, deadline_channel,
+};
 use std::{
     collections::HashMap,
     sync::{
@@ -22,6 +25,7 @@ use std::{
     },
     time::Duration,
 };
+use tower::ServiceExt;
 
 #[test]
 fn monotonic_clock_clones_share_one_non_decreasing_epoch() {
@@ -112,6 +116,13 @@ impl EvidenceStore for MemoryStore {
             .push(capture.clone());
         Ok(())
     }
+
+    fn finalize_capture(
+        &self,
+        _: &openfrag_capture::SaveAcknowledgement,
+    ) -> Result<openfrag_live::FinalizedClip, LiveDiagnostic> {
+        Err(LiveDiagnostic::Unsupported("fake capture finalization"))
+    }
 }
 
 struct FakeCapture {
@@ -129,9 +140,16 @@ impl CaptureRuntimePort for FakeCapture {
         self.available_from_ms
     }
 
-    fn request_save(&mut self, provenance: SaveProvenance) -> Result<SaveDisposition, String> {
+    fn request_save(
+        &mut self,
+        recorder_request_id: &str,
+        provenance: SaveProvenance,
+    ) -> Result<SaveRequestOutcome, String> {
         self.saves.lock().expect("saves").push(provenance);
-        Ok(SaveDisposition::Signalled)
+        Ok(SaveRequestOutcome {
+            recorder_request_id: recorder_request_id.into(),
+            disposition: SaveDisposition::Signalled,
+        })
     }
 }
 
@@ -141,6 +159,12 @@ struct FakeClock(Arc<AtomicU64>);
 impl Clock for FakeClock {
     fn now_ms(&self) -> u64 {
         self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl openfrag_gsi::Clock for FakeClock {
+    fn now(&self) -> Duration {
+        Duration::from_millis(self.0.load(Ordering::SeqCst))
     }
 }
 
@@ -308,4 +332,129 @@ fn durable_constructor_composes_the_sqlite_evidence_store() {
     runtime
         .ingest_receipt(&receipt(9, Vec::new()))
         .expect("durable receipt");
+}
+
+struct FinalizingCapture {
+    clock: Arc<AtomicU64>,
+    output: std::path::PathBuf,
+    pending: Option<SaveAcknowledgement>,
+    shutdowns: Arc<AtomicU64>,
+}
+
+impl CaptureRuntimePort for FinalizingCapture {
+    fn readiness(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn available_from_ms(&self) -> u64 {
+        0
+    }
+
+    fn request_save(
+        &mut self,
+        recorder_request_id: &str,
+        provenance: SaveProvenance,
+    ) -> Result<SaveRequestOutcome, String> {
+        self.pending = Some(SaveAcknowledgement {
+            path: self.output.clone(),
+            recorder_request_id: recorder_request_id.into(),
+            provenance,
+            requested_at_ms: self.clock.load(Ordering::SeqCst),
+            media: MediaInfo {
+                duration_ms: 60_000,
+                video_streams: 1,
+            },
+        });
+        Ok(SaveRequestOutcome {
+            recorder_request_id: recorder_request_id.into(),
+            disposition: SaveDisposition::Signalled,
+        })
+    }
+
+    fn has_save_in_flight(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn discover_save(&mut self) -> Result<Option<SaveAcknowledgement>, String> {
+        Ok(self.pending.take())
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn authenticated_gsi_deadline_finalizes_one_clip_and_shuts_down_capture() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let layout = Layout::at(directory.path().join("data"));
+    let output = directory.path().join("captured.mkv");
+    std::fs::write(&output, b"validated captured media").expect("captured media");
+    let store = StorageEvidenceStore::new(
+        Storage::open(layout.clone()).expect("storage"),
+        "76561198000000000",
+    )
+    .expect("durable store");
+    let session = store.capture_session_id().to_owned();
+    let clock = FakeClock::default();
+    clock.0.store(40_000, Ordering::SeqCst);
+    let shutdowns = Arc::new(AtomicU64::new(0));
+    let (scheduler, deadlines) = deadline_channel();
+    let runtime = Arc::new(LiveRuntime::with_store(
+        session,
+        store,
+        FinalizingCapture {
+            clock: clock.0.clone(),
+            output,
+            pending: None,
+            shutdowns: shutdowns.clone(),
+        },
+        clock.clone(),
+        scheduler,
+    ));
+    let driver = RuntimeDriver::new(runtime.clone(), deadlines, clock.clone());
+    let gsi = openfrag_gsi::GsiService::new(
+        openfrag_gsi::GsiConfig::new(
+            "private-test-token",
+            "76561198000000000",
+            Duration::from_secs(10),
+        ),
+        Arc::new(clock.clone()),
+        runtime,
+    );
+    let worker = RuntimeWorker::start(driver, gsi.clone()).expect("runtime worker");
+    let router = openfrag_gsi::router(gsi);
+    for (round, timestamp) in [(1, 1), (2, 2)] {
+        let payload = format!(
+            r#"{{"provider":{{"appid":730,"timestamp":{timestamp}}},"map":{{"name":"de_mirage","mode":"competitive","round":{round}}},"player":{{"steamid":"76561198000000000","state":{{"health":100,"round_kills":0}},"match_stats":{{"kills":0,"deaths":0}}}},"auth":{{"token":"private-test-token"}}}}"#
+        );
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/gsi/router")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .expect("GSI request"),
+            )
+            .await
+            .expect("GSI response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    clock.0.store(50_000, Ordering::SeqCst);
+    let mut clip_count = 0;
+    for _ in 0..100 {
+        clip_count = Storage::open(layout.clone())
+            .expect("reopen storage")
+            .list_clips()
+            .expect("Clips")
+            .len();
+        if clip_count == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(clip_count, 1);
+    drop(worker);
+    assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
 }

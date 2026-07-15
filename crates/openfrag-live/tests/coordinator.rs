@@ -1,4 +1,4 @@
-use openfrag_capture::{SaveDisposition, SaveProvenance};
+use openfrag_capture::{SaveDisposition, SaveProvenance, SaveRequestOutcome};
 use openfrag_domain::{
     AUTO_POST_ROLL_MS, CandidateTrigger, DESIRED_PRE_ROLL_MS, FinalHighlightLabel,
     REPLAY_BUFFER_MS, TimeRange,
@@ -52,6 +52,13 @@ impl EvidenceStore for MemoryStore {
             .expect("captures lock")
             .insert(capture.id.clone(), capture.clone());
         Ok(())
+    }
+
+    fn finalize_capture(
+        &self,
+        _: &openfrag_capture::SaveAcknowledgement,
+    ) -> Result<openfrag_live::FinalizedClip, LiveDiagnostic> {
+        Err(LiveDiagnostic::Unsupported("fake capture finalization"))
     }
 }
 
@@ -122,13 +129,21 @@ impl Recorder for FakeRecorder {
         self.available_from_ms
     }
 
-    fn request_save(&self, provenance: SaveProvenance) -> Result<SaveDisposition, String> {
+    fn request_save(
+        &self,
+        capture_id: &str,
+        provenance: SaveProvenance,
+    ) -> Result<SaveRequestOutcome, String> {
         self.calls.lock().expect("calls lock").push(provenance);
         self.responses
             .lock()
             .expect("responses lock")
             .pop_front()
             .unwrap_or(Ok(SaveDisposition::Signalled))
+            .map(|disposition| SaveRequestOutcome {
+                recorder_request_id: capture_id.into(),
+                disposition,
+            })
     }
 }
 
@@ -514,16 +529,20 @@ fn recorder_failure_remains_retryable_and_retry_preserves_capture_identity() {
         Ok(TimerOutcome::SaveRequested)
     );
     assert_eq!(recorder.calls.lock().expect("calls lock").len(), 2);
-    assert!(matches!(
+    assert_eq!(
         store
             .captures
             .lock()
             .expect("captures lock")
             .get(&capture.id)
             .expect("capture")
-            .status,
-        CaptureStatus::SaveRequested(SaveDisposition::Signalled)
-    ));
+            .status
+            .clone(),
+        CaptureStatus::SaveRequested(SaveRequestOutcome {
+            recorder_request_id: capture.id.clone(),
+            disposition: SaveDisposition::Signalled,
+        })
+    );
 }
 
 #[test]
@@ -555,7 +574,10 @@ fn manual_flag_is_immediate_and_retains_identity_when_recorder_coalesces() {
     assert_eq!(manual.provenance, SaveProvenance::ManualFlag);
     assert_eq!(
         manual.status,
-        CaptureStatus::SaveRequested(SaveDisposition::Coalesced)
+        CaptureStatus::SaveRequested(SaveRequestOutcome {
+            recorder_request_id: manual_id,
+            disposition: SaveDisposition::Coalesced,
+        })
     );
     assert_eq!(
         manual.window.expect("manual window").desired,
