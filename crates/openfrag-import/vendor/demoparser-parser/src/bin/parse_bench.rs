@@ -46,6 +46,7 @@ fn settings<'a>(huf: &'a Vec<(u8, u8)>) -> ParserInputs<'a> {
         order_by_steamid: false,
         wanted_prop_states: AHashMap::default(),
         fallback_bytes: None,
+        event_snapshot_mode: None,
     }
 }
 
@@ -57,7 +58,7 @@ fn run_once(mmap: &[u8], huf: &Vec<(u8, u8)>, mode: ParsingMode) -> f64 {
     // touch output so the optimizer can't elide the parse
     std::hint::black_box(&out.df);
     // Deterministic golden checksum of the output DataFrame (CS2_CKSUM=1). DefaultHasher uses
-    // fixed keys, so the hash is stable across runs/builds — used for before/after identity checks.
+    // fixed keys, so the hash is stable across runs/builds and can verify before/after identity.
     if std::env::var("CS2_CKSUM").is_ok() {
         use std::collections::BTreeMap;
         use std::hash::{Hash, Hasher};

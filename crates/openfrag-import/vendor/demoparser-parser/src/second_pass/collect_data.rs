@@ -57,11 +57,22 @@ pub enum CoordinateAxis {
 
 impl<'a> SecondPassParser<'a> {
     pub fn collect_entities(&mut self) {
+        if self.event_snapshot_mode.is_some() {
+            return;
+        }
         if !self.prop_controller.event_with_velocity {
             if !self.wanted_ticks.contains(&self.tick) && self.wanted_ticks.len() != 0 || self.wanted_events.len() != 0 {
                 return;
             }
         }
+        self.collect_entities_unfiltered();
+    }
+
+    pub(crate) fn collect_event_snapshot(&mut self) {
+        self.collect_entities_unfiltered();
+    }
+
+    fn collect_entities_unfiltered(&mut self) {
         if self.parse_projectiles {
             self.collect_projectiles();
             return;

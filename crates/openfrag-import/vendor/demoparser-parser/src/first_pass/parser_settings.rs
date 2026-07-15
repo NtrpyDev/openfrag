@@ -31,6 +31,9 @@ pub struct ParserInputs<'a> {
     pub wanted_prop_states: AHashMap<String, Variant>,
     pub wanted_ticks: Vec<i32>,
     pub wanted_events: Vec<String>,
+    /// Capture requested player properties after each packet that emits at least one
+    /// requested event. This keeps event evidence and its state snapshots in one parse.
+    pub event_snapshot_mode: Option<EventSnapshotMode>,
     pub parse_ents: bool,
     pub parse_projectiles: bool,
     pub parse_grenades: bool,
@@ -40,6 +43,13 @@ pub struct ParserInputs<'a> {
     pub order_by_steamid: bool,
     pub list_props: bool,
     pub fallback_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventSnapshotMode {
+    /// State after every net message in the packet containing the requested event has
+    /// been processed. More than one event in the same packet shares one snapshot batch.
+    AfterEventPacket,
 }
 
 pub struct FirstPassParser<'a> {

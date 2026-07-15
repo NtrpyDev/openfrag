@@ -173,9 +173,17 @@ pub struct ParsedRound {
     pub winner: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SnapshotPhase {
+    /// Synthetic or explicitly requested state at a tick, with no event-order claim.
+    RequestedTick,
+    /// State after all net messages in a packet that emitted a requested event.
+    AfterEventPacket,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayerSnapshot {
     pub tick: i32,
     pub ingestion_ordinal: u64,
+    pub phase: SnapshotPhase,
     pub steam_id: u64,
     pub entity_id: Option<i32>,
     pub team: Option<i32>,
@@ -206,8 +214,8 @@ impl ParsedOutput {
 }
 
 pub const DEMOPARSER_COMMIT: &str = "ba39cc44cd5abfd7f34df2b3c0a7dd3630048311";
-pub const DEMOPARSER_BUILD: &str = "parser-0.1.1/csgoproto-0.1.5";
-pub const QUERY_PLAN_VERSION: &str = "openfrag-evidence-query-2";
+pub const DEMOPARSER_BUILD: &str = "parser-0.1.1+openfrag-event-snapshots-1/csgoproto-0.1.5";
+pub const QUERY_PLAN_VERSION: &str = "openfrag-evidence-query-3";
 pub const EVENT_QUERY: &[&str] = &[
     "round_freeze_end",
     "round_end",
@@ -232,15 +240,17 @@ pub const PROPERTY_QUERY: &[&str] = &[
     "winner",
     "warmup_period",
 ];
-pub const EVIDENCE_SEMANTICS_EPOCH: &str = "openfrag-evidence-1";
+pub const SNAPSHOT_PHASE: &str = "after-event-packet";
+pub const EVIDENCE_SEMANTICS_EPOCH: &str = "openfrag-evidence-2";
 pub const GENERATED_PROTO_BUILD: &str = "csgoproto-0.1.5";
 
 pub fn query_plan_hash() -> String {
     let canonical = format!(
-        "{}\nevents:{}\nproperties:{}",
+        "{}\nevents:{}\nproperties:{}\nsnapshot-phase:{}",
         QUERY_PLAN_VERSION,
         EVENT_QUERY.join(","),
-        PROPERTY_QUERY.join(",")
+        PROPERTY_QUERY.join(","),
+        SNAPSHOT_PHASE,
     );
     format!("{:x}", Sha256::digest(canonical.as_bytes()))
 }
@@ -274,7 +284,7 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
     use ahash::AHashMap;
     use demoparser_parser::second_pass::parser_settings::create_huffman_lookup_table;
     use demoparser_parser::{
-        first_pass::parser_settings::ParserInputs,
+        first_pass::parser_settings::{EventSnapshotMode, ParserInputs},
         parse_demo::{Parser, ParsingMode},
         second_pass::variants::{OutputSerdeHelperStruct, soa_to_aos},
     };
@@ -294,6 +304,7 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
         wanted_prop_states: AHashMap::new(),
         wanted_ticks: vec![],
         wanted_events: EVENT_QUERY.iter().map(|s| (*s).into()).collect(),
+        event_snapshot_mode: Some(EventSnapshotMode::AfterEventPacket),
         parse_ents: true,
         parse_projectiles: false,
         parse_grenades: false,
@@ -304,44 +315,13 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
         list_props: false,
         fallback_bytes: None,
     };
-    let mut parser = Parser::new(inputs, ParsingMode::Normal);
+    let mut parser = Parser::new(inputs, ParsingMode::ForceSingleThreaded);
     let out = parser
         .parse_demo(&bytes)
         .map_err(|e| ParserError::Parse(e.to_string()))?;
-    let mut evidence_ticks: Vec<i32> = out.game_events.iter().map(|event| event.tick).collect();
-    evidence_ticks.sort_unstable();
-    evidence_ticks.dedup();
-    let snapshot_inputs = ParserInputs {
-        real_name_to_og_name: AHashMap::new(),
-        wanted_players: vec![],
-        wanted_player_props: vec![
-            "player_steamid".into(),
-            "team_num".into(),
-            "is_alive".into(),
-            "life_state".into(),
-            "health".into(),
-        ],
-        wanted_other_props: vec!["total_rounds_played".into()],
-        wanted_prop_states: AHashMap::new(),
-        wanted_ticks: evidence_ticks,
-        wanted_events: vec![],
-        parse_ents: true,
-        parse_projectiles: false,
-        parse_grenades: false,
-        only_header: false,
-        only_convars: false,
-        huffman_lookup_table: &huf,
-        order_by_steamid: false,
-        list_props: false,
-        fallback_bytes: None,
-    };
-    let mut snapshot_parser = Parser::new(snapshot_inputs, ParsingMode::Normal);
-    let snapshot_out = snapshot_parser
-        .parse_demo(&bytes)
-        .map_err(|e| ParserError::Parse(e.to_string()))?;
     let player_snapshots = soa_to_aos(OutputSerdeHelperStruct {
-        prop_infos: snapshot_out.prop_controller.prop_infos.clone(),
-        inner: snapshot_out.df.into(),
+        prop_infos: out.prop_controller.prop_infos.clone(),
+        inner: out.df.into(),
     })
     .into_iter()
     .enumerate()
@@ -359,6 +339,7 @@ pub fn parse_with_pinned_demoparser(path: &Path) -> Result<ParsedOutput, ParserE
         Some(PlayerSnapshot {
             tick: i64_value("tick")? as i32,
             ingestion_ordinal: ordinal as u64,
+            phase: SnapshotPhase::AfterEventPacket,
             steam_id,
             entity_id: i64_value("entity_id").map(|v| v as i32),
             team: i64_value("team_num").map(|v| v as i32),
@@ -1048,6 +1029,7 @@ mod tests {
             }
         );
         assert_ne!(query_plan_hash(), QUERY_PLAN_VERSION);
+        assert_eq!(SNAPSHOT_PHASE, "after-event-packet");
     }
 
     #[cfg(feature = "demoparser")]
@@ -1106,12 +1088,43 @@ mod tests {
         assert_eq!(death.victim(), Some(76561198073049527));
         assert_eq!(death.weapon(), Some("p250"));
         assert!(!parsed.player_snapshots.is_empty());
+        assert!(parsed
+            .player_snapshots
+            .iter()
+            .all(|snapshot| snapshot.phase == SnapshotPhase::AfterEventPacket));
         assert!(parsed.player_snapshots.iter().all(|snapshot| {
             parsed
                 .participants
                 .iter()
                 .any(|participant| participant.steam_id == snapshot.steam_id)
         }));
+        let event_ticks = parsed
+            .events
+            .iter()
+            .map(|event| event.tick)
+            .collect::<std::collections::BTreeSet<_>>();
+        let snapshot_ticks_without_events = parsed
+            .player_snapshots
+            .iter()
+            .map(|snapshot| snapshot.tick)
+            .filter(|tick| !event_ticks.contains(tick))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            snapshot_ticks_without_events.is_empty(),
+            "snapshot ticks without requested events: {snapshot_ticks_without_events:?}"
+        );
+        assert!(parsed
+            .events
+            .windows(2)
+            .any(|events| events[0].tick == events[1].tick));
+        assert!(parsed.events.windows(2).all(|events| {
+            events[0].tick != events[1].tick
+                || events[0].ingestion_ordinal < events[1].ingestion_ordinal
+        }));
+        assert!(parsed
+            .player_snapshots
+            .windows(2)
+            .all(|snapshots| snapshots[0].ingestion_ordinal < snapshots[1].ingestion_ordinal));
         assert!(
             parsed.metadata.tick_rate.is_some()
                 || parsed.metadata.tick_rate_unavailable_reason.is_some()
@@ -1133,12 +1146,16 @@ mod tests {
             .map(|r| r.ingestion_ordinal)
             .collect();
         assert!(ordinals.windows(2).all(|w| w[0] < w[1]));
+        let reparsed =
+            parse_with_pinned_demoparser(Path::new(&path)).expect("repeat parse must succeed");
+        assert_eq!(parsed, reparsed, "canonical evidence must be deterministic");
         eprintln!(
-            "fixture={} participants={} rounds={} events={} elapsed_ms={} map={:?}",
+            "fixture={} participants={} rounds={} events={} snapshots={} elapsed_ms={} map={:?}",
             path,
             parsed.participants.len(),
             parsed.rounds.len(),
             parsed.events.len(),
+            parsed.player_snapshots.len(),
             start.elapsed().as_millis(),
             parsed.metadata.map
         );

@@ -5,7 +5,7 @@ use openfrag_domain::{
 };
 use openfrag_import::{
     CalculationIdentity as ImportIdentity, DemoMetadata, EventReceipt, ParsedEvent, ParsedOutput,
-    ParsedRound, Participant, PlayerSnapshot,
+    ParsedRound, Participant, PlayerSnapshot, SnapshotPhase,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -99,6 +99,7 @@ fn golden_parsed_output() -> ParsedOutput {
             snapshots.push(PlayerSnapshot {
                 tick: base + 10,
                 ingestion_ordinal: snapshot_ordinal,
+                phase: SnapshotPhase::RequestedTick,
                 steam_id: participant.steam_id,
                 entity_id: None,
                 team: participant.team,
@@ -229,6 +230,7 @@ fn golden_parsed_output() -> ParsedOutput {
                 snapshots.push(PlayerSnapshot {
                     tick: base + 50,
                     ingestion_ordinal: snapshot_ordinal,
+                    phase: SnapshotPhase::RequestedTick,
                     steam_id: participant.steam_id,
                     entity_id: None,
                     team: participant.team,
@@ -253,6 +255,7 @@ fn golden_parsed_output() -> ParsedOutput {
             snapshots.push(PlayerSnapshot {
                 tick: base + 90,
                 ingestion_ordinal: snapshot_ordinal,
+                phase: SnapshotPhase::RequestedTick,
                 steam_id: participant.steam_id,
                 entity_id: None,
                 team: participant.team,
@@ -536,6 +539,7 @@ fn disconnect_transition_and_post_death_bomb_win_preserve_clutch_conversion() {
     parsed.player_snapshots.push(PlayerSnapshot {
         tick: base + 60,
         ingestion_ordinal: ordinal,
+        phase: SnapshotPhase::RequestedTick,
         steam_id: 76_561_198_000_000_001,
         entity_id: None,
         team: Some(2),

@@ -1,5 +1,6 @@
 use crate::first_pass::frameparser::StartEndOffset;
 use crate::first_pass::parser::FirstPassOutput;
+use crate::first_pass::parser_settings::EventSnapshotMode;
 use crate::first_pass::prop_controller::PropController;
 use crate::first_pass::read_bits::DemoParserError;
 use crate::first_pass::sendtables::Serializer;
@@ -68,6 +69,7 @@ pub struct SecondPassParser<'a> {
     pub player_end_data: Vec<PlayerEndMetaData>,
     // Settings
     pub wanted_events: Vec<String>,
+    pub event_snapshot_mode: Option<EventSnapshotMode>,
     pub parse_entities: bool,
     pub parse_projectiles: bool,
     pub parse_grenades: bool,
@@ -211,6 +213,7 @@ impl<'a> SecondPassParser<'a> {
             output: AHashMap::default(),
             game_events: vec![],
             wanted_events: first_pass_output.settings.wanted_events.clone(),
+            event_snapshot_mode: first_pass_output.settings.event_snapshot_mode,
             parse_entities: first_pass_output.settings.parse_ents,
             projectiles: BTreeSet::default(),
             baselines: first_pass_output.baselines.clone(),

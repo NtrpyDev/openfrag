@@ -37,6 +37,7 @@ fn main() {
         only_convars: false,
         huffman_lookup_table: &huf,
         fallback_bytes: None,
+        event_snapshot_mode: None,
         wanted_prop_states: AHashMap::default(),
         order_by_steamid: false,
     };
@@ -162,4 +163,3 @@ This part combined with command "DEM_SendTables" are by far the most comlicated 
 ### Other stuff
 
 The demo has 2 headers. First header 16 bytes and is just demo magic + how long file is expected to be. The other header is the message DEM_FileHeader and has some more info like what map was played.
-

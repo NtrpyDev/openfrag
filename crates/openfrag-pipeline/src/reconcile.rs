@@ -288,6 +288,7 @@ mod tests {
     use super::*;
     use openfrag_import::{
         CalculationIdentity, DemoMetadata, ParsedEvent, ParsedRound, Participant, PlayerSnapshot,
+        SnapshotPhase,
     };
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -381,6 +382,7 @@ mod tests {
             player_snapshots.push(PlayerSnapshot {
                 tick: 10,
                 ingestion_ordinal: participant.steam_id,
+                phase: SnapshotPhase::RequestedTick,
                 steam_id: participant.steam_id,
                 entity_id: None,
                 team: participant.team,

@@ -1,5 +1,6 @@
 use crate::first_pass::parser::Frame;
 use crate::first_pass::parser::HEADER_ENDS_AT_BYTE;
+use crate::first_pass::parser_settings::EventSnapshotMode;
 use crate::first_pass::parser_settings::FirstPassParser;
 use crate::first_pass::prop_controller::PropController;
 use crate::first_pass::prop_controller::*;
@@ -233,6 +234,7 @@ impl<'a> SecondPassParser<'a> {
         is_fullpacket: bool,
     ) -> Result<(), DemoParserError> {
         let mut wrong_order_events = vec![];
+        let events_before_packet = self.game_events.len();
 
         while bitreader.bits_remaining().unwrap_or(0) > 8 {
             let msg_type = bitreader.read_u_bit_var()?;
@@ -279,6 +281,13 @@ impl<'a> SecondPassParser<'a> {
         }
         if !wrong_order_events.is_empty() {
             self.resolve_wrong_order_event(&mut wrong_order_events)?;
+        }
+        let wants_all_events = self.wanted_events.first().is_some_and(|event| event == "all");
+        let emitted_requested_event = self.game_events[events_before_packet..]
+            .iter()
+            .any(|event| wants_all_events || self.wanted_events.contains(&event.name));
+        if self.event_snapshot_mode == Some(EventSnapshotMode::AfterEventPacket) && emitted_requested_event {
+            self.collect_event_snapshot();
         }
         Ok(())
     }

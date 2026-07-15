@@ -1,6 +1,6 @@
 use openfrag_import::{
     CalculationIdentity, DemoMetadata, EventReceipt, ParsedEvent, ParsedOutput, ParsedRound,
-    Participant, PlayerSnapshot,
+    Participant, PlayerSnapshot, SnapshotPhase,
 };
 use openfrag_pipeline::{
     ImportOutcome, ImportRequest, ImportService, ParserBackend, PipelineError,
@@ -107,6 +107,7 @@ fn available_output() -> ParsedOutput {
             snapshots.push(PlayerSnapshot {
                 tick: base + 10,
                 ingestion_ordinal: snapshot_ordinal,
+                phase: SnapshotPhase::RequestedTick,
                 steam_id: participant.steam_id,
                 entity_id: None,
                 team: participant.team,
@@ -165,6 +166,7 @@ fn available_output() -> ParsedOutput {
             snapshots.push(PlayerSnapshot {
                 tick: base + 90,
                 ingestion_ordinal: snapshot_ordinal,
+                phase: SnapshotPhase::RequestedTick,
                 steam_id: participant.steam_id,
                 entity_id: None,
                 team: participant.team,
