@@ -17,6 +17,8 @@ packages=(
     openfragd
 )
 
+scripts/hardware/tests/verify-nvidia-host-self-test.sh
+
 for package in "${packages[@]}"; do
     cargo fmt --check --package "$package"
 done
